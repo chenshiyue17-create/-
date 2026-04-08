@@ -1,2 +1,2 @@
-requests>=2.31,<3
-aiohttp>=3.9,<4
+requests>=2.27,<3
+aiohttp>=3.8,<4

@@ -5,10 +5,9 @@ import WebKit
 final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
     private let appName = "OKX Local App"
     private let healthPorts = [8765]
-    private let healthPath = "/api/health"
+    private let healthPath = "/api/ping"
     private let compatibilityPaths = [
-        "/api/config",
-        "/api/automation/config",
+        "/api/local-config",
         "/api/miner/config"
     ]
     private let bundleId = "com.cc.okxlocalapp"

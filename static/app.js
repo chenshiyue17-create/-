@@ -2378,12 +2378,18 @@ async function loadSavedConfig() {
   $("executionMode").value = config.executionMode || "local";
   $("remoteGatewayUrl").value = config.remoteGatewayUrl || "";
   applyEnvironmentPreset($("envPreset").value, { keepBaseUrl: true });
+  if (data.remoteConfigLoaded === false && data.remoteConfigError) {
+    setMessage(`远端配置暂未读取成功：${data.remoteConfigError}`, "warn");
+  }
 }
 
 async function loadAutomationConfig() {
   const data = await request("/api/automation/config");
   const config = data.config || {};
   fillAutomationForm(config);
+  if (data.remoteConfigLoaded === false && data.remoteConfigError) {
+    setAutomationMessage(`远端策略配置暂未读取成功：${data.remoteConfigError}`, "warn");
+  }
   renderDeskGuards();
 }
 
