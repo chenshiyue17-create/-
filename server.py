@@ -1233,14 +1233,34 @@ class JsonStore:
         self.default_factory = default_factory
         self.lock = threading.RLock()
         self.data = default_factory()
+        self._mtime_ns = 0
         self.load()
+
+    def _path_mtime_ns(self) -> int:
+        try:
+            return int(self.path.stat().st_mtime_ns)
+        except OSError:
+            return 0
+
+    def _remember_current_mtime(self) -> None:
+        self._mtime_ns = self._path_mtime_ns()
 
     def load(self) -> None:
         with self.lock:
             loaded, _ = secure_load_json(self.path, self.default_factory)
             self.data = deep_merge(self.default_factory(), loaded)
+            self._remember_current_mtime()
+
+    def maybe_reload(self) -> None:
+        with self.lock:
+            current_mtime = self._path_mtime_ns()
+            if current_mtime and current_mtime > self._mtime_ns:
+                loaded, _ = secure_load_json(self.path, self.default_factory)
+                self.data = deep_merge(self.default_factory(), loaded)
+                self._mtime_ns = current_mtime
 
     def current(self) -> dict[str, Any]:
+        self.maybe_reload()
         with self.lock:
             return copy.deepcopy(self.data)
 
@@ -1248,6 +1268,7 @@ class JsonStore:
         with self.lock:
             self.data = deep_merge(self.default_factory(), payload)
             secure_dump_json(self.path, self.data)
+            self._remember_current_mtime()
 
     def update(self, mutator) -> dict[str, Any]:
         with self.lock:
@@ -1255,6 +1276,7 @@ class JsonStore:
             mutator(data)
             self.data = deep_merge(self.default_factory(), data)
             secure_dump_json(self.path, self.data)
+            self._remember_current_mtime()
             return copy.deepcopy(self.data)
 
 
@@ -1263,7 +1285,17 @@ class ConfigStore:
         self.path = path
         self.lock = threading.RLock()
         self.runtime_config: dict[str, Any] = default_config()
+        self._mtime_ns = 0
         self.load()
+
+    def _path_mtime_ns(self) -> int:
+        try:
+            return int(self.path.stat().st_mtime_ns)
+        except OSError:
+            return 0
+
+    def _remember_current_mtime(self) -> None:
+        self._mtime_ns = self._path_mtime_ns()
 
     def _normalize_state(self, payload: dict[str, Any]) -> dict[str, Any]:
         state = deep_merge(default_config(), payload)
@@ -1305,8 +1337,18 @@ class ConfigStore:
         with self.lock:
             loaded, _ = secure_load_json(self.path, dict)
             self.runtime_config = self._normalize_state(loaded)
+            self._remember_current_mtime()
+
+    def maybe_reload(self) -> None:
+        with self.lock:
+            current_mtime = self._path_mtime_ns()
+            if current_mtime and current_mtime > self._mtime_ns:
+                loaded, _ = secure_load_json(self.path, dict)
+                self.runtime_config = self._normalize_state(loaded)
+                self._mtime_ns = current_mtime
 
     def snapshot(self) -> dict[str, Any]:
+        self.maybe_reload()
         with self.lock:
             return copy.deepcopy(self._normalize_state(self.runtime_config))
 
@@ -1347,8 +1389,10 @@ class ConfigStore:
             self.runtime_config = self._normalize_state(state)
             if persist:
                 secure_dump_json(self.path, self.runtime_config)
+                self._remember_current_mtime()
 
     def current(self) -> dict[str, Any]:
+        self.maybe_reload()
         with self.lock:
             return self.current_for_selection()
 
