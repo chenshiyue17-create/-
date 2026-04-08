@@ -329,7 +329,6 @@ def enforce_gateway_auth(handler: BaseHTTPRequestHandler, path: str) -> bool:
 
 
 REMOTE_PROXY_EXACT_PATHS = {
-    "/api/health",
     "/api/focus-snapshot",
     "/api/account/overview",
     "/api/orders/recent",
@@ -342,6 +341,79 @@ REMOTE_PROXY_PREFIXES = (
     "/api/market/",
 )
 
+REMOTE_CONFIG_KEYS = (
+    "envPreset",
+    "apiKey",
+    "secretKey",
+    "passphrase",
+    "baseUrl",
+    "simulated",
+)
+
+
+def build_proxy_runtime_config(current: dict[str, Any], payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    payload = payload or {}
+    merged = deep_merge(default_config(), current)
+    if "executionMode" in payload:
+        merged["executionMode"] = payload.get("executionMode")
+    remote_url = str(payload.get("remoteGatewayUrl") or "").strip()
+    if remote_url:
+        merged["remoteGatewayUrl"] = remote_url
+    remote_token = str(payload.get("remoteGatewayToken") or "").strip()
+    if remote_token:
+        merged["remoteGatewayToken"] = remote_token
+    return merged
+
+
+def build_local_runtime_config(current: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    merged = deep_merge(default_config(), current)
+    for key in ("envPreset", "baseUrl", "simulated", "executionMode", "remoteGatewayUrl"):
+        if key in payload:
+            merged[key] = payload.get(key)
+    remote_token = str(payload.get("remoteGatewayToken") or "").strip()
+    if remote_token:
+        merged["remoteGatewayToken"] = remote_token
+    return merged
+
+
+def build_remote_trading_config(current: dict[str, Any], payload: dict[str, Any], *, persist: bool) -> dict[str, Any]:
+    merged = {
+        "envPreset": payload.get("envPreset", current.get("envPreset", "okx_main_demo")),
+        "apiKey": payload.get("apiKey", ""),
+        "secretKey": payload.get("secretKey", ""),
+        "passphrase": payload.get("passphrase", ""),
+        "baseUrl": payload.get("baseUrl", current.get("baseUrl", "https://www.okx.com")),
+        "simulated": bool(payload.get("simulated", current.get("simulated", True))),
+        "executionMode": "local",
+        "remoteGatewayUrl": "",
+        "remoteGatewayToken": "",
+        "persist": persist,
+    }
+    return merged
+
+
+def merge_remote_redacted_config(
+    local_redacted: dict[str, Any], remote_payload: dict[str, Any] | None
+) -> dict[str, Any]:
+    merged = deep_merge(default_config(), local_redacted)
+    remote_config = (remote_payload or {}).get("config") or {}
+    for key in ("envPreset", "baseUrl", "simulated"):
+        if key in remote_config:
+            merged[key] = remote_config.get(key)
+    for key in ("apiKey", "secretKey", "passphrase"):
+        merged[key] = ""
+    for mask_key in ("apiKeyMask", "secretKeyMask", "passphraseMask"):
+        if remote_config.get(mask_key):
+            merged[mask_key] = remote_config.get(mask_key)
+        else:
+            merged.pop(mask_key, None)
+    merged["executionMode"] = local_redacted.get("executionMode", "remote")
+    merged["remoteGatewayUrl"] = local_redacted.get("remoteGatewayUrl", "")
+    merged["remoteGatewayToken"] = ""
+    if local_redacted.get("remoteGatewayTokenMask"):
+        merged["remoteGatewayTokenMask"] = local_redacted.get("remoteGatewayTokenMask")
+    return merged
+
 
 def should_proxy_to_remote(config: dict[str, Any], path: str) -> bool:
     if not is_remote_execution_enabled(config):
@@ -349,6 +421,32 @@ def should_proxy_to_remote(config: dict[str, Any], path: str) -> bool:
     if path in REMOTE_PROXY_EXACT_PATHS:
         return True
     return any(path.startswith(prefix) for prefix in REMOTE_PROXY_PREFIXES)
+
+
+def remote_node_health(config: dict[str, Any], *, timeout: float = 1.2) -> dict[str, Any]:
+    try:
+        response = remote_gateway_request(config, "GET", "/api/health", timeout=timeout)
+        payload = response.json()
+        route = payload.get("okxRoute") or {}
+        if not route:
+            route = {
+                "healthy": response.ok,
+                "summary": "远端执行节点已连接" if response.ok else "远端执行节点未就绪",
+                "detail": "",
+            }
+        route["executionMode"] = "remote"
+        route["remoteGatewayUrl"] = remote_gateway_url(config)
+        return route
+    except Exception as exc:
+        return {
+            "healthy": False,
+            "status": "remote_unreachable",
+            "summary": "远端执行节点未连通",
+            "detail": str(exc),
+            "technicalDetail": str(exc),
+            "executionMode": "remote",
+            "remoteGatewayUrl": remote_gateway_url(config),
+        }
 
 
 def safe_host_ips(host: str) -> list[str]:
@@ -5685,7 +5783,7 @@ class AppHandler(BaseHTTPRequestHandler):
             return
         config = CONFIG.current()
 
-        if should_proxy_to_remote(config, path):
+        if path != "/api/automation/config" and should_proxy_to_remote(config, path):
             try:
                 if path in ("/api/health", "/api/focus-snapshot"):
                     response = remote_gateway_request(config, "GET", self.path)
@@ -5704,7 +5802,9 @@ class AppHandler(BaseHTTPRequestHandler):
 
         if path == "/api/health":
             route_health = {}
-            if config.get("apiKey") and config.get("passphrase"):
+            if is_remote_execution_enabled(config):
+                route_health = remote_node_health(config)
+            elif config.get("apiKey") and config.get("passphrase"):
                 try:
                     route_health = evaluate_okx_route_health(config, force=False)
                 except Exception as exc:
@@ -5720,11 +5820,68 @@ class AppHandler(BaseHTTPRequestHandler):
             )
             return
 
-        if path == "/api/config":
+        if path == "/api/ping":
+            json_response(
+                self,
+                {
+                    "ok": True,
+                    "service": "okx-local-app",
+                    "executionMode": config.get("executionMode") or "local",
+                },
+            )
+            return
+
+        if path == "/api/local-config":
             json_response(self, {"ok": True, "config": CONFIG.redacted()})
             return
 
+        if path == "/api/config":
+            local_config = CONFIG.current()
+            local_redacted = CONFIG.redacted()
+            if is_remote_execution_enabled(local_config):
+                try:
+                    response = remote_gateway_request(local_config, "GET", self.path, timeout=1.2)
+                    remote_payload = response.json()
+                    merged = merge_remote_redacted_config(local_redacted, remote_payload)
+                    json_response(
+                        self,
+                        {
+                            "ok": bool(remote_payload.get("ok", True)),
+                            "config": merged,
+                            "remoteConfigLoaded": True,
+                        },
+                        status=response.status_code,
+                    )
+                except Exception as exc:
+                    json_response(
+                        self,
+                        {
+                            "ok": True,
+                            "config": local_redacted,
+                            "remoteConfigLoaded": False,
+                            "remoteConfigError": str(exc),
+                        },
+                    )
+                return
+            json_response(self, {"ok": True, "config": local_redacted})
+            return
+
         if path == "/api/automation/config":
+            if is_remote_execution_enabled(config):
+                try:
+                    response = remote_gateway_request(config, "GET", self.path, timeout=1.2)
+                    relay_requests_response(self, response)
+                except Exception as exc:
+                    json_response(
+                        self,
+                        {
+                            "ok": True,
+                            "config": AUTOMATION_CONFIG.current(),
+                            "remoteConfigLoaded": False,
+                            "remoteConfigError": str(exc),
+                        },
+                    )
+                return
             json_response(self, {"ok": True, "config": AUTOMATION_CONFIG.current()})
             return
 
@@ -5929,10 +6086,15 @@ class AppHandler(BaseHTTPRequestHandler):
                 raw = read_raw_request(self)
                 content_type = str(self.headers.get("Content-Type") or "application/json; charset=utf-8")
                 if path == "/api/config/test":
-                    raw = b"{}"
+                    payload = read_json_request(self)
+                    proxy_config = build_proxy_runtime_config(config, payload)
+                    remote_payload = build_remote_trading_config(config, payload, persist=False)
+                    raw = json.dumps(remote_payload, ensure_ascii=False).encode("utf-8")
                     content_type = "application/json; charset=utf-8"
+                else:
+                    proxy_config = config
                 response = remote_gateway_request(
-                    config,
+                    proxy_config,
                     "POST",
                     self.path,
                     body=raw,
@@ -5946,6 +6108,52 @@ class AppHandler(BaseHTTPRequestHandler):
         if path == "/api/config":
             payload = read_json_request(self)
             persist = bool(payload.pop("persist", False))
+            target_mode = str(payload.get("executionMode") or config.get("executionMode") or "local").strip()
+            if target_mode == "remote":
+                local_runtime = build_local_runtime_config(config, payload)
+                proxy_config = build_proxy_runtime_config(config, payload)
+                valid, message = validate_config(local_runtime)
+                if not valid:
+                    error_response(self, message, status=400)
+                    return
+                CONFIG.save(local_runtime, persist=persist)
+                remote_payload = build_remote_trading_config(config, payload, persist=persist)
+                try:
+                    response = remote_gateway_request(
+                        proxy_config,
+                        "POST",
+                        self.path,
+                        body=json.dumps(remote_payload, ensure_ascii=False).encode("utf-8"),
+                        content_type="application/json; charset=utf-8",
+                    )
+                    remote_data = response.json()
+                    merged = merge_remote_redacted_config(CONFIG.redacted(), remote_data)
+                    reset_focus_cache("account", "orders")
+                    PRIVATE_ORDER_STREAM.mark_dirty()
+                    json_response(
+                        self,
+                        {
+                            "ok": bool(remote_data.get("ok", response.ok)),
+                            "config": merged,
+                            "persisted": persist,
+                            "remoteConfigSaved": True,
+                        },
+                        status=response.status_code,
+                    )
+                except Exception as exc:
+                    json_response(
+                        self,
+                        {
+                            "ok": False,
+                            "error": f"远端执行节点保存失败: {exc}",
+                            "config": CONFIG.redacted(),
+                            "persisted": persist,
+                            "remoteConfigSaved": False,
+                        },
+                        status=502,
+                    )
+                return
+
             payload = CONFIG.merged_with_existing_secrets(payload)
             valid, message = validate_config(payload)
             if not valid:

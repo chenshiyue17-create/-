@@ -6,10 +6,16 @@
 - 本地 Mac 保留矿机和桌面控制台
 - 尽量不影响服务器上其他项目
 
+基于这台 `47.87.68.74` 当前情况：
+
+- `80` 口上已经有别的项目
+- `/okx-node` 现在没有挂到这套服务
+- 最快可用方案是：直接对外放 `18765/tcp`
+
 推荐默认值：
 
-- 节点监听：`127.0.0.1:18765`
-- 对外暴露：通过现有 Nginx 挂路径 `/okx-node/`
+- 节点监听：`0.0.0.0:18765`
+- 对外暴露：先走高位端口，后续再接 Nginx
 - systemd 服务名：`okx-remote-node`
 - 部署目录：`/opt/okx-local-app`
 
@@ -43,7 +49,7 @@ sudo nano /etc/okx-remote-node.env
 建议先填成：
 
 ```bash
-OKX_LOCAL_APP_HOST=127.0.0.1
+OKX_LOCAL_APP_HOST=0.0.0.0
 OKX_LOCAL_APP_PORT=18765
 OKX_LOCAL_APP_DATA_DIR=/opt/okx-local-app/data-remote
 OKX_DESK_GATEWAY_TOKEN=change-this-to-your-own-long-random-token
@@ -57,7 +63,25 @@ sudo systemctl status okx-remote-node --no-pager
 curl -s http://127.0.0.1:18765/api/health
 ```
 
-## 5A. 如果服务器已经有 Nginx，建议挂路径共存
+如果你之前手动写过 `/etc/systemd/system/okx-remote-node.service`，请确认里面没有把
+`OKX_LOCAL_APP_HOST=127.0.0.1` 这类值写死，否则会覆盖 `/etc/okx-remote-node.env`。
+最稳妥的做法是重新复制仓库里的最新 service 文件，再 `daemon-reload`：
+
+```bash
+sudo cp /opt/okx-local-app/deploy/systemd/okx-remote-node.service /etc/systemd/system/okx-remote-node.service
+sudo systemctl daemon-reload
+sudo systemctl restart okx-remote-node
+```
+
+别忘了同时在云控制台/安全组放开 `18765/tcp`。
+
+外网验证：
+
+```bash
+curl -s http://47.87.68.74:18765/api/health
+```
+
+## 5A. 后续如果你想并到 Nginx，再挂路径共存
 
 把下面模板合并到你现有站点配置里：
 
@@ -99,15 +123,13 @@ http://47.87.68.74/okx-node
 https://your-domain/okx-node
 ```
 
-## 5B. 如果你暂时没有 Nginx，也可以临时直开高位端口
-
-先把安全组放开 `18765/tcp`，然后本地桌面 App 填：
+## 5B. 当前最快方案：直接走高位端口
 
 ```text
 http://47.87.68.74:18765
 ```
 
-但这只是临时方案，长期还是建议挂到 Nginx 后面。
+长期如果要和现有 Web 项目更深共存，再切去 Nginx。
 
 ## 6. 本地桌面 App 怎么填
 

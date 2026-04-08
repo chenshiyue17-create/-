@@ -39,6 +39,6 @@ echo "[6/6] status"
 sudo systemctl --no-pager --full status "$SERVICE_NAME" || true
 
 echo
-echo "Done. Edit /etc/okx-remote-node.env to set OKX_DESK_GATEWAY_TOKEN and data path if needed."
+echo "Done. Edit /etc/okx-remote-node.env to set OKX_DESK_GATEWAY_TOKEN and host/port/data path if needed."
 echo "Then use:"
 echo "  sudo systemctl restart $SERVICE_NAME"

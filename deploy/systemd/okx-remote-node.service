@@ -7,9 +7,6 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=/opt/okx-local-app
 EnvironmentFile=-/etc/okx-remote-node.env
-Environment=OKX_LOCAL_APP_HOST=127.0.0.1
-Environment=OKX_LOCAL_APP_PORT=18765
-Environment=OKX_LOCAL_APP_DATA_DIR=/opt/okx-local-app/data-remote
 ExecStart=/opt/okx-local-app/scripts/start-remote-node.sh
 Restart=always
 RestartSec=3
