@@ -1,0 +1,7 @@
+data/
+data-remote/
+dist/
+__pycache__/
+*.pyc
+.venv/
+*.log

@@ -1,0 +1,446 @@
+import Cocoa
+import Foundation
+import WebKit
+
+final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
+    private let appName = "OKX Local App"
+    private let healthPorts = [8765]
+    private let healthPath = "/api/health"
+    private let compatibilityPaths = [
+        "/api/config",
+        "/api/automation/config",
+        "/api/miner/config"
+    ]
+    private let bundleId = "com.cc.okxlocalapp"
+
+    private var window: NSWindow!
+    private var webView: WKWebView!
+    private var serverProcess: Process?
+    private var serverOutputHandle: FileHandle?
+    private var serverLogURL: URL?
+    private var attachedToExistingServer = false
+
+    private struct PythonRuntime {
+        let executable: String
+        let home: String?
+        let version: String?
+    }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        if activateExistingInstanceIfNeeded() {
+            NSApp.terminate(nil)
+            return
+        }
+
+        buildWindow()
+        showPlaceholder(title: "Starting Local Desk", detail: "Preparing the embedded OKX service.")
+        ensureServerAndLoad()
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if !flag {
+            window.makeKeyAndOrderFront(nil)
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        return true
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        guard !attachedToExistingServer, let process = serverProcess, process.isRunning else {
+            serverOutputHandle?.closeFile()
+            return
+        }
+        process.terminate()
+        serverOutputHandle?.closeFile()
+    }
+
+    private func activateExistingInstanceIfNeeded() -> Bool {
+        let currentPid = ProcessInfo.processInfo.processIdentifier
+        let others = NSRunningApplication
+            .runningApplications(withBundleIdentifier: bundleId)
+            .filter { $0.processIdentifier != currentPid }
+
+        guard let existing = others.first else {
+            return false
+        }
+
+        existing.activate(options: [.activateAllWindows])
+        return true
+    }
+
+    private func buildWindow() {
+        let frame = NSRect(x: 0, y: 0, width: 1440, height: 920)
+        window = NSWindow(
+            contentRect: frame,
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = appName
+        window.center()
+        window.isReleasedWhenClosed = false
+        window.minSize = NSSize(width: 1120, height: 760)
+
+        let config = WKWebViewConfiguration()
+        config.defaultWebpagePreferences.allowsContentJavaScript = true
+        webView = WKWebView(frame: frame, configuration: config)
+        webView.navigationDelegate = self
+        webView.setValue(false, forKey: "drawsBackground")
+
+        window.contentView = webView
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func ensureServerAndLoad() {
+        if let url = detectExistingServiceURL() {
+            attachedToExistingServer = true
+            load(url)
+            return
+        }
+
+        launchEmbeddedServer()
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            for _ in 0..<80 {
+                if let url = self.detectExistingServiceURL() {
+                    DispatchQueue.main.async {
+                        self.load(url)
+                    }
+                    return
+                }
+                Thread.sleep(forTimeInterval: 0.25)
+            }
+
+            let detail = self.readProcessOutput().ifEmpty("The embedded service did not become ready in time.")
+            DispatchQueue.main.async {
+                self.showPlaceholder(title: "Launch Failed", detail: detail)
+            }
+        }
+    }
+
+    private func launchEmbeddedServer() {
+        guard let resourceURL = Bundle.main.resourceURL else {
+            showPlaceholder(title: "Missing Resources", detail: "Cannot locate the app bundle resources.")
+            return
+        }
+
+        let appResourceDir = resourceURL.appendingPathComponent("app", isDirectory: true)
+        let serverPath = appResourceDir.appendingPathComponent("server.py").path
+        let dataDir = applicationSupportDirectory().appendingPathComponent("data", isDirectory: true)
+        let logURL = applicationSupportDirectory().appendingPathComponent("embedded-server.log", isDirectory: false)
+
+        try? FileManager.default.createDirectory(at: dataDir, withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: logURL.path, contents: Data())
+
+        guard let pythonRuntime = preferredPythonRuntime() else {
+            showPlaceholder(
+                title: "Python Runtime Missing",
+                detail: "The app could not find a bundled Python runtime or a system Python with requests."
+            )
+            return
+        }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: pythonRuntime.executable)
+        process.arguments = [serverPath]
+        process.currentDirectoryURL = appResourceDir
+
+        var env = ProcessInfo.processInfo.environment
+        env["OKX_LOCAL_APP_DATA_DIR"] = dataDir.path
+        env["PYTHONUNBUFFERED"] = "1"
+        if let home = pythonRuntime.home {
+            env["PYTHONHOME"] = home
+            let pythonLibVersion = pythonRuntime.version ?? "3.12"
+            env["PYTHONPATH"] = "\(home)/lib/python\(pythonLibVersion):\(home)/lib/python\(pythonLibVersion)/site-packages"
+        }
+        process.environment = env
+
+        do {
+            let outputHandle = try FileHandle(forWritingTo: logURL)
+            try outputHandle.truncate(atOffset: 0)
+            serverOutputHandle = outputHandle
+            serverLogURL = logURL
+            process.standardOutput = outputHandle
+            process.standardError = outputHandle
+        } catch {
+            showPlaceholder(title: "Log Setup Error", detail: error.localizedDescription)
+            return
+        }
+
+        do {
+            if let outputHandle = serverOutputHandle,
+               let message = "[runtime] python=\(pythonRuntime.executable) version=\(pythonRuntime.version ?? "system")\n".data(using: .utf8) {
+                outputHandle.write(message)
+            }
+            try process.run()
+            serverProcess = process
+        } catch {
+            showPlaceholder(title: "Server Launch Error", detail: error.localizedDescription)
+        }
+    }
+
+    private func preferredPythonRuntime() -> PythonRuntime? {
+        if let frameworksURL = Bundle.main.privateFrameworksURL {
+            let versionsRoot = frameworksURL
+                .appendingPathComponent("Python.framework/Versions", isDirectory: true)
+            if let versionedRuntime = bundledPythonRuntime(in: versionsRoot) {
+                return versionedRuntime
+            }
+        }
+
+        let candidates = [
+            ProcessInfo.processInfo.environment["PYTHON3_PATH"],
+            "/Library/Frameworks/Python.framework/Versions/3.12/bin/python3",
+            "/opt/homebrew/bin/python3",
+            "/usr/local/bin/python3",
+            "/usr/bin/python3"
+        ].compactMap { $0 }
+
+        for candidate in candidates {
+            guard FileManager.default.isExecutableFile(atPath: candidate),
+                  probePythonRuntime(executable: candidate, home: nil, version: nil) else {
+                continue
+            }
+            return PythonRuntime(executable: candidate, home: nil, version: nil)
+        }
+
+        return nil
+    }
+
+    private func bundledPythonRuntime(in versionsRoot: URL) -> PythonRuntime? {
+        guard let entries = try? FileManager.default.contentsOfDirectory(
+            at: versionsRoot,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return nil
+        }
+
+        let versionDirs = entries
+            .filter { url in
+                let name = url.lastPathComponent
+                return name.range(of: #"^\d+\.\d+$"#, options: .regularExpression) != nil
+            }
+            .sorted { lhs, rhs in
+                compareVersionStrings(lhs.lastPathComponent, rhs.lastPathComponent) == .orderedDescending
+            }
+
+        for versionDir in versionDirs {
+            let version = versionDir.lastPathComponent
+            let executable = versionDir.appendingPathComponent("bin/python3").path
+            guard FileManager.default.isExecutableFile(atPath: executable),
+                  probePythonRuntime(executable: executable, home: versionDir.path, version: version) else {
+                continue
+            }
+            return PythonRuntime(executable: executable, home: versionDir.path, version: version)
+        }
+
+        return nil
+    }
+
+    private func compareVersionStrings(_ lhs: String, _ rhs: String) -> ComparisonResult {
+        let left = lhs.split(separator: ".").compactMap { Int($0) }
+        let right = rhs.split(separator: ".").compactMap { Int($0) }
+        let count = max(left.count, right.count)
+        for index in 0..<count {
+            let leftValue = index < left.count ? left[index] : 0
+            let rightValue = index < right.count ? right[index] : 0
+            if leftValue == rightValue { continue }
+            return leftValue < rightValue ? .orderedAscending : .orderedDescending
+        }
+        return .orderedSame
+    }
+
+    private func probePythonRuntime(executable: String, home: String?, version: String?) -> Bool {
+        let probe = Process()
+        probe.executableURL = URL(fileURLWithPath: executable)
+        probe.arguments = ["-c", "import requests"]
+        if let home {
+            var env = ProcessInfo.processInfo.environment
+            env["PYTHONHOME"] = home
+            let pythonLibVersion = version ?? "3.12"
+            env["PYTHONPATH"] = "\(home)/lib/python\(pythonLibVersion):\(home)/lib/python\(pythonLibVersion)/site-packages"
+            probe.environment = env
+        }
+
+        do {
+            try probe.run()
+            probe.waitUntilExit()
+            return probe.terminationStatus == 0
+        } catch {
+            return false
+        }
+    }
+
+    private func detectExistingServiceURL() -> URL? {
+        for port in healthPorts {
+            guard let url = URL(string: "http://127.0.0.1:\(port)\(healthPath)") else {
+                continue
+            }
+            if isHealthy(url: url) {
+                return URL(string: "http://127.0.0.1:\(port)/")
+            }
+        }
+        return nil
+    }
+
+    private func requestLooksHealthy(
+        url: URL,
+        timeout: TimeInterval,
+        bodyMustContain fragment: String? = nil
+    ) -> Bool {
+        let semaphore = DispatchSemaphore(value: 0)
+        var looksHealthy = false
+        var request = URLRequest(url: url)
+        request.timeoutInterval = timeout
+
+        URLSession.shared.dataTask(with: request) { data, response, error in
+            defer { semaphore.signal() }
+
+            guard
+                error == nil,
+                let http = response as? HTTPURLResponse,
+                http.statusCode == 200
+            else {
+                return
+            }
+
+            if let fragment {
+                guard
+                    let data,
+                    let text = String(data: data, encoding: .utf8),
+                    text.contains(fragment)
+                else {
+                    return
+                }
+            }
+
+            looksHealthy = true
+        }.resume()
+
+        _ = semaphore.wait(timeout: .now() + timeout + 0.25)
+        return looksHealthy
+    }
+
+    private func isHealthy(url: URL) -> Bool {
+        guard requestLooksHealthy(url: url, timeout: 0.8, bodyMustContain: "\"service\": \"okx-local-app\"") else {
+            return false
+        }
+
+        for compatibilityPath in compatibilityPaths {
+            guard let compatibilityURL = URL(string: "http://127.0.0.1:\(url.port ?? 0)\(compatibilityPath)") else {
+                return false
+            }
+            guard requestLooksHealthy(url: compatibilityURL, timeout: 1.5) else {
+                return false
+            }
+        }
+
+        return true
+    }
+
+    private func load(_ url: URL) {
+        window.title = "\(appName) - \(url.host ?? "127.0.0.1"):\(url.port ?? 0)"
+        webView.load(URLRequest(url: url))
+    }
+
+    private func showPlaceholder(title: String, detail: String) {
+        let safeTitle = title
+            .replacingOccurrences(of: "&", with: "&amp;")
+            .replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;")
+        let safeDetail = detail
+            .replacingOccurrences(of: "&", with: "&amp;")
+            .replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;")
+            .replacingOccurrences(of: "\n", with: "<br>")
+
+        let html = """
+        <!doctype html>
+        <html lang="en">
+          <head>
+            <meta charset="utf-8">
+            <style>
+              :root {
+                color-scheme: dark;
+              }
+              body {
+                margin: 0;
+                background: radial-gradient(circle at top left, rgba(69,214,196,0.12), transparent 28%), radial-gradient(circle at top right, rgba(255,184,77,0.10), transparent 24%), #0b0f14;
+                color: #e9eef5;
+                font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", sans-serif;
+                display: grid;
+                place-items: center;
+                min-height: 100vh;
+              }
+              .panel {
+                width: min(680px, calc(100vw - 96px));
+                border: 1px solid rgba(255,255,255,0.08);
+                padding: 28px 30px;
+                background: rgba(255,255,255,0.03);
+              }
+              .kicker {
+                color: #45d6c4;
+                text-transform: uppercase;
+                letter-spacing: 0.18em;
+                font-size: 11px;
+                margin-bottom: 12px;
+              }
+              h1 {
+                margin: 0 0 10px;
+                font: 600 36px Georgia, serif;
+              }
+              p {
+                margin: 0;
+                color: #9aa6b4;
+                line-height: 1.65;
+              }
+            </style>
+          </head>
+          <body>
+            <div class="panel">
+              <div class="kicker">OKX Local App</div>
+              <h1>\(safeTitle)</h1>
+              <p>\(safeDetail)</p>
+            </div>
+          </body>
+        </html>
+        """
+        webView.loadHTMLString(html, baseURL: nil)
+    }
+
+    private func applicationSupportDirectory() -> URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        return base.appendingPathComponent("OKXLocalApp", isDirectory: true)
+    }
+
+    private func readProcessOutput() -> String {
+        guard
+            let logURL = serverLogURL,
+            let data = try? Data(contentsOf: logURL),
+            let text = String(data: data, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+            !text.isEmpty
+        else {
+            return ""
+        }
+        return text
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        window.makeFirstResponder(webView)
+    }
+}
+
+private extension String {
+    func ifEmpty(_ fallback: String) -> String {
+        isEmpty ? fallback : self
+    }
+}
+
+let app = NSApplication.shared
+let delegate = AppDelegate()
+app.setActivationPolicy(.regular)
+app.delegate = delegate
+app.run()
