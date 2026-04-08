@@ -129,6 +129,30 @@ chmod +x scripts/package-remote-node.sh
 
 都会自动走远端节点。
 
+## 远端安全回归
+
+仓库带了一个只读验证脚本，用来确认当前远端节点到底跑的是 demo 还是 live、余额是不是按估值口径显示、以及实盘风险开关是否还锁着：
+
+```bash
+chmod +x scripts/verify-remote-safety.sh
+OKX_DESK_GATEWAY_TOKEN=your-token \
+./scripts/verify-remote-safety.sh http://127.0.0.1:18765 demo
+```
+
+如果你走的是 Nginx 路径代理，也可以直接测公网入口：
+
+```bash
+OKX_DESK_GATEWAY_TOKEN=your-token \
+./scripts/verify-remote-safety.sh https://your-host/okx-node live
+```
+
+它会输出：
+
+- 当前环境与 `simulated` 是否一致
+- 远端链路是否健康
+- 账户显示总额、估值总额、显示来源
+- `allowLiveManualOrders / allowLiveTrading / allowLiveAutostart` 当前状态
+
 ## 当前限制
 
 - 矿机相关接口仍然保留在本机

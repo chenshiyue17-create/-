@@ -152,3 +152,27 @@ http://47.87.68.74:18765
 - 模拟 / 实盘
 
 本地桌面控制台不会替远端保管这些交易密钥。
+
+## 8. 服务器侧安全回归
+
+更新远端节点后，推荐立刻在 ECS 上跑一次只读验证：
+
+```bash
+cd /opt/okx-local-app
+chmod +x scripts/verify-remote-safety.sh
+
+# 验证模拟盘
+OKX_DESK_GATEWAY_TOKEN=your-token \
+./scripts/verify-remote-safety.sh http://127.0.0.1:18765 demo
+
+# 验证实盘（如果当前切到了实盘）
+OKX_DESK_GATEWAY_TOKEN=your-token \
+./scripts/verify-remote-safety.sh http://127.0.0.1:18765 live
+```
+
+如果你外面已经挂了 `/okx-node`，也可以直接对公网入口做同样验证：
+
+```bash
+OKX_DESK_GATEWAY_TOKEN=your-token \
+./scripts/verify-remote-safety.sh http://47.87.68.74/okx-node demo
+```
