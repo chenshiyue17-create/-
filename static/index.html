@@ -1,0 +1,984 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>10U战神</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body data-view="focus">
+    <canvas id="tunnel-bg" aria-hidden="true"></canvas>
+    <div class="shell">
+      <aside class="rail">
+        <div class="brand">
+          <div class="brand-avatar-shell">
+            <img class="brand-avatar" src="/assets/avatar-10u-badge.png" alt="10U战神头像" />
+            <span class="brand-avatar-glow" aria-hidden="true"></span>
+          </div>
+          <div class="brand-copy">
+            <div class="brand-kicker">Galaxy Control</div>
+            <h1 class="brand-title"><span>10U</span><span>战神</span></h1>
+            <div class="brand-subtitle">OKX Quant Desk</div>
+            <p>本地量化驾驶舱，把现货、永续、自动量化、风控与矿机监控压进同一张桌面。</p>
+          </div>
+        </div>
+        <nav class="nav">
+          <button class="nav-link active" type="button" data-view="focus">聚焦工作台</button>
+          <button class="nav-link" type="button" data-view="research">策略研究</button>
+          <button class="nav-link" type="button" data-view="trade">交易执行</button>
+          <button class="nav-link" type="button" data-view="market">行情监控</button>
+          <button class="nav-link" type="button" data-view="miner">矿机看板</button>
+        </nav>
+        <div class="rail-highlights">
+          <div class="rail-stat">
+            <span>总余额</span>
+            <strong id="rail-balance-main">0.00</strong>
+            <small id="rail-balance-sub">USDT</small>
+          </div>
+          <div class="rail-stat">
+            <span>矿机收益</span>
+            <strong id="rail-miner-main">0.00</strong>
+            <small id="rail-miner-sub">USDT / 天</small>
+          </div>
+        </div>
+        <div class="status-strip">
+          <span class="dot" id="health-dot"></span>
+          <span id="health-text">等待连接</span>
+          <button id="test-config" class="btn btn-secondary status-strip-action">测试连接</button>
+        </div>
+      </aside>
+
+      <main class="workspace">
+        <section class="floating-dock" id="floating-dock">
+          <div class="dock-curve-card">
+            <div class="dock-head">
+              <div>
+                <div class="eyebrow">Live Equity</div>
+                <strong id="dock-equity-title">收益曲线悬浮窗</strong>
+              </div>
+              <span class="pill" id="dock-equity-meta">等待样本</span>
+            </div>
+            <div class="dock-equity-hero">
+              <span class="dock-equity-label">当前收益</span>
+              <strong class="dock-equity-main" id="dock-pnl-main">--</strong>
+              <small class="dock-equity-sub" id="dock-pnl-sub">等待会话收益</small>
+            </div>
+            <div class="dock-curve-shell">
+              <svg id="dock-equity-curve" viewBox="0 0 960 130" preserveAspectRatio="none" aria-label="悬浮收益曲线"></svg>
+            </div>
+            <div class="dock-curve-stats" id="dock-curve-stats">
+              <div class="dock-stat">
+                <span>样本</span>
+                <strong>--</strong>
+              </div>
+              <div class="dock-stat">
+                <span>峰值</span>
+                <strong>--</strong>
+              </div>
+              <div class="dock-stat">
+                <span>低点</span>
+                <strong>--</strong>
+              </div>
+              <div class="dock-stat">
+                <span>变化</span>
+                <strong>--</strong>
+              </div>
+            </div>
+          </div>
+          <div class="dock-market-card">
+            <div class="dock-head">
+              <div>
+                <div class="eyebrow">Hot Coins</div>
+                <strong id="dock-market-title">主流币实时价格</strong>
+              </div>
+              <span class="pill" id="dock-market-meta">滚动时保持可见</span>
+            </div>
+            <div class="dock-market-board" id="dock-mainstream-board">
+              <div class="board-card">
+                <span>BTC</span>
+                <strong>--</strong>
+                <small>等待价格</small>
+              </div>
+              <div class="board-card">
+                <span>ETH</span>
+                <strong>--</strong>
+                <small>等待价格</small>
+              </div>
+              <div class="board-card">
+                <span>SOL</span>
+                <strong>--</strong>
+                <small>等待价格</small>
+              </div>
+              <div class="board-card">
+                <span>DOGE</span>
+                <strong>--</strong>
+                <small>等待价格</small>
+              </div>
+              <div class="board-card">
+                <span>XRP</span>
+                <strong>--</strong>
+                <small>等待价格</small>
+              </div>
+            </div>
+          </div>
+          <div class="dock-status-card">
+            <div class="eyebrow">Live Decision</div>
+            <strong id="dock-status-main">等待联网预检</strong>
+            <small id="dock-status-sub">顶部固定显示当前策略、联网判断和执行环境。</small>
+          </div>
+        </section>
+
+        <section class="panel panel-cockpit" id="cockpit" data-view-group="focus">
+          <div class="cockpit-hero">
+            <div>
+              <div class="eyebrow">Auto Quant Cockpit</div>
+              <h2>总控 / 策略 / 风控 / 执行</h2>
+              <p>
+                先看资金、回撤、行情和联网决策，再决定是否下钻执行细节。
+              </p>
+            </div>
+            <div class="cockpit-actions">
+              <button id="cockpit-refresh" class="btn btn-primary" type="button">刷新全局</button>
+              <button id="cockpit-analyze" class="btn btn-secondary" type="button">立即联网预检</button>
+              <button id="cockpit-run-once" class="btn btn-secondary" type="button">跑一轮策略</button>
+              <button id="cockpit-stop" class="btn btn-ghost danger" type="button">一键停机</button>
+            </div>
+          </div>
+
+          <div class="cockpit-metrics">
+            <div class="cockpit-card hero">
+              <span>总权益</span>
+              <strong id="desk-total-equity">--</strong>
+              <small id="desk-total-equity-sub">等待账户快照</small>
+            </div>
+            <div class="cockpit-card">
+              <span>会话盈亏</span>
+              <strong id="desk-session-pnl">--</strong>
+              <small id="desk-session-pnl-sub">从本次自动化会话开始统计</small>
+            </div>
+            <div class="cockpit-card">
+              <span>日内回撤</span>
+              <strong id="desk-drawdown-main">0%</strong>
+              <small id="desk-drawdown-sub">风控阈值待载入</small>
+            </div>
+            <div class="cockpit-card">
+              <span>订单节奏</span>
+              <strong id="desk-order-pace">0 / 0</strong>
+              <small id="desk-order-pace-sub">今日订单数 / 日上限</small>
+            </div>
+            <div class="cockpit-card">
+              <span>策略节奏</span>
+              <strong id="desk-cycle">--</strong>
+              <small id="desk-cycle-sub">等待配置</small>
+            </div>
+            <div class="cockpit-card">
+              <span>执行环境</span>
+              <strong id="desk-mode">--</strong>
+              <small id="desk-mode-sub">模拟 / 实盘 + 策略状态</small>
+            </div>
+            <div class="cockpit-card">
+              <span>BTC 区块高度</span>
+              <strong id="desk-block-height">--</strong>
+              <small id="desk-block-height-sub">等待 BTC 网络数据</small>
+            </div>
+            <div class="cockpit-card">
+              <span>乐透矿机链路</span>
+              <strong id="desk-miner-route">--</strong>
+              <small id="desk-miner-route-sub">等待矿机概览</small>
+            </div>
+          </div>
+
+          <div class="cockpit-lower">
+            <div class="guard-card">
+              <div class="block-head">
+                <h3>执行护栏</h3>
+                <span class="pill" id="desk-risk-pill">待检查</span>
+              </div>
+              <div class="guard-list">
+                <div class="guard-item">
+                  <b>环境</b>
+                  <span id="guard-env">等待配置</span>
+                </div>
+                <div class="guard-item">
+                  <b>实盘开关</b>
+                  <span id="guard-live">未检查</span>
+                </div>
+                <div class="guard-item">
+                  <b>策略节奏</b>
+                  <span id="guard-cycle">未检查</span>
+                </div>
+                <div class="guard-item">
+                  <b>风控约束</b>
+                  <span id="guard-risk">未检查</span>
+                </div>
+                <div class="guard-item">
+                  <b>实时行情</b>
+                  <span id="guard-feed">等待行情连接</span>
+                </div>
+              </div>
+            </div>
+            <div class="guard-card analysis-card">
+              <div class="block-head">
+                <h3>联网决策层</h3>
+                <span class="pill" id="analysis-pill">待分析</span>
+              </div>
+              <div class="guard-list">
+                <div class="guard-item">
+                  <b>执行决策</b>
+                  <span id="analysis-decision">等待首轮联网分析</span>
+                </div>
+                <div class="guard-item">
+                  <b>当前策略</b>
+                  <span id="analysis-strategy">先联网分析，再给出本轮最优策略</span>
+                </div>
+                <div class="guard-item">
+                  <b>市场状态</b>
+                  <span id="analysis-market">等待波动、价差、资金费和趋势分析</span>
+                </div>
+                <div class="guard-item">
+                  <b>联网上下文</b>
+                  <span id="analysis-refresh">等待最新分析时间</span>
+                </div>
+                <div class="guard-item">
+                  <b>原因解释</b>
+                  <span id="analysis-reason">这层会决定是允许开新仓、只观察，还是直接跳过。</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel panel-hero" id="config" data-view-group="trade">
+          <div class="quick-surface">
+            <div class="quick-copy">
+              <div class="eyebrow">快速切换</div>
+              <h3>一键切到当前交易上下文</h3>
+              <p>先定环境，再切主盯标，底下表单只负责细调和落单。</p>
+            </div>
+            <div class="quick-groups">
+              <div class="quick-group">
+                <span class="quick-label">环境</span>
+                <div class="chip-group" id="env-quick-group">
+                  <button class="chip" type="button" data-env-preset="okx_main_demo">主站模拟</button>
+                  <button class="chip" type="button" data-env-preset="okx_main_live">主站实盘</button>
+                  <button class="chip" type="button" data-env-preset="okx_us_live">US 实盘</button>
+                  <button class="chip" type="button" data-env-preset="custom">自定义</button>
+                </div>
+              </div>
+              <div class="quick-group">
+                <span class="quick-label">主盯标</span>
+                <div class="chip-group" id="pair-quick-group">
+                  <button class="chip" type="button" data-pair-preset="btc">BTC</button>
+                  <button class="chip" type="button" data-pair-preset="eth">ETH</button>
+                  <button class="chip" type="button" data-pair-preset="sol">SOL</button>
+                </div>
+              </div>
+            </div>
+            <div class="quick-summary">
+              <div>
+                <span>当前环境</span>
+                <strong id="active-env-label">OKX 主站模拟盘</strong>
+              </div>
+              <div>
+                <span>当前组合</span>
+                <strong id="active-pair-label">BTC-USDT / BTC-USDT-SWAP</strong>
+              </div>
+            </div>
+          </div>
+          <div class="panel-head">
+            <div>
+              <div class="eyebrow">连接配置</div>
+              <h2>把交易环境先接稳</h2>
+            </div>
+            <div class="actions">
+              <button id="save-config" class="btn btn-primary">保存配置</button>
+              <button id="refresh-all" class="btn btn-ghost">刷新快照</button>
+            </div>
+          </div>
+          <div class="config-grid">
+            <label>
+              <span>环境预设</span>
+              <select id="envPreset">
+                <option value="okx_main_demo">OKX 主站模拟盘</option>
+                <option value="okx_main_live">OKX 主站实盘</option>
+                <option value="okx_us_live">OKX US 实盘</option>
+                <option value="custom">自定义</option>
+              </select>
+            </label>
+            <label>
+              <span>API Key</span>
+              <input id="apiKey" type="text" placeholder="输入 OKX API Key" />
+            </label>
+            <label>
+              <span>Secret Key</span>
+              <input id="secretKey" type="password" placeholder="输入 Secret Key" />
+            </label>
+            <label>
+              <span>Passphrase</span>
+              <input id="passphrase" type="password" placeholder="输入 Passphrase" />
+            </label>
+            <label>
+              <span>Base URL</span>
+              <input id="baseUrl" type="text" value="https://www.okx.com" />
+            </label>
+            <label class="toggle">
+              <span>模式</span>
+              <select id="simulated">
+                <option value="true">模拟盘</option>
+                <option value="false">实盘</option>
+              </select>
+            </label>
+            <label class="toggle">
+              <span>执行节点</span>
+              <select id="executionMode">
+                <option value="local">本机直连</option>
+                <option value="remote">远端执行节点</option>
+              </select>
+            </label>
+            <label>
+              <span>远端节点 URL</span>
+              <input id="remoteGatewayUrl" type="text" placeholder="https://your-remote-node:8765" />
+            </label>
+            <label>
+              <span>远端节点令牌</span>
+              <input id="remoteGatewayToken" type="password" placeholder="可选，远端节点鉴权令牌" />
+            </label>
+            <label class="toggle checkbox-row">
+              <span>本地明文保存</span>
+              <input id="persist" type="checkbox" checked />
+            </label>
+          </div>
+          <div class="endpoint-grid">
+            <div class="endpoint-card">
+              <b>REST</b>
+              <span id="endpoint-rest">https://www.okx.com</span>
+            </div>
+            <div class="endpoint-card">
+              <b>Public WS</b>
+              <span id="endpoint-public-ws">wss://wspap.okx.com:8443/ws/v5/public</span>
+            </div>
+            <div class="endpoint-card">
+              <b>Private WS</b>
+              <span id="endpoint-private-ws">wss://wspap.okx.com:8443/ws/v5/private</span>
+            </div>
+            <div class="endpoint-card">
+              <b>Business WS</b>
+              <span id="endpoint-business-ws">wss://wspap.okx.com:8443/ws/v5/business</span>
+            </div>
+          </div>
+          <div class="notice" id="config-message">建议先用模拟盘测试下单链路。</div>
+        </section>
+
+        <section class="panel panel-automation" id="automation" data-view-group="focus research">
+          <div class="section-title">
+            <div>
+              <div class="eyebrow">自动量化</div>
+              <h2>后台自己盯信号，自己做风控</h2>
+            </div>
+            <div class="actions">
+              <button id="save-automation" class="btn btn-secondary">保存策略</button>
+              <button id="run-automation-once" class="btn btn-ghost">执行一轮</button>
+              <button id="start-automation" class="btn btn-primary">启动自动化</button>
+              <button id="stop-automation" class="btn btn-ghost">停止</button>
+            </div>
+          </div>
+          <div class="preset-surface">
+            <div class="preset-copy">
+              <span class="quick-label">策略模式</span>
+              <input id="autoStrategyPreset" type="hidden" value="dual_engine" />
+              <strong id="active-strategy-label">标准双引擎</strong>
+              <p id="active-strategy-description">均衡版现货+永续策略，适合常规 BTC / ETH / SOL 轮询。</p>
+            </div>
+            <div class="chip-group" id="strategy-preset-group">
+              <button class="chip" type="button" data-strategy-preset="dual_engine">标准双引擎</button>
+              <button class="chip" type="button" data-strategy-preset="btc_lotto">BTC 乐透机</button>
+            </div>
+          </div>
+          <div class="research-surface">
+            <div class="block-head">
+              <div>
+                <h3>模拟研究 / 自动优化</h3>
+                <p class="subtle">
+                  先用历史 K 线跑本地回测，再自动扫描更合适的 EMA、止盈止损和周期组合，最后把最佳参数回填到当前策略。
+                </p>
+              </div>
+              <div class="actions research-actions">
+                <button id="run-backtest" class="btn btn-secondary" type="button">回测当前参数</button>
+                <button id="run-optimizer" class="btn btn-primary" type="button">持续进化优化</button>
+                <button id="apply-best-strategy" class="btn btn-ghost" type="button">应用最佳参数</button>
+                <button id="export-all-strategies" class="btn btn-ghost" type="button">导出当前策略包</button>
+              </div>
+            </div>
+            <div class="research-controls">
+              <label>
+                <span>研究样本数</span>
+                <input id="researchHistoryLimit" type="number" min="120" max="720" step="20" value="240" />
+              </label>
+              <label>
+                <span>赛马策略数</span>
+                <input id="researchRaceSize" type="number" min="6" max="16" step="1" value="10" />
+              </label>
+              <label>
+                <span>进化轮数</span>
+                <input id="researchEvolutionLoops" type="number" min="2" max="6" step="1" value="4" />
+              </label>
+              <label>
+                <span>优化强度</span>
+                <select id="researchDepth">
+                  <option value="quick">快速</option>
+                  <option value="standard">标准</option>
+                </select>
+              </label>
+              <label class="checkbox-row">
+                <span>跨周期扫描</span>
+                <input id="researchIncludeAltBars" type="checkbox" checked />
+              </label>
+              <label class="checkbox-row">
+                <span>开启杂交</span>
+                <input id="researchEnableHybrid" type="checkbox" checked />
+              </label>
+              <label class="checkbox-row">
+                <span>开启微调</span>
+                <input id="researchEnableFineTune" type="checkbox" checked />
+              </label>
+            </div>
+            <div class="research-metrics">
+              <div class="bot-meta">
+                <span>研究状态</span>
+                <strong id="research-status">未运行</strong>
+                <small id="research-status-sub">先运行回测或自动优化</small>
+              </div>
+              <div class="bot-meta">
+                <span>回测收益</span>
+                <strong id="research-return">--</strong>
+                <small id="research-return-sub">净收益率</small>
+              </div>
+              <div class="bot-meta">
+                <span>最大回撤</span>
+                <strong id="research-drawdown">--</strong>
+                <small id="research-drawdown-sub">研究样本内</small>
+              </div>
+              <div class="bot-meta">
+                <span>建议参数</span>
+                <strong id="research-best">--</strong>
+                <small id="research-best-sub">自动优化后可直接应用</small>
+              </div>
+            </div>
+            <div class="data-columns research-columns">
+              <div class="table-block">
+                <div class="block-head">
+                  <h3>命名策略榜单</h3>
+                </div>
+                <div id="research-board" class="table-like empty">自动优化后会列出带名字、收益、回撤和单独导出动作的候选策略。</div>
+              </div>
+              <div class="table-block">
+                <div class="block-head">
+                  <h3>进化轨迹</h3>
+                </div>
+                <div id="research-notes" class="table-like empty">回测会基于历史收盘价做本地模拟，不会真实下单。</div>
+              </div>
+            </div>
+          </div>
+          <div class="bot-status-bar">
+            <div class="bot-badge">
+              <span class="dot" id="bot-dot"></span>
+              <strong id="bot-status">未启动</strong>
+              <span id="bot-mode">等待配置</span>
+            </div>
+            <div class="bot-meta">
+              <span>最近轮询</span>
+              <strong id="bot-last-cycle">-</strong>
+            </div>
+            <div class="bot-meta">
+              <span>今日订单数</span>
+              <strong id="bot-order-count">0</strong>
+            </div>
+            <div class="bot-meta">
+              <span>日内回撤</span>
+              <strong id="bot-drawdown">0%</strong>
+            </div>
+          </div>
+          <div class="focus-inline-note">
+            聚焦模式只保留研究入口和运行状态。切到“策略研究”再看完整参数、状态明细和日志。
+          </div>
+          <div class="automation-grid research-detail-block">
+            <label>
+              <span>K 线周期</span>
+              <select id="autoBar">
+                <option value="1m">1m</option>
+                <option value="5m">5m</option>
+                <option value="15m">15m</option>
+                <option value="1H">1H</option>
+              </select>
+            </label>
+            <label>
+              <span>快 EMA</span>
+              <input id="autoFastEma" type="number" min="2" value="9" />
+            </label>
+            <label>
+              <span>慢 EMA</span>
+              <input id="autoSlowEma" type="number" min="3" value="21" />
+            </label>
+            <label>
+              <span>轮询秒数</span>
+              <input id="autoPollSeconds" type="number" min="5" value="20" />
+            </label>
+            <label>
+              <span>冷却秒数</span>
+              <input id="autoCooldownSeconds" type="number" min="0" value="180" />
+            </label>
+            <label>
+              <span>每日最大订单数</span>
+              <input id="autoMaxOrdersPerDay" type="number" min="1" value="20" />
+            </label>
+            <label class="checkbox-row">
+              <span>启用现货策略</span>
+              <input id="autoSpotEnabled" type="checkbox" checked />
+            </label>
+            <label>
+              <span>现货单次预算 (USDT)</span>
+              <input id="autoSpotQuoteBudget" type="number" min="0" step="0.01" value="100" />
+            </label>
+            <label>
+              <span>现货最大敞口 (USDT)</span>
+              <input id="autoSpotMaxExposure" type="number" min="0" step="0.01" value="300" />
+            </label>
+            <label class="checkbox-row">
+              <span>启用永续策略</span>
+              <input id="autoSwapEnabled" type="checkbox" checked />
+            </label>
+            <label>
+              <span>永续张数</span>
+              <input id="autoSwapContracts" type="number" min="0" step="1" value="1" />
+            </label>
+            <label>
+              <span>永续保证金模式</span>
+              <select id="autoSwapTdMode">
+                <option value="cross">全仓 cross</option>
+                <option value="isolated">逐仓 isolated</option>
+              </select>
+            </label>
+            <label>
+              <span>永续策略方向</span>
+              <select id="autoSwapStrategyMode">
+                <option value="trend_follow">顺势双向</option>
+                <option value="long_only">只做多</option>
+                <option value="short_only">只做空</option>
+              </select>
+            </label>
+            <label>
+              <span>永续杠杆</span>
+              <input id="autoSwapLeverage" type="number" min="1" max="10" step="1" value="5" />
+            </label>
+            <label>
+              <span>止损 (%)</span>
+              <input id="autoStopLossPct" type="number" min="0" step="0.1" value="1.2" />
+            </label>
+            <label>
+              <span>止盈 (%)</span>
+              <input id="autoTakeProfitPct" type="number" min="0" step="0.1" value="2.4" />
+            </label>
+            <label>
+              <span>日内最大回撤 (%)</span>
+              <input id="autoMaxDailyLossPct" type="number" min="0" step="0.1" value="3.0" />
+            </label>
+            <label class="checkbox-row">
+              <span>服务启动后自动启动策略</span>
+              <input id="autoAutostart" type="checkbox" />
+            </label>
+            <label class="checkbox-row">
+              <span>允许实盘自动交易</span>
+              <input id="autoAllowLiveTrading" type="checkbox" />
+            </label>
+            <label class="checkbox-row">
+              <span>允许实盘自动启动</span>
+              <input id="autoAllowLiveAutostart" type="checkbox" />
+            </label>
+            <label class="checkbox-row">
+              <span>启动时强制切 net_mode</span>
+              <input id="autoEnforceNetMode" type="checkbox" checked />
+            </label>
+          </div>
+          <div class="bot-panels research-detail-block">
+            <div class="bot-panel">
+              <div class="block-head">
+                <h3>现货策略状态</h3>
+              </div>
+              <div id="bot-spot-state" class="table-like empty">等待策略启动</div>
+            </div>
+            <div class="bot-panel">
+              <div class="block-head">
+                <h3>永续策略状态</h3>
+              </div>
+              <div id="bot-swap-state" class="table-like empty">等待策略启动</div>
+            </div>
+          </div>
+          <div class="bot-panel log-panel research-detail-block">
+            <div class="block-head">
+              <h3>策略日志</h3>
+            </div>
+            <div id="bot-logs" class="log-list empty">暂无日志</div>
+          </div>
+          <div class="notice" id="automation-message">默认参数已预填，建议先保存配置，再在模拟盘启动自动化。</div>
+        </section>
+
+        <section class="panel panel-grid" id="snapshot" data-view-group="trade">
+          <div class="section-title">
+            <div class="eyebrow">账户快照</div>
+            <h2>余额、持仓、订单一眼扫清</h2>
+          </div>
+          <div class="metrics">
+            <div class="metric">
+              <span>可用余额币种数</span>
+              <strong id="metric-balance-count">-</strong>
+            </div>
+            <div class="metric">
+              <span>持仓数量</span>
+              <strong id="metric-position-count">-</strong>
+            </div>
+            <div class="metric">
+              <span>最近订单</span>
+              <strong id="metric-order-count">-</strong>
+            </div>
+          </div>
+          <div class="data-columns">
+            <div class="table-block">
+              <div class="block-head">
+                <h3>余额</h3>
+              </div>
+              <div id="balances" class="table-like empty">暂无数据</div>
+            </div>
+            <div class="table-block">
+              <div class="block-head">
+                <h3>持仓</h3>
+              </div>
+              <div id="positions" class="table-like empty">暂无数据</div>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel panel-market" id="market" data-view-group="market">
+          <div class="section-title">
+            <div class="eyebrow">行情</div>
+            <h2>主流币实时价格和 K 线都挂在眼前</h2>
+          </div>
+          <div class="market-live-bar">
+            <div class="bot-badge market-badge">
+              <span class="dot" id="live-feed-dot"></span>
+              <strong id="live-feed-text">实时行情未连接</strong>
+              <span id="live-feed-detail">等待建立 WebSocket</span>
+            </div>
+            <div class="chip-group">
+              <button id="restart-live-feed" class="btn btn-ghost" type="button">重连实时流</button>
+            </div>
+          </div>
+          <div class="market-board" id="mainstream-board">
+            <div class="board-card">
+              <span>BTC-USDT</span>
+              <strong>--</strong>
+              <small>等待实时价格</small>
+            </div>
+            <div class="board-card">
+              <span>ETH-USDT</span>
+              <strong>--</strong>
+              <small>等待实时价格</small>
+            </div>
+            <div class="board-card">
+              <span>SOL-USDT</span>
+              <strong>--</strong>
+              <small>等待实时价格</small>
+            </div>
+            <div class="board-card">
+              <span>DOGE-USDT</span>
+              <strong>--</strong>
+              <small>等待实时价格</small>
+            </div>
+            <div class="board-card">
+              <span>XRP-USDT</span>
+              <strong>--</strong>
+              <small>等待实时价格</small>
+            </div>
+          </div>
+          <div class="market-controls">
+            <label>
+              <span>现货 InstId</span>
+              <input id="spotInstId" value="BTC-USDT" />
+            </label>
+            <label>
+              <span>永续 InstId</span>
+              <input id="swapInstId" value="BTC-USDT-SWAP" />
+            </label>
+            <label>
+              <span>K 线周期</span>
+              <select id="marketBar">
+                <option value="1m">1m</option>
+                <option value="5m" selected>5m</option>
+                <option value="15m">15m</option>
+                <option value="1H">1H</option>
+              </select>
+            </label>
+            <button id="refresh-market" class="btn btn-secondary">刷新行情</button>
+          </div>
+          <div class="ticker-grid">
+            <div class="ticker-pane">
+              <div class="ticker-label">现货</div>
+              <div id="spotTicker" class="ticker-value">等待刷新</div>
+            </div>
+            <div class="ticker-pane">
+              <div class="ticker-label">永续</div>
+              <div id="swapTicker" class="ticker-value">等待刷新</div>
+            </div>
+          </div>
+          <div class="chart-block">
+            <div class="block-head">
+              <h3 id="market-chart-title">BTC-USDT 实时 K 线</h3>
+              <span class="pill" id="market-chart-meta">5m · 实时推送</span>
+            </div>
+            <div class="chart-shell">
+              <svg id="market-chart" viewBox="0 0 960 320" preserveAspectRatio="none" aria-label="实时K线图"></svg>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel panel-miner" id="miner" data-view-group="miner">
+          <div class="section-title">
+            <div>
+              <div class="eyebrow">Mac BTC Lotto</div>
+              <h2>这里只保留本机 Mac 乐透机</h2>
+            </div>
+            <div class="actions">
+              <button id="save-miner-config" class="btn btn-secondary" type="button">保存矿机配置</button>
+              <button id="refresh-miner" class="btn btn-primary" type="button">刷新矿机概览</button>
+            </div>
+          </div>
+
+          <div class="metrics miner-metrics">
+            <div class="metric">
+              <span>BTC 现价</span>
+              <strong id="miner-btc-price">--</strong>
+            </div>
+            <div class="metric">
+              <span>区块高度</span>
+              <strong id="miner-tip-height">--</strong>
+            </div>
+            <div class="metric">
+              <span>推荐费率</span>
+              <strong id="miner-fast-fee">--</strong>
+            </div>
+            <div class="metric">
+              <span>并发矿工</span>
+              <strong id="miner-worker-count">--</strong>
+            </div>
+            <div class="metric">
+              <span>本机算力</span>
+              <strong id="miner-cpu-hashrate">--</strong>
+            </div>
+            <div class="metric">
+              <span>理论日收益</span>
+              <strong id="miner-theory-yield">--</strong>
+            </div>
+            <div class="metric">
+              <span>单日命中概率</span>
+              <strong id="miner-theory-chance">--</strong>
+            </div>
+            <div class="metric">
+              <span>联网方案</span>
+              <strong id="miner-plan-count">--</strong>
+            </div>
+          </div>
+
+          <div class="miner-progress-surface">
+            <div class="miner-progress-copy">
+              <div class="block-head">
+                <div>
+                  <h3>本机挖矿进度和理论收获</h3>
+                  <p class="subtle">
+                    这不是稳定分润矿机，而是彩票型 solo miner。多数时候不会有稳定 share 收入，所以这里直接展示当前进度、理论日收益和理论中块周期。
+                  </p>
+                </div>
+                <span class="pill" id="miner-progress-badge">等待分析</span>
+              </div>
+              <div class="miner-progress-headline">
+                <strong id="miner-progress-headline">等待矿机概览</strong>
+                <span id="miner-progress-detail">会根据本机算力、全网难度和矿池状态解释现在到底有没有在推进。</span>
+              </div>
+            </div>
+            <div class="miner-progress-grid">
+              <div class="bot-meta">
+                <span>估算算力</span>
+                <strong id="miner-progress-hashrate">--</strong>
+                <small id="miner-progress-hashrate-sub">等待本机基准</small>
+              </div>
+              <div class="bot-meta">
+                <span>理论日收益</span>
+                <strong id="miner-progress-yield">--</strong>
+                <small id="miner-progress-yield-sub">等待网络数据</small>
+              </div>
+              <div class="bot-meta">
+                <span>理论中块时间</span>
+                <strong id="miner-progress-eta">--</strong>
+                <small id="miner-progress-eta-sub">等待全网难度</small>
+              </div>
+              <div class="bot-meta">
+                <span>当前进度</span>
+                <strong id="miner-progress-ratio">--</strong>
+                <small id="miner-progress-ratio-sub">等待最佳难度</small>
+              </div>
+              <div class="bot-meta">
+                <span>运行时长</span>
+                <strong id="miner-progress-uptime">--</strong>
+                <small id="miner-progress-uptime-sub">等待启动时间</small>
+              </div>
+              <div class="bot-meta">
+                <span>矿池反馈</span>
+                <strong id="miner-progress-pool">--</strong>
+                <small id="miner-progress-pool-sub">等待矿池统计</small>
+              </div>
+            </div>
+          </div>
+
+          <input id="minerMode" type="hidden" value="mac_lotto" />
+          <input id="minerPoolApiBase" type="hidden" value="" />
+          <input id="minerBitaxeHosts" type="hidden" value="" />
+          <input id="minerSerialPort" type="hidden" value="" />
+          <input id="minerBoardType" type="hidden" value="Mac 本机 CPU" />
+          <input id="minerBitaxeActionHost" type="hidden" value="" />
+
+          <div class="config-grid miner-config-grid">
+            <label>
+              <span>BTC 地址</span>
+              <input id="minerWallet" type="text" placeholder="bc1..." />
+            </label>
+            <label>
+              <span>Worker 名称</span>
+              <input id="minerWorkerName" type="text" placeholder="desk" />
+            </label>
+            <label>
+              <span>Pool Host</span>
+              <input id="minerPoolHost" type="text" placeholder="solo.ckpool.org" />
+            </label>
+            <label>
+              <span>Pool Port</span>
+              <input id="minerPoolPort" type="number" min="1" step="1" placeholder="3333" />
+            </label>
+            <label>
+              <span>并发矿工</span>
+              <input id="minerCpuWorkers" type="number" min="1" step="1" value="8" />
+            </label>
+            <label>
+              <span>刷新秒数</span>
+              <input id="minerRefreshSeconds" type="number" min="1" step="1" value="20" />
+            </label>
+            <label>
+              <span>Pool Password</span>
+              <input id="minerPoolPassword" type="text" placeholder="x" />
+            </label>
+          </div>
+
+          <div class="bot-status-bar miner-actions-bar">
+            <div class="bot-badge market-badge">
+              <span class="dot" id="miner-dot"></span>
+              <strong id="miner-status">等待刷新</strong>
+              <span id="miner-status-detail">将会展示 BTC 网络、本机 CPU 矿机状态和本轮理论收获解释</span>
+            </div>
+            <button id="miner-mac-start" class="btn btn-primary" type="button">启动 Mac 乐透机</button>
+            <button id="miner-mac-stop" class="btn btn-secondary" type="button">停止本机矿机</button>
+          </div>
+
+          <div class="table-block recent-block">
+            <div class="block-head">
+              <h3>Mac 乐透机日志</h3>
+            </div>
+            <div id="miner-mac-log" class="log-list empty">本机矿机尚未启动</div>
+          </div>
+
+          <div class="table-block recent-block">
+            <div class="block-head">
+              <h3>联网更多矿机方案</h3>
+            </div>
+            <div id="miner-options" class="miner-option-grid"></div>
+          </div>
+
+          <div class="notice" id="miner-message">
+            模式横幅已经移除。现在矿机页只保留本机聚合矿工、理论收益和外部扩展方案。
+          </div>
+        </section>
+
+        <section class="panel panel-orders" id="orders" data-view-group="trade">
+          <div class="section-title">
+            <div class="eyebrow">下单</div>
+            <h2>现货与合约两张票据分开控</h2>
+          </div>
+          <div class="ticket-grid">
+            <form class="ticket" id="spot-order-form">
+              <div class="ticket-head">
+                <h3>现货下单</h3>
+                <span class="pill">tdMode=cash</span>
+              </div>
+              <input type="hidden" name="instId" data-source="spotInstId" />
+              <input type="hidden" name="tdMode" value="cash" />
+              <label><span>方向</span><select name="side"><option value="buy">买入</option><option value="sell">卖出</option></select></label>
+              <label><span>类型</span><select name="ordType"><option value="limit">限价</option><option value="market">市价</option></select></label>
+              <label><span>价格</span><input name="px" placeholder="限价单必填" /></label>
+              <label><span>数量</span><input name="sz" placeholder="如 0.001" /></label>
+              <label><span>Client ID</span><input name="clOrdId" placeholder="可选" /></label>
+              <button class="btn btn-primary" type="submit">提交现货订单</button>
+            </form>
+
+            <form class="ticket" id="swap-order-form">
+              <div class="ticket-head">
+                <h3>永续下单</h3>
+                <span class="pill">cross / isolated</span>
+              </div>
+              <input type="hidden" name="instId" data-source="swapInstId" />
+              <label><span>模式</span><select name="tdMode"><option value="cross">全仓</option><option value="isolated">逐仓</option></select></label>
+              <label><span>方向</span><select name="side"><option value="buy">开多 / 平空</option><option value="sell">开空 / 平多</option></select></label>
+              <label><span>持仓方向</span><select name="posSide"><option value="long">long</option><option value="short">short</option></select></label>
+              <label><span>类型</span><select name="ordType"><option value="limit">限价</option><option value="market">市价</option></select></label>
+              <label><span>价格</span><input name="px" placeholder="限价单必填" /></label>
+              <label><span>张数</span><input name="sz" placeholder="如 1" /></label>
+              <label><span>Client ID</span><input name="clOrdId" placeholder="可选" /></label>
+              <label class="checkbox-row"><span>仅减仓</span><input name="reduceOnly" type="checkbox" /></label>
+              <button class="btn btn-primary" type="submit">提交合约订单</button>
+            </form>
+          </div>
+          <div class="table-block recent-block">
+            <div class="block-head">
+              <h3>最近订单</h3>
+              <button id="refresh-orders" class="btn btn-ghost">刷新订单</button>
+            </div>
+            <div class="order-summary-strip" id="orderSummaryStrip">
+              <div class="order-summary-chip">
+                <span>订单总数</span>
+                <strong id="order-summary-count">0</strong>
+              </div>
+              <div class="order-summary-chip">
+                <span>工作中</span>
+                <strong id="order-summary-working">0</strong>
+              </div>
+              <div class="order-summary-chip">
+                <span>已成交</span>
+                <strong id="order-summary-filled">0</strong>
+              </div>
+              <div class="order-summary-chip">
+                <span>数据源</span>
+                <strong id="order-summary-source">-</strong>
+              </div>
+            </div>
+            <div class="orders-terminal">
+              <div id="recentOrders" class="orders-feed empty">暂无订单数据</div>
+              <aside id="orderDetail" class="order-detail empty">
+                <div class="order-detail-empty">
+                  <strong>选中一笔订单</strong>
+                  <span>这里会显示状态、成交、价格、时间、订单号和执行标记。</span>
+                </div>
+              </aside>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <script src="/app.js"></script>
+  </body>
+  </html>
