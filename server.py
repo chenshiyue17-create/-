@@ -14,6 +14,7 @@ import ipaddress
 import os
 import re
 import secrets
+import shutil
 import socket
 import subprocess
 import sys
@@ -52,6 +53,7 @@ MAX_LOG_ENTRIES = 120
 SECURE_FILE_MAGIC = "okx-local-app-secure-v1"
 KEYCHAIN_SERVICE = "com.cc.okxlocalapp.local-file-key"
 KEYCHAIN_ACCOUNT = "default"
+FALLBACK_SECRET_FILE = DATA_DIR / ".local-file-key"
 VENDOR_ROOT = APP_DIR.parent / "btc-lotto-miner-app" / "vendor"
 HASHRATE_BENCHMARK_CACHE: dict[str, Any] = {"ts": 0.0, "hashrate": 0.0, "duration": 0.0}
 MINER_OPTIONS_CACHE: dict[str, Any] = {"ts": 0.0, "items": []}
@@ -724,6 +726,9 @@ def ensure_private_permissions(path: Path, *, is_dir: bool = False) -> None:
 
 
 def keychain_secret() -> str:
+    if sys.platform != "darwin" or not shutil.which("security"):
+        return file_secret()
+
     found = subprocess.run(
         [
             "security",
@@ -761,6 +766,25 @@ def keychain_secret() -> str:
     if created.returncode != 0:
         message = created.stderr.strip() or "无法写入 macOS Keychain"
         raise RuntimeError(message)
+    return generated
+
+
+def file_secret() -> str:
+    secret = str(os.environ.get("OKX_LOCAL_APP_FILE_SECRET") or "").strip()
+    if secret:
+        return secret
+
+    FALLBACK_SECRET_FILE.parent.mkdir(parents=True, exist_ok=True)
+    ensure_private_permissions(FALLBACK_SECRET_FILE.parent, is_dir=True)
+    if FALLBACK_SECRET_FILE.exists():
+        ensure_private_permissions(FALLBACK_SECRET_FILE)
+        value = FALLBACK_SECRET_FILE.read_text(encoding="utf-8").strip()
+        if value:
+            return value
+
+    generated = secrets.token_urlsafe(48)
+    FALLBACK_SECRET_FILE.write_text(generated, encoding="utf-8")
+    ensure_private_permissions(FALLBACK_SECRET_FILE)
     return generated
 
 

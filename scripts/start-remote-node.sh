@@ -19,6 +19,18 @@ if [[ ! -x "$PYTHON_BIN" ]]; then
   PYTHON_BIN="$(command -v python3)"
 fi
 
+PY_VERSION_OK="$("$PYTHON_BIN" - <<'PY'
+import sys
+print("ok" if sys.version_info >= (3, 10) else f"too-old:{sys.version_info.major}.{sys.version_info.minor}")
+PY
+)"
+
+if [[ "$PY_VERSION_OK" != "ok" ]]; then
+  echo "当前 Python 版本过低：$PY_VERSION_OK"
+  echo "OKX 远端执行节点需要 Python 3.10 或更高版本。"
+  exit 1
+fi
+
 echo "Starting OKX remote execution node on $HOST:$PORT"
 echo "Data dir: $DATA_DIR"
 echo "Python: $PYTHON_BIN"
