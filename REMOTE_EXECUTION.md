@@ -83,9 +83,20 @@ chmod +x deploy/check-server-collisions.sh
 ./deploy/check-server-collisions.sh 18765 okx-remote-node
 ```
 
+## 服务器直接从 GitHub 部署
+
+更推荐直接在服务器上克隆：
+
+```bash
+sudo git clone https://github.com/chenshiyue17-create/-.git /opt/okx-local-app
+cd /opt/okx-local-app
+chmod +x deploy/bootstrap-cloned-node.sh
+./deploy/bootstrap-cloned-node.sh /opt/okx-local-app okx-remote-node 18765
+```
+
 ## 打包上传
 
-本机可以先生成远端部署包：
+如果你不方便让服务器直接访问 GitHub，本机也可以先生成远端部署包：
 
 ```bash
 chmod +x scripts/package-remote-node.sh
