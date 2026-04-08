@@ -13,46 +13,26 @@
 - systemd 服务名：`okx-remote-node`
 - 部署目录：`/opt/okx-local-app`
 
-## 1. 上传部署包到服务器
-
-本机当前包：
+## 1. 服务器直接从 GitHub 拉代码
 
 ```bash
-/Users/cc/Documents/New project/okx-local-app/dist/okx-remote-node-20260408-175430.tar.gz
-```
-
-如果你本地能直接用 SSH：
-
-```bash
-scp "/Users/cc/Documents/New project/okx-local-app/dist/okx-remote-node-20260408-175430.tar.gz" ecs-assist-user@47.87.68.74:~/
-```
-
-如果你现在是 Session Manager 进的服务器，也可以用你现有上传方式把包放到：
-
-```bash
-~/okx-remote-node-20260408-175430.tar.gz
-```
-
-## 2. 服务器上检查是否会撞现有项目
-
-```bash
-cd ~
-mkdir -p /opt/okx-local-app
+sudo mkdir -p /opt
+cd /opt
+sudo rm -rf /opt/okx-local-app
+sudo git clone https://github.com/chenshiyue17-create/-.git /opt/okx-local-app
+sudo chown -R ecs-assist-user:ecs-assist-user /opt/okx-local-app
 cd /opt/okx-local-app
-tar -xzf ~/okx-remote-node-20260408-175430.tar.gz
-chmod +x deploy/check-server-collisions.sh
-./deploy/check-server-collisions.sh 18765 okx-remote-node
 ```
 
-## 3. 安装远端执行节点
+## 2. 一键检查冲突并安装
 
 ```bash
 cd /opt/okx-local-app
-chmod +x deploy/install-remote-node.sh
-sudo ./deploy/install-remote-node.sh /opt/okx-local-app okx-remote-node
+chmod +x deploy/bootstrap-cloned-node.sh
+./deploy/bootstrap-cloned-node.sh /opt/okx-local-app okx-remote-node 18765
 ```
 
-## 4. 配环境
+## 3. 配环境
 
 编辑：
 
@@ -69,7 +49,7 @@ OKX_LOCAL_APP_DATA_DIR=/opt/okx-local-app/data-remote
 OKX_DESK_GATEWAY_TOKEN=change-this-to-your-own-long-random-token
 ```
 
-## 5. 启动并检查 systemd
+## 4. 启动并检查 systemd
 
 ```bash
 sudo systemctl restart okx-remote-node
@@ -77,7 +57,7 @@ sudo systemctl status okx-remote-node --no-pager
 curl -s http://127.0.0.1:18765/api/health
 ```
 
-## 6A. 如果服务器已经有 Nginx，建议挂路径共存
+## 5A. 如果服务器已经有 Nginx，建议挂路径共存
 
 把下面模板合并到你现有站点配置里：
 
@@ -119,7 +99,7 @@ http://47.87.68.74/okx-node
 https://your-domain/okx-node
 ```
 
-## 6B. 如果你暂时没有 Nginx，也可以临时直开高位端口
+## 5B. 如果你暂时没有 Nginx，也可以临时直开高位端口
 
 先把安全组放开 `18765/tcp`，然后本地桌面 App 填：
 
@@ -129,7 +109,7 @@ http://47.87.68.74:18765
 
 但这只是临时方案，长期还是建议挂到 Nginx 后面。
 
-## 7. 本地桌面 App 怎么填
+## 6. 本地桌面 App 怎么填
 
 在本地桌面 App 的“连接配置”里：
 
@@ -139,7 +119,7 @@ http://47.87.68.74:18765
 
 矿机配置不要动，仍然留在本地。
 
-## 8. 远端节点保存真实交易凭据
+## 7. 远端节点保存真实交易凭据
 
 远端节点第一次启动后，需要在服务器上的这套节点里保存真实：
 
