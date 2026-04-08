@@ -8,7 +8,7 @@ const ENV_PRESETS = {
     publicWs: "wss://wspap.okx.com:8443/ws/v5/public",
     privateWs: "wss://wspap.okx.com:8443/ws/v5/private",
     businessWs: "wss://wspap.okx.com:8443/ws/v5/business",
-    notice: "当前是主站模拟盘，REST 仍走 okx.com，请先用模拟盘验证下单链路。",
+    notice: "当前是主站模拟盘。REST 虽然仍走 okx.com，但会使用模拟盘专用 API Key、x-simulated-trading: 1，以及 wspap 私有/业务 WebSocket。",
   },
   okx_main_live: {
     label: "OKX 主站实盘",
@@ -207,6 +207,7 @@ const dashboardState = {
   miner: null,
   research: null,
   routeHealth: null,
+  config: null,
   currentView: "focus",
   recentOrders: [],
   recentOrdersAll: [],
@@ -216,6 +217,55 @@ const dashboardState = {
   accountSummaryLoadedOnce: false,
   ordersLoadedOnce: false,
 };
+
+function inferEnvPreset(envPreset, baseUrl, simulated) {
+  const normalizedBase = (baseUrl || "").trim() || ENV_PRESETS.custom.baseUrl;
+  const normalizedSimulated = Boolean(simulated);
+  const preset = ENV_PRESETS[envPreset];
+  if (
+    preset &&
+    (envPreset === "custom" ||
+      (preset.baseUrl === normalizedBase && Boolean(preset.simulated) === normalizedSimulated))
+  ) {
+    return envPreset;
+  }
+  if (normalizedBase === ENV_PRESETS.okx_main_live.baseUrl) {
+    return normalizedSimulated ? "okx_main_demo" : "okx_main_live";
+  }
+  if (normalizedBase === ENV_PRESETS.okx_us_live.baseUrl && !normalizedSimulated) {
+    return "okx_us_live";
+  }
+  return "custom";
+}
+
+function syncEnvironmentUi({ envPreset, baseUrl, simulated }, { preserveBaseUrl = false } = {}) {
+  const effectivePreset = inferEnvPreset(envPreset, baseUrl, simulated);
+  const preset = ENV_PRESETS[effectivePreset] || ENV_PRESETS.custom;
+  const resolvedBaseUrl = (baseUrl || "").trim() || preset.baseUrl;
+
+  $("envPreset").value = effectivePreset;
+  $("simulated").value = String(Boolean(simulated));
+  $("simulated").disabled = effectivePreset !== "custom";
+  $("baseUrl").readOnly = effectivePreset !== "custom";
+
+  if (!preserveBaseUrl || !$("baseUrl").value.trim()) {
+    $("baseUrl").value = resolvedBaseUrl;
+  } else if (resolvedBaseUrl) {
+    $("baseUrl").value = resolvedBaseUrl;
+  }
+
+  updateEndpointCards(effectivePreset);
+  updateQuickState();
+  renderDeskGuards();
+}
+
+function setPendingEnvironmentUi() {
+  $("active-env-label").textContent = "正在同步环境";
+  $("active-pair-label").textContent = "正在同步组合";
+  document.querySelectorAll("[data-env-preset]").forEach((button) => {
+    button.classList.remove("active");
+  });
+}
 
 function isSimulatedMode() {
   return $("simulated")?.value === "true";
@@ -232,9 +282,22 @@ function isLiveRouteBlocked() {
 
 function applyRouteHealth(route, { preserveMessage = false } = {}) {
   dashboardState.routeHealth = route || null;
+  if (route && (Object.prototype.hasOwnProperty.call(route, "simulated") || route.baseUrl)) {
+    syncEnvironmentUi(
+      {
+        envPreset: $("envPreset")?.value || "custom",
+        baseUrl: route.baseUrl || $("baseUrl")?.value || ENV_PRESETS.custom.baseUrl,
+        simulated: Object.prototype.hasOwnProperty.call(route, "simulated")
+          ? route.simulated
+          : isSimulatedMode(),
+      },
+      { preserveBaseUrl: false }
+    );
+  }
   const simulated = isSimulatedMode();
   const remote = isRemoteExecutionMode() || route?.executionMode === "remote";
   const blocked = !simulated && route && route.healthy === false;
+  const manualLiveLocked = !simulated && !$("autoAllowLiveManualOrders").checked;
   const detail = route?.detail || "";
   const rawSummary = route?.summary || detail || "";
   const summary = remote
@@ -256,8 +319,10 @@ function applyRouteHealth(route, { preserveMessage = false } = {}) {
   }
   $("health-text").title = technicalDetail;
 
-  const disabled = blocked;
-  const disabledTitle = summary || "当前实盘链路不可用";
+  const disabled = blocked || manualLiveLocked;
+  const disabledTitle = blocked
+    ? (summary || "当前实盘链路不可用")
+    : "当前是实盘，未开启“允许手动实盘下单”";
   [
     $("start-automation"),
     $("run-automation-once"),
@@ -639,10 +704,18 @@ function setLiveFeedStatus(kind, text, detail) {
 
 function updateEndpointCards(presetKey) {
   const preset = ENV_PRESETS[presetKey] || ENV_PRESETS.custom;
-  $("endpoint-rest").textContent = $("baseUrl").value.trim() || preset.baseUrl;
+  const restBase = $("baseUrl").value.trim() || preset.baseUrl;
+  const restMode = $("simulated").value === "true" ? "模拟专用（x-simulated-trading: 1）" : "实盘";
+  $("endpoint-rest").textContent = `${restBase} · ${restMode}`;
   $("endpoint-public-ws").textContent = preset.publicWs;
   $("endpoint-private-ws").textContent = preset.privateWs;
   $("endpoint-business-ws").textContent = preset.businessWs;
+  const hint = $("base-url-hint");
+  if (hint) {
+    hint.textContent = $("simulated").value === "true"
+      ? "主站模拟盘的 REST 域名仍是 okx.com；真正区分依赖模拟盘专用 API Key、x-simulated-trading: 1，以及 wspap 私有/业务 WebSocket。"
+      : "实盘和模拟盘可以共用主站 REST 域名，但必须使用对应环境的 API Key；实盘私有/业务 WebSocket 为 ws.okx.com。";
+  }
 }
 
 function deriveMarketWsEndpoints() {
@@ -927,6 +1000,7 @@ function renderEquityCurve(curve) {
 
 function renderDeskGuards() {
   const simulated = $("simulated").value === "true";
+  const allowLiveManualOrders = $("autoAllowLiveManualOrders").checked;
   const allowLiveTrading = $("autoAllowLiveTrading").checked;
   const allowLiveAutostart = $("autoAllowLiveAutostart").checked;
   const autostart = $("autoAutostart").checked;
@@ -941,9 +1015,12 @@ function renderDeskGuards() {
     : `实盘 · ${$("baseUrl").value.trim() || "OKX"} 正在直连`;
   $("guard-live").textContent = simulated
     ? "模拟盘下无需额外实盘开关"
-    : allowLiveTrading
-      ? `已允许实盘自动交易${autostart && allowLiveAutostart ? " / 自动启动" : ""}`
-      : "实盘自动交易仍锁着";
+    : [
+        allowLiveManualOrders ? "手动下单已解锁" : "手动下单仍锁着",
+        allowLiveTrading
+          ? `自动交易已解锁${autostart && allowLiveAutostart ? " / 自动启动" : ""}`
+          : "自动交易仍锁着",
+      ].join(" · ");
   $("guard-cycle").textContent = `${$("autoBar").value} 周期 · ${pollSeconds || "--"} 秒轮询`;
   $("guard-risk").textContent = `日内最大回撤 ${maxLoss || 0}% · 今日上限 ${maxOrders || 0} 单`;
   $("guard-feed").textContent = feedHealthy
@@ -954,8 +1031,12 @@ function renderDeskGuards() {
     riskPill.textContent = "模拟护栏";
     riskPill.style.borderColor = "rgba(69, 214, 196, 0.28)";
     riskPill.style.color = "var(--accent-2)";
-  } else if (!allowLiveTrading) {
+  } else if (!allowLiveManualOrders && !allowLiveTrading) {
     riskPill.textContent = "实盘锁定";
+    riskPill.style.borderColor = "rgba(255, 184, 77, 0.24)";
+    riskPill.style.color = "var(--accent)";
+  } else if (!allowLiveManualOrders) {
+    riskPill.textContent = "手动单受限";
     riskPill.style.borderColor = "rgba(255, 184, 77, 0.24)";
     riskPill.style.color = "var(--accent)";
   } else if (autostart && !allowLiveAutostart) {
@@ -1040,8 +1121,10 @@ function renderDeskOverview() {
   const minerNetwork = miner.network || {};
   const minerProgress = miner.progress || {};
   const minerFees = minerNetwork.fees || {};
-  const totalEq = Number(summary.totalEq || automation.currentEq || 0);
-  const currentEq = Number(automation.currentEq || summary.totalEq || 0);
+  const totalEq = Number(summary.displayTotalEq || summary.totalEq || automation.currentEq || 0);
+  const currentEq = Number(automation.currentEq || summary.displayTotalEq || summary.totalEq || 0);
+  const tradingTotalEq = Number(summary.tradingTotalEq || summary.adjEq || 0);
+  const fundingTotalEq = Number(summary.fundingTotalEq || 0);
   const startEq = Number(automation.sessionStartEq || 0);
   const pnlAmount = startEq > 0 ? currentEq - startEq : 0;
   const pnlPct = startEq > 0 ? (pnlAmount / startEq) * 100 : 0;
@@ -1057,10 +1140,14 @@ function renderDeskOverview() {
   const railBalanceSub = $("rail-balance-sub");
   const railMinerMain = $("rail-miner-main");
   const railMinerSub = $("rail-miner-sub");
+  const balanceBreakdown = summary.displayBreakdown
+    || (fundingTotalEq > 0
+      ? `资金账户 ${formatMoney(fundingTotalEq)} USDT · 交易账户 ${formatMoney(tradingTotalEq)} USDT`
+      : (tradingTotalEq > 0 ? `交易账户 ${formatMoney(tradingTotalEq)} USDT` : ""));
 
   $("desk-total-equity").textContent = totalEq > 0 ? `${formatMoney(totalEq)} USDT` : "--";
   $("desk-total-equity-sub").textContent =
-    summary.adjEq ? `调整后权益 ${formatMoney(summary.adjEq)} USDT` : "等待账户快照";
+    balanceBreakdown || (summary.adjEq ? `调整后权益 ${formatMoney(summary.adjEq)} USDT` : "等待账户快照");
 
   $("desk-session-pnl").textContent =
     startEq > 0 ? `${formatPercentValue(pnlPct)}` : "--";
@@ -1076,7 +1163,7 @@ function renderDeskOverview() {
   if (dockPnlSub) {
     dockPnlSub.textContent = startEq > 0
       ? `约 ${pnlAmount >= 0 ? "+" : ""}${formatMoney(pnlAmount)} USDT · 总权益 ${formatMoney(totalEq)} USDT`
-      : (totalEq > 0 ? `总权益 ${formatMoney(totalEq)} USDT` : "等待会话收益");
+      : (balanceBreakdown || (totalEq > 0 ? `总权益 ${formatMoney(totalEq)} USDT` : "等待会话收益"));
   }
 
   $("desk-drawdown-main").textContent = formatPercentValue(drawdown);
@@ -1111,9 +1198,9 @@ function renderDeskOverview() {
     railBalanceMain.textContent = formatMoney(totalEq || 0);
   }
   if (railBalanceSub) {
-    railBalanceSub.textContent = totalEq > 0
+    railBalanceSub.textContent = balanceBreakdown || (totalEq > 0
       ? `USDT · 调整后 ${formatMoney(Number(summary.adjEq || totalEq))}`
-      : "USDT";
+      : "USDT");
   }
   if (railMinerMain) {
     railMinerMain.textContent = formatMoney(minerDailyUsd || 0);
@@ -1734,7 +1821,11 @@ function findPairPreset(spot, swap) {
 }
 
 function updateQuickState() {
-  const envPreset = $("envPreset").value;
+  const envPreset = inferEnvPreset(
+    $("envPreset").value,
+    $("baseUrl").value,
+    $("simulated").value === "true"
+  );
   const env = ENV_PRESETS[envPreset] || ENV_PRESETS.custom;
   const spot = $("spotInstId").value.trim();
   const swap = $("swapInstId").value.trim();
@@ -1833,6 +1924,7 @@ function collectAutomationConfig() {
     takeProfitPct: $("autoTakeProfitPct").value.trim(),
     maxDailyLossPct: $("autoMaxDailyLossPct").value.trim(),
     autostart: $("autoAutostart").checked,
+    allowLiveManualOrders: $("autoAllowLiveManualOrders").checked,
     allowLiveTrading: $("autoAllowLiveTrading").checked,
     allowLiveAutostart: $("autoAllowLiveAutostart").checked,
     enforceNetMode: $("autoEnforceNetMode").checked,
@@ -1900,6 +1992,7 @@ function fillAutomationForm(config) {
   $("autoTakeProfitPct").value = config.takeProfitPct ?? "2.4";
   $("autoMaxDailyLossPct").value = config.maxDailyLossPct ?? "3.0";
   $("autoAutostart").checked = Boolean(config.autostart);
+  $("autoAllowLiveManualOrders").checked = Boolean(config.allowLiveManualOrders);
   $("autoAllowLiveTrading").checked = Boolean(config.allowLiveTrading);
   $("autoAllowLiveAutostart").checked = Boolean(config.allowLiveAutostart);
   $("autoEnforceNetMode").checked = config.enforceNetMode !== false;
@@ -2362,6 +2455,13 @@ async function loadSavedConfig() {
     $("envPreset").value = "okx_main_demo";
     applyEnvironmentPreset("okx_main_demo");
     $("executionMode").value = "local";
+    dashboardState.config = {
+      envPreset: "okx_main_demo",
+      baseUrl: ENV_PRESETS.okx_main_demo.baseUrl,
+      simulated: true,
+      executionMode: "local",
+      remoteGatewayUrl: "",
+    };
     return;
   }
   $("apiKey").value = "";
@@ -2372,15 +2472,35 @@ async function loadSavedConfig() {
   $("secretKey").placeholder = config.secretKeyMask || "已保存";
   $("passphrase").placeholder = config.passphraseMask || "已保存";
   $("remoteGatewayToken").placeholder = config.remoteGatewayTokenMask || "可选，远端节点鉴权令牌";
-  $("envPreset").value = config.envPreset || "custom";
-  $("baseUrl").value = config.baseUrl || "https://www.okx.com";
-  $("simulated").value = String(Boolean(config.simulated));
   $("executionMode").value = config.executionMode || "local";
   $("remoteGatewayUrl").value = config.remoteGatewayUrl || "";
-  applyEnvironmentPreset($("envPreset").value, { keepBaseUrl: true });
+  syncEnvironmentUi(
+    {
+      envPreset: config.envPreset || "custom",
+      baseUrl: config.baseUrl || "https://www.okx.com",
+      simulated: Boolean(config.simulated),
+    },
+    { preserveBaseUrl: true }
+  );
+  dashboardState.config = {
+    envPreset: config.envPreset || "custom",
+    baseUrl: config.baseUrl || "https://www.okx.com",
+    simulated: Boolean(config.simulated),
+    executionMode: config.executionMode || "local",
+    remoteGatewayUrl: config.remoteGatewayUrl || "",
+  };
   if (data.remoteConfigLoaded === false && data.remoteConfigError) {
     setMessage(`远端配置暂未读取成功：${data.remoteConfigError}`, "warn");
   }
+}
+
+function hasTradingEnvironmentChanged(previousConfig, nextConfig) {
+  const prev = previousConfig || {};
+  return (
+    String(prev.envPreset || "") !== String(nextConfig.envPreset || "") ||
+    String((prev.baseUrl || "").trim()) !== String((nextConfig.baseUrl || "").trim()) ||
+    Boolean(prev.simulated) !== Boolean(nextConfig.simulated)
+  );
 }
 
 async function loadAutomationConfig() {
@@ -2417,11 +2537,44 @@ function renderAutomationState(state) {
 
 async function saveConfig() {
   const payload = collectConfig();
+  const envChanged = hasTradingEnvironmentChanged(dashboardState.config, payload);
+
+  if (envChanged) {
+    try {
+      await request("/api/automation/stop", { method: "POST" });
+    } catch (_) {}
+    $("autoAutostart").checked = false;
+    $("autoAllowLiveManualOrders").checked = false;
+    $("autoAllowLiveTrading").checked = false;
+    $("autoAllowLiveAutostart").checked = false;
+    try {
+      await saveAutomationConfig({ silent: true });
+    } catch (_) {}
+  }
+
   const data = await request("/api/config", {
     method: "POST",
     body: JSON.stringify(payload),
   });
-  setMessage(data.persisted ? "配置已保存到本地" : "配置已载入到当前会话", "ok");
+  dashboardState.config = {
+    envPreset: payload.envPreset,
+    baseUrl: payload.baseUrl,
+    simulated: Boolean(payload.simulated),
+    executionMode: payload.executionMode,
+    remoteGatewayUrl: payload.remoteGatewayUrl,
+  };
+  await refreshSnapshot().catch(() => {});
+  await refreshDeskState().catch(() => {});
+  await refreshAutomationState().catch(() => {});
+  if (envChanged) {
+    setMessage(
+      `${data.persisted ? "配置已保存到本地" : "配置已载入到当前会话"}；已停止策略并关闭自动启动`,
+      "ok"
+    );
+    setAutomationMessage("切换真实/模拟盘时已自动停止策略，并锁回实盘手动/自动交易与自动启动。", "warn");
+  } else {
+    setMessage(data.persisted ? "配置已保存到本地" : "配置已载入到当前会话", "ok");
+  }
 }
 
 async function testConfig() {
@@ -2626,9 +2779,28 @@ async function refreshMinerOverview() {
   });
 }
 
+function buildAccountBalanceRows(account) {
+  const fundingRows = (account.fundingBalances || []).map((row) => ({
+    accountType: "资金",
+    ccy: row.ccy || "-",
+    availBal: row.availBal ?? row.bal ?? "-",
+    cashBal: row.bal ?? row.cashBal ?? "-",
+    eqUsd: row.usdEq ?? row.eqUsd ?? "-",
+  }));
+  const tradingRows = (account.balances || []).map((row) => ({
+    accountType: "交易",
+    ccy: row.ccy || "-",
+    availBal: row.availBal ?? row.availEq ?? "-",
+    cashBal: row.cashBal ?? row.bal ?? "-",
+    eqUsd: row.eqUsd ?? row.usdEq ?? "-",
+  }));
+  return [...fundingRows, ...tradingRows];
+}
+
 function applyAccountOverview(account) {
   dashboardState.account = account;
-  renderRows("balances", (account.balances || []).slice(0, 8), [
+  renderRows("balances", buildAccountBalanceRows(account).slice(0, 12), [
+    { key: "accountType", label: "账户" },
     { key: "ccy", label: "币种" },
     { key: "availBal", label: "可用" },
     { key: "cashBal", label: "现金余额" },
@@ -2640,8 +2812,8 @@ function applyAccountOverview(account) {
     { key: "pos", label: "持仓" },
     { key: "upl", label: "未实现 PnL" },
   ]);
-  $("metric-balance-count").textContent = (account.balances || []).length;
-  $("metric-position-count").textContent = (account.positions || []).length;
+  $("metric-balance-count").textContent = account.balanceCount ?? buildAccountBalanceRows(account).length;
+  $("metric-position-count").textContent = account.positionCount ?? (account.positions || []).length;
   dashboardState.accountDetailsLoadedOnce = true;
   dashboardState.accountSummaryLoadedOnce = true;
   renderDeskOverview();
@@ -2776,6 +2948,9 @@ async function submitOrder(event) {
   if (isLiveRouteBlocked()) {
     throw new Error(dashboardState.routeHealth?.summary || "当前实盘链路不可用");
   }
+  if (!isSimulatedMode() && !$("autoAllowLiveManualOrders").checked) {
+    throw new Error("当前是实盘，未开启“允许手动实盘下单”");
+  }
   const form = event.currentTarget;
   const payload = buildOrderPayload(form);
   const result = await request("/api/order/place", {
@@ -2847,6 +3022,7 @@ async function boot() {
   } catch (_) {}
   setWorkspaceView(initialView, { persist: false, scroll: false });
   setupTunnelBackground();
+  setPendingEnvironmentUi();
 
   try {
     const health = await request("/api/health");
@@ -2949,6 +3125,7 @@ async function boot() {
     "autoTakeProfitPct",
     "autoMaxDailyLossPct",
     "autoAutostart",
+    "autoAllowLiveManualOrders",
     "autoAllowLiveTrading",
     "autoAllowLiveAutostart",
     "researchHistoryLimit",

@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>10U战神</title>
-    <link rel="stylesheet" href="/styles.css" />
+    <link rel="stylesheet" href="/styles.css?v=20260408-livefix" />
   </head>
   <body data-view="focus">
     <canvas id="tunnel-bg" aria-hidden="true"></canvas>
@@ -277,11 +277,11 @@
             <div class="quick-summary">
               <div>
                 <span>当前环境</span>
-                <strong id="active-env-label">OKX 主站模拟盘</strong>
+                <strong id="active-env-label">正在同步环境</strong>
               </div>
               <div>
                 <span>当前组合</span>
-                <strong id="active-pair-label">BTC-USDT / BTC-USDT-SWAP</strong>
+                <strong id="active-pair-label">正在同步组合</strong>
               </div>
             </div>
           </div>
@@ -318,8 +318,9 @@
               <input id="passphrase" type="password" placeholder="输入 Passphrase" />
             </label>
             <label>
-              <span>Base URL</span>
+              <span>REST Base URL</span>
               <input id="baseUrl" type="text" value="https://www.okx.com" />
+              <small id="base-url-hint" class="field-hint">主站模拟盘与主站实盘可以共用 REST 域名，但依赖不同环境凭据与连接头。</small>
             </label>
             <label class="toggle">
               <span>模式</span>
@@ -585,6 +586,10 @@
             <label class="checkbox-row">
               <span>服务启动后自动启动策略</span>
               <input id="autoAutostart" type="checkbox" />
+            </label>
+            <label class="checkbox-row">
+              <span>允许手动实盘下单</span>
+              <input id="autoAllowLiveManualOrders" type="checkbox" />
             </label>
             <label class="checkbox-row">
               <span>允许实盘自动交易</span>
@@ -979,6 +984,6 @@
       </main>
     </div>
 
-    <script src="/app.js"></script>
+    <script src="/app.js?v=20260408-livefix"></script>
   </body>
   </html>
