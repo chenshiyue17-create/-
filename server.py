@@ -321,12 +321,14 @@ def configured_gateway_access_token() -> str:
 def enforce_gateway_auth(handler: BaseHTTPRequestHandler, path: str) -> bool:
     if not path.startswith("/api/"):
         return True
+    client_ip = str((handler.client_address or ("", 0))[0] or "")
+    is_direct_loopback = is_loopback_client(client_ip) and handler.headers.get("X-OKX-Desk-Forwarded") != "1"
+    if is_direct_loopback:
+        return True
     access_token = configured_gateway_access_token()
     if not access_token:
-        return True
-    client_ip = str((handler.client_address or ("", 0))[0] or "")
-    if is_loopback_client(client_ip) and handler.headers.get("X-OKX-Desk-Forwarded") != "1":
-        return True
+        error_response(handler, "远端执行节点未配置鉴权令牌", status=503)
+        return False
     incoming = str(handler.headers.get("X-OKX-Desk-Gateway-Token") or "")
     if incoming and hmac.compare_digest(incoming, access_token):
         return True
@@ -378,9 +380,10 @@ def build_local_runtime_config(current: dict[str, Any], payload: dict[str, Any])
     for key in ("envPreset", "baseUrl", "simulated", "executionMode", "remoteGatewayUrl"):
         if key in payload:
             merged[key] = payload.get(key)
-    for key in ("apiKey", "secretKey", "passphrase"):
-        if key in payload:
-            merged[key] = payload.get(key)
+    # Remote execution stores trading secrets on the remote node instead of the local control plane.
+    merged["apiKey"] = ""
+    merged["secretKey"] = ""
+    merged["passphrase"] = ""
     remote_token = str(payload.get("remoteGatewayToken") or "").strip()
     if remote_token:
         merged["remoteGatewayToken"] = remote_token
@@ -675,10 +678,12 @@ def warm_focus_cache_once() -> None:
 
     def fetch_account() -> dict[str, Any]:
         client = OkxClient(config)
-        balances = parse_balance_snapshot(client.get_account_balance())
+        snapshot = fetch_account_snapshot(client, include_positions=False)
         return {
-            "summary": balances["summary"],
-            "balanceCount": len(balances["details"]),
+            "summary": snapshot["summary"],
+            "fundingSummary": snapshot.get("fundingSummary", {}),
+            "balanceCount": snapshot.get("balanceCount", 0),
+            "positionCount": snapshot.get("positionCount", 0),
         }
 
     def fetch_orders() -> dict[str, Any]:
@@ -997,6 +1002,7 @@ def default_automation_config() -> dict[str, Any]:
         "takeProfitPct": "2.4",
         "maxDailyLossPct": "3.0",
         "autostart": False,
+        "allowLiveManualOrders": False,
         "allowLiveTrading": False,
         "allowLiveAutostart": False,
         "enforceNetMode": True,
@@ -3705,7 +3711,9 @@ def parse_funding_balance_snapshot(
     )
     valuation_entries = (valuation_raw or {}).get("data") or []
     valuation_top = valuation_entries[0] if valuation_entries else {}
+    valuation_details = copy.deepcopy(valuation_top.get("details") or {})
     total_bal = safe_decimal(valuation_top.get("totalBal"), "0")
+    source = "valuation" if total_bal > 0 else "funding_balances"
     if total_bal <= 0:
         total_bal = sum(
             safe_decimal(row.get("usdEq") or row.get("eqUsd") or row.get("bal") or row.get("availBal") or "0")
@@ -3716,6 +3724,8 @@ def parse_funding_balance_snapshot(
             "totalBal": decimal_to_str(total_bal),
             "ccy": valuation_top.get("ccy") or ccy,
             "ts": valuation_top.get("ts", ""),
+            "source": source,
+            "valuationDetails": valuation_details,
         },
         "details": details,
     }
@@ -3731,24 +3741,46 @@ def build_account_snapshot(
     trading_summary = copy.deepcopy(trading_snapshot.get("summary") or {})
     trading_total = safe_decimal(trading_summary.get("totalEq"), "0")
     funding_summary = copy.deepcopy(funding_snapshot.get("summary") or {})
-    funding_total = safe_decimal(funding_summary.get("totalBal"), "0")
-    display_total = trading_total + funding_total
-    if display_total <= 0:
-        display_total = trading_total
+    valuation_total = safe_decimal(funding_summary.get("totalBal"), "0")
+    valuation_source = str(funding_summary.get("source") or "")
+    valuation_details = copy.deepcopy(funding_summary.get("valuationDetails") or {})
+    funding_total = (
+        safe_decimal(valuation_details.get("funding"), "0")
+        + safe_decimal(valuation_details.get("classic"), "0")
+        + safe_decimal(valuation_details.get("earn"), "0")
+    )
 
-    if funding_total > 0 and trading_total > 0:
+    if valuation_source == "valuation" and valuation_total > 0:
+        display_total = valuation_total
+        display_source = "总资产估值"
+        breakdown_parts: list[str] = []
+        for key, label in (
+            ("trading", "交易账户"),
+            ("funding", "资金账户"),
+            ("classic", "经典账户"),
+            ("earn", "赚币"),
+        ):
+            amount = safe_decimal(valuation_details.get(key), "0")
+            if amount > 0:
+                breakdown_parts.append(f"{label} {compact_metric(amount)} USDT")
+        display_breakdown = " · ".join(breakdown_parts)
+    elif funding_total > 0 and trading_total > 0:
+        display_total = trading_total + funding_total
         display_source = "资金账户 + 交易账户"
         display_breakdown = (
-            f"资金账户 {format_decimal(funding_total, 2)} USDT · "
-            f"交易账户 {format_decimal(trading_total, 2)} USDT"
+            f"资金账户 {compact_metric(funding_total)} USDT · "
+            f"交易账户 {compact_metric(trading_total)} USDT"
         )
     elif funding_total > 0:
+        display_total = funding_total
         display_source = "资金账户"
-        display_breakdown = f"资金账户 {format_decimal(funding_total, 2)} USDT"
+        display_breakdown = f"资金账户 {compact_metric(funding_total)} USDT"
     elif trading_total > 0:
+        display_total = trading_total
         display_source = "交易账户"
-        display_breakdown = f"交易账户 {format_decimal(trading_total, 2)} USDT"
+        display_breakdown = f"交易账户 {compact_metric(trading_total)} USDT"
     else:
+        display_total = trading_total
         display_source = "交易账户"
         display_breakdown = ""
 
@@ -3756,6 +3788,7 @@ def build_account_snapshot(
         **trading_summary,
         "tradingTotalEq": decimal_to_str(trading_total),
         "fundingTotalEq": decimal_to_str(funding_total),
+        "valuationTotalEq": decimal_to_str(valuation_total),
         "displayTotalEq": decimal_to_str(display_total),
         "displaySource": display_source,
         "displayBreakdown": display_breakdown,
@@ -5373,6 +5406,13 @@ class AutomationEngine:
         if not automation.get("allowLiveTrading"):
             raise OkxApiError("当前是实盘，未开启“允许实盘自动交易”")
 
+    @staticmethod
+    def _guard_live_manual_order(api_config: dict[str, Any], automation: dict[str, Any]) -> None:
+        if api_config.get("simulated"):
+            return
+        if not automation.get("allowLiveManualOrders"):
+            raise OkxApiError("当前是实盘，未开启“允许手动实盘下单”")
+
     def _prepare_swap(self, client: OkxClient, automation: dict[str, Any]) -> None:
         if not automation.get("swapEnabled"):
             return
@@ -5468,6 +5508,12 @@ class AutomationEngine:
                 self.stop("自动量化已停止：参数不合法")
                 return
             try:
+                self._guard_live_mode(automation, api_config, autostart=False)
+            except Exception as exc:
+                self._log("error", str(exc))
+                self.stop(f"自动量化已停止：{exc}")
+                return
+            try:
                 ensure_live_route_ready(api_config, force=False)
                 client = OkxClient(api_config)
                 self._run_cycle(client, automation)
@@ -5503,8 +5549,16 @@ class AutomationEngine:
             "info",
             f"联网分析完成：{analysis.get('selectedStrategyName', '未选策略')} · {analysis.get('decisionLabel', '待分析')}",
         )
-        balance_snapshot = parse_balance_snapshot(client.get_account_balance())
-        total_eq = safe_decimal(balance_snapshot["summary"].get("totalEq"), "0")
+        account_snapshot = fetch_account_snapshot(client, include_positions=False)
+        balance_snapshot = {
+            "summary": account_snapshot.get("summary", {}),
+            "details": account_snapshot.get("tradingBalances") or account_snapshot.get("balances") or [],
+        }
+        total_eq = safe_decimal(
+            account_snapshot["summary"].get("displayTotalEq")
+            or account_snapshot["summary"].get("totalEq"),
+            "0",
+        )
         state = self._touch_session(total_eq)
         max_daily_loss = safe_decimal(effective_automation.get("maxDailyLossPct"), "0")
         if max_daily_loss > 0 and safe_decimal(state.get("dailyDrawdownPct"), "0") <= -max_daily_loss:
@@ -6465,7 +6519,6 @@ class AppHandler(BaseHTTPRequestHandler):
                 if not valid:
                     error_response(self, message, status=400)
                     return
-                CONFIG.save(local_runtime, persist=persist)
                 remote_payload = build_remote_trading_config(config_state, payload, persist=persist)
                 try:
                     response = remote_gateway_request(
@@ -6476,6 +6529,10 @@ class AppHandler(BaseHTTPRequestHandler):
                         content_type="application/json; charset=utf-8",
                     )
                     remote_data = response.json()
+                    if not response.ok or remote_data.get("ok") is False:
+                        remote_error = remote_data.get("error") or f"远端执行节点返回 {response.status_code}"
+                        raise OkxApiError(remote_error)
+                    CONFIG.save(local_runtime, persist=persist)
                     merged = merge_remote_redacted_config(CONFIG.redacted(), remote_data)
                     reset_focus_cache("account", "orders")
                     PRIVATE_ORDER_STREAM.mark_dirty()
@@ -6721,6 +6778,8 @@ class AppHandler(BaseHTTPRequestHandler):
                 key: value for key, value in payload.items() if value not in (None, "", False)
             }
             try:
+                automation = AUTOMATION_CONFIG.current()
+                self._guard_live_manual_order(config, automation)
                 route = ensure_live_route_ready(config, force=False)
                 client = OkxClient(config)
                 started_at = time.perf_counter()

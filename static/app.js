@@ -297,6 +297,7 @@ function applyRouteHealth(route, { preserveMessage = false } = {}) {
   const simulated = isSimulatedMode();
   const remote = isRemoteExecutionMode() || route?.executionMode === "remote";
   const blocked = !simulated && route && route.healthy === false;
+  const manualLiveLocked = !simulated && !$("autoAllowLiveManualOrders").checked;
   const detail = route?.detail || "";
   const rawSummary = route?.summary || detail || "";
   const summary = remote
@@ -318,8 +319,10 @@ function applyRouteHealth(route, { preserveMessage = false } = {}) {
   }
   $("health-text").title = technicalDetail;
 
-  const disabled = blocked;
-  const disabledTitle = summary || "当前实盘链路不可用";
+  const disabled = blocked || manualLiveLocked;
+  const disabledTitle = blocked
+    ? (summary || "当前实盘链路不可用")
+    : "当前是实盘，未开启“允许手动实盘下单”";
   [
     $("start-automation"),
     $("run-automation-once"),
@@ -997,6 +1000,7 @@ function renderEquityCurve(curve) {
 
 function renderDeskGuards() {
   const simulated = $("simulated").value === "true";
+  const allowLiveManualOrders = $("autoAllowLiveManualOrders").checked;
   const allowLiveTrading = $("autoAllowLiveTrading").checked;
   const allowLiveAutostart = $("autoAllowLiveAutostart").checked;
   const autostart = $("autoAutostart").checked;
@@ -1011,9 +1015,12 @@ function renderDeskGuards() {
     : `实盘 · ${$("baseUrl").value.trim() || "OKX"} 正在直连`;
   $("guard-live").textContent = simulated
     ? "模拟盘下无需额外实盘开关"
-    : allowLiveTrading
-      ? `已允许实盘自动交易${autostart && allowLiveAutostart ? " / 自动启动" : ""}`
-      : "实盘自动交易仍锁着";
+    : [
+        allowLiveManualOrders ? "手动下单已解锁" : "手动下单仍锁着",
+        allowLiveTrading
+          ? `自动交易已解锁${autostart && allowLiveAutostart ? " / 自动启动" : ""}`
+          : "自动交易仍锁着",
+      ].join(" · ");
   $("guard-cycle").textContent = `${$("autoBar").value} 周期 · ${pollSeconds || "--"} 秒轮询`;
   $("guard-risk").textContent = `日内最大回撤 ${maxLoss || 0}% · 今日上限 ${maxOrders || 0} 单`;
   $("guard-feed").textContent = feedHealthy
@@ -1024,8 +1031,12 @@ function renderDeskGuards() {
     riskPill.textContent = "模拟护栏";
     riskPill.style.borderColor = "rgba(69, 214, 196, 0.28)";
     riskPill.style.color = "var(--accent-2)";
-  } else if (!allowLiveTrading) {
+  } else if (!allowLiveManualOrders && !allowLiveTrading) {
     riskPill.textContent = "实盘锁定";
+    riskPill.style.borderColor = "rgba(255, 184, 77, 0.24)";
+    riskPill.style.color = "var(--accent)";
+  } else if (!allowLiveManualOrders) {
+    riskPill.textContent = "手动单受限";
     riskPill.style.borderColor = "rgba(255, 184, 77, 0.24)";
     riskPill.style.color = "var(--accent)";
   } else if (autostart && !allowLiveAutostart) {
@@ -1913,6 +1924,7 @@ function collectAutomationConfig() {
     takeProfitPct: $("autoTakeProfitPct").value.trim(),
     maxDailyLossPct: $("autoMaxDailyLossPct").value.trim(),
     autostart: $("autoAutostart").checked,
+    allowLiveManualOrders: $("autoAllowLiveManualOrders").checked,
     allowLiveTrading: $("autoAllowLiveTrading").checked,
     allowLiveAutostart: $("autoAllowLiveAutostart").checked,
     enforceNetMode: $("autoEnforceNetMode").checked,
@@ -1980,6 +1992,7 @@ function fillAutomationForm(config) {
   $("autoTakeProfitPct").value = config.takeProfitPct ?? "2.4";
   $("autoMaxDailyLossPct").value = config.maxDailyLossPct ?? "3.0";
   $("autoAutostart").checked = Boolean(config.autostart);
+  $("autoAllowLiveManualOrders").checked = Boolean(config.allowLiveManualOrders);
   $("autoAllowLiveTrading").checked = Boolean(config.allowLiveTrading);
   $("autoAllowLiveAutostart").checked = Boolean(config.allowLiveAutostart);
   $("autoEnforceNetMode").checked = config.enforceNetMode !== false;
@@ -2531,6 +2544,8 @@ async function saveConfig() {
       await request("/api/automation/stop", { method: "POST" });
     } catch (_) {}
     $("autoAutostart").checked = false;
+    $("autoAllowLiveManualOrders").checked = false;
+    $("autoAllowLiveTrading").checked = false;
     $("autoAllowLiveAutostart").checked = false;
     try {
       await saveAutomationConfig({ silent: true });
@@ -2556,7 +2571,7 @@ async function saveConfig() {
       `${data.persisted ? "配置已保存到本地" : "配置已载入到当前会话"}；已停止策略并关闭自动启动`,
       "ok"
     );
-    setAutomationMessage("切换真实/模拟盘时已自动停止策略，并关闭自动启动。", "warn");
+    setAutomationMessage("切换真实/模拟盘时已自动停止策略，并锁回实盘手动/自动交易与自动启动。", "warn");
   } else {
     setMessage(data.persisted ? "配置已保存到本地" : "配置已载入到当前会话", "ok");
   }
@@ -2933,6 +2948,9 @@ async function submitOrder(event) {
   if (isLiveRouteBlocked()) {
     throw new Error(dashboardState.routeHealth?.summary || "当前实盘链路不可用");
   }
+  if (!isSimulatedMode() && !$("autoAllowLiveManualOrders").checked) {
+    throw new Error("当前是实盘，未开启“允许手动实盘下单”");
+  }
   const form = event.currentTarget;
   const payload = buildOrderPayload(form);
   const result = await request("/api/order/place", {
@@ -3107,6 +3125,7 @@ async function boot() {
     "autoTakeProfitPct",
     "autoMaxDailyLossPct",
     "autoAutostart",
+    "autoAllowLiveManualOrders",
     "autoAllowLiveTrading",
     "autoAllowLiveAutostart",
     "researchHistoryLimit",
