@@ -1194,6 +1194,14 @@ def config_profile_key(config: dict[str, Any]) -> str:
     return "custom_demo" if simulated else "custom_live"
 
 
+def trading_environment_changed(previous: dict[str, Any], current: dict[str, Any]) -> bool:
+    keys = ("envPreset", "baseUrl", "simulated")
+    for key in keys:
+        if previous.get(key) != current.get(key):
+            return True
+    return False
+
+
 def default_miner_state() -> dict[str, Any]:
     return {
         "lastRefreshAt": "",
@@ -1363,6 +1371,19 @@ class ConfigStore:
         config.pop("profiles", None)
         config.update(masks)
         return config
+
+
+def reset_automation_live_permissions(*, reason: str = "") -> dict[str, Any]:
+    def mutate(config: dict[str, Any]) -> None:
+        config["autostart"] = False
+        config["allowLiveManualOrders"] = False
+        config["allowLiveTrading"] = False
+        config["allowLiveAutostart"] = False
+
+    updated = AUTOMATION_CONFIG.update(mutate)
+    if AUTOMATION_ENGINE.snapshot().get("running"):
+        AUTOMATION_ENGINE.stop(reason or "交易环境已切换，已自动停止策略并锁回实盘权限")
+    return updated
 
 
 class OkxApiError(RuntimeError):
@@ -6512,6 +6533,7 @@ class AppHandler(BaseHTTPRequestHandler):
             payload = read_json_request(self)
             persist = bool(payload.pop("persist", False))
             target_mode = str(payload.get("executionMode") or config.get("executionMode") or "local").strip()
+            previous_effective = CONFIG.current()
             if target_mode == "remote":
                 local_runtime = build_local_runtime_config(config, payload)
                 proxy_config = build_proxy_runtime_config(config, payload)
@@ -6533,6 +6555,9 @@ class AppHandler(BaseHTTPRequestHandler):
                         remote_error = remote_data.get("error") or f"远端执行节点返回 {response.status_code}"
                         raise OkxApiError(remote_error)
                     CONFIG.save(local_runtime, persist=persist)
+                    env_changed = trading_environment_changed(previous_effective, local_runtime)
+                    if env_changed:
+                        reset_automation_live_permissions(reason="交易环境已切换，已自动停止策略并锁回实盘权限")
                     merged = merge_remote_redacted_config(CONFIG.redacted(), remote_data)
                     reset_focus_cache("account", "orders")
                     PRIVATE_ORDER_STREAM.mark_dirty()
@@ -6543,6 +6568,7 @@ class AppHandler(BaseHTTPRequestHandler):
                             "config": merged,
                             "persisted": persist,
                             "remoteConfigSaved": True,
+                            "automationReset": env_changed,
                         },
                         status=response.status_code,
                     )
@@ -6566,11 +6592,14 @@ class AppHandler(BaseHTTPRequestHandler):
                 error_response(self, message, status=400)
                 return
             CONFIG.save(payload, persist=persist)
+            env_changed = trading_environment_changed(previous_effective, CONFIG.current())
+            if env_changed:
+                reset_automation_live_permissions(reason="交易环境已切换，已自动停止策略并锁回实盘权限")
             reset_focus_cache("account", "orders")
             PRIVATE_ORDER_STREAM.mark_dirty()
             json_response(
                 self,
-                {"ok": True, "config": CONFIG.redacted(), "persisted": persist},
+                {"ok": True, "config": CONFIG.redacted(), "persisted": persist, "automationReset": env_changed},
             )
             return
 

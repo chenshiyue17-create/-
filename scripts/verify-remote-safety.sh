@@ -75,8 +75,8 @@ summary = account.get("summary") or {}
 route = (health or {}).get("okxRoute") or {}
 private_stream = (health or {}).get("privateOrderStream") or {}
 
-errors: list[str] = []
-warnings: list[str] = []
+errors = []
+warnings = []
 
 if not ping.get("ok"):
     errors.append("ping 返回 ok=false")
