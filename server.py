@@ -1716,6 +1716,9 @@ class OkxClient:
             and paper_state_has_activity(self._paper_state())
         )
 
+    def _paper_fallback_allowed(self) -> bool:
+        return self._paper_enabled() and not self._has_private_credentials()
+
     @staticmethod
     def _binance_symbol(inst_id: str) -> str:
         return inst_id.replace("-SWAP", "").replace("-", "").upper()
@@ -2001,7 +2004,7 @@ class OkxClient:
         try:
             return self._request("GET", "/api/v5/account/balance", params=params)
         except Exception:
-            if self._paper_enabled():
+            if self._paper_fallback_allowed():
                 return self._paper_account_balance()
             raise
 
@@ -2012,7 +2015,7 @@ class OkxClient:
         try:
             return self._request("GET", "/api/v5/asset/balances", params=params)
         except Exception:
-            if self._paper_enabled():
+            if self._paper_fallback_allowed():
                 return {"code": "0", "data": [], "_paperSim": True}
             raise
 
@@ -2023,7 +2026,7 @@ class OkxClient:
         try:
             return self._request("GET", "/api/v5/asset/asset-valuation", params=params)
         except Exception:
-            if self._paper_enabled():
+            if self._paper_fallback_allowed():
                 return {"code": "0", "data": [{"ccy": ccy or "USDT", "totalBal": "0", "ts": str(int(time.time() * 1000))}], "_paperSim": True}
             raise
 
@@ -2034,7 +2037,7 @@ class OkxClient:
         try:
             return self._request("GET", "/api/v5/account/positions", params=params)
         except Exception:
-            if self._paper_enabled():
+            if self._paper_fallback_allowed():
                 return self._paper_positions(inst_id)
             raise
 
@@ -2051,7 +2054,7 @@ class OkxClient:
         try:
             return self._request("GET", "/api/v5/trade/orders-history", params=params)
         except Exception:
-            if self._paper_enabled():
+            if self._paper_fallback_allowed():
                 return self._paper_recent_orders()
             raise
 

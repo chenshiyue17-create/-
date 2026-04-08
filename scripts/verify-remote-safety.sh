@@ -74,6 +74,7 @@ account = load(base, "account-overview.json")
 summary = account.get("summary") or {}
 route = (health or {}).get("okxRoute") or {}
 private_stream = (health or {}).get("privateOrderStream") or {}
+funding_warning = str(account.get("fundingWarning") or "")
 
 errors = []
 warnings = []
@@ -112,6 +113,9 @@ if not display_total:
 if simulated and Decimal(str(valuation_total or "0")) > 0 and display_source != "总资产估值":
     warnings.append(f"模拟盘估值口径未优先显示：displaySource={display_source}")
 
+if simulated and funding_warning:
+    errors.append(f"模拟盘资金/估值接口异常：{funding_warning}")
+
 if simulated:
     if automation.get("allowLiveTrading"):
         errors.append("模拟盘下 allowLiveTrading 仍为开启")
@@ -137,6 +141,7 @@ print(f"显示来源: {display_source or '未提供'}")
 print(f"显示拆分: {display_breakdown or '未提供'}")
 print(f"估值总额: {fmt_decimal(valuation_total)}")
 print(f"资金口径: {fmt_decimal(funding_total)}")
+print(f"资金告警: {funding_warning or '无'}")
 print(
     "策略开关: "
     f"autostart={automation.get('autostart')} "
