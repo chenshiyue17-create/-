@@ -296,11 +296,15 @@ def remote_gateway_request(
     if not base:
         raise OkxApiError("未配置远端执行节点 URL")
     url = f"{base}{path_with_query if path_with_query.startswith('/') else '/' + path_with_query}"
-    response = remote_gateway_session(config).request(
+    headers = remote_gateway_headers(config, content_type=content_type)
+    # Gateway calls are control-plane operations. Prefer a fresh connection so a stale
+    # keep-alive socket to the remote node or nginx does not pin the UI on env switches.
+    headers["Connection"] = "close"
+    response = requests.request(
         method=method.upper(),
         url=url,
         data=body,
-        headers=remote_gateway_headers(config, content_type=content_type),
+        headers=headers,
         timeout=timeout,
     )
     return response
@@ -351,6 +355,8 @@ REMOTE_CONFIG_KEYS = (
     "baseUrl",
     "simulated",
 )
+REMOTE_CONFIG_FETCH_TIMEOUT = 8.0
+REMOTE_NODE_HEALTH_TIMEOUT = 6.0
 
 
 def build_proxy_runtime_config(current: dict[str, Any], payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -372,6 +378,9 @@ def build_local_runtime_config(current: dict[str, Any], payload: dict[str, Any])
     for key in ("envPreset", "baseUrl", "simulated", "executionMode", "remoteGatewayUrl"):
         if key in payload:
             merged[key] = payload.get(key)
+    for key in ("apiKey", "secretKey", "passphrase"):
+        if key in payload:
+            merged[key] = payload.get(key)
     remote_token = str(payload.get("remoteGatewayToken") or "").strip()
     if remote_token:
         merged["remoteGatewayToken"] = remote_token
@@ -379,13 +388,21 @@ def build_local_runtime_config(current: dict[str, Any], payload: dict[str, Any])
 
 
 def build_remote_trading_config(current: dict[str, Any], payload: dict[str, Any], *, persist: bool) -> dict[str, Any]:
+    selection = deep_merge(default_config(), current)
+    for key in ("envPreset", "baseUrl", "simulated"):
+        if key in payload:
+            selection[key] = payload.get(key)
+    profile_key = config_profile_key(selection)
+    profiles = deep_merge(default_trading_profiles(), current.get("profiles") or {})
+    profile_defaults = default_trading_profiles().get(profile_key, {})
+    stored_profile = deep_merge(profile_defaults, profiles.get(profile_key) or {})
     merged = {
-        "envPreset": payload.get("envPreset", current.get("envPreset", "okx_main_demo")),
-        "apiKey": payload.get("apiKey", ""),
-        "secretKey": payload.get("secretKey", ""),
-        "passphrase": payload.get("passphrase", ""),
-        "baseUrl": payload.get("baseUrl", current.get("baseUrl", "https://www.okx.com")),
-        "simulated": bool(payload.get("simulated", current.get("simulated", True))),
+        "envPreset": payload.get("envPreset", stored_profile.get("envPreset", current.get("envPreset", "okx_main_demo"))),
+        "apiKey": payload.get("apiKey") or stored_profile.get("apiKey", ""),
+        "secretKey": payload.get("secretKey") or stored_profile.get("secretKey", ""),
+        "passphrase": payload.get("passphrase") or stored_profile.get("passphrase", ""),
+        "baseUrl": payload.get("baseUrl", stored_profile.get("baseUrl", current.get("baseUrl", "https://www.okx.com"))),
+        "simulated": bool(payload.get("simulated", stored_profile.get("simulated", current.get("simulated", True)))),
         "executionMode": "local",
         "remoteGatewayUrl": "",
         "remoteGatewayToken": "",
@@ -414,6 +431,7 @@ def merge_remote_redacted_config(
     merged["remoteGatewayToken"] = ""
     if local_redacted.get("remoteGatewayTokenMask"):
         merged["remoteGatewayTokenMask"] = local_redacted.get("remoteGatewayTokenMask")
+    merged.pop("profiles", None)
     return merged
 
 
@@ -425,30 +443,37 @@ def should_proxy_to_remote(config: dict[str, Any], path: str) -> bool:
     return any(path.startswith(prefix) for prefix in REMOTE_PROXY_PREFIXES)
 
 
-def remote_node_health(config: dict[str, Any], *, timeout: float = 1.2) -> dict[str, Any]:
-    try:
-        response = remote_gateway_request(config, "GET", "/api/health", timeout=timeout)
-        payload = response.json()
-        route = payload.get("okxRoute") or {}
-        if not route:
-            route = {
-                "healthy": response.ok,
-                "summary": "远端执行节点已连接" if response.ok else "远端执行节点未就绪",
-                "detail": "",
-            }
-        route["executionMode"] = "remote"
-        route["remoteGatewayUrl"] = remote_gateway_url(config)
-        return route
-    except Exception as exc:
-        return {
-            "healthy": False,
-            "status": "remote_unreachable",
-            "summary": "远端执行节点未连通",
-            "detail": str(exc),
-            "technicalDetail": str(exc),
-            "executionMode": "remote",
-            "remoteGatewayUrl": remote_gateway_url(config),
-        }
+def remote_node_health(config: dict[str, Any], *, timeout: float = REMOTE_NODE_HEALTH_TIMEOUT) -> dict[str, Any]:
+    last_error: Exception | None = None
+    for attempt, attempt_timeout in enumerate((timeout, max(timeout, 10.0)), start=1):
+        try:
+            response = remote_gateway_request(config, "GET", "/api/health", timeout=attempt_timeout)
+            payload = response.json()
+            route = payload.get("okxRoute") or {}
+            if not route:
+                route = {
+                    "healthy": response.ok,
+                    "summary": "远端执行节点已连接" if response.ok else "远端执行节点未就绪",
+                    "detail": "",
+                }
+            route["executionMode"] = "remote"
+            route["remoteGatewayUrl"] = remote_gateway_url(config)
+            return route
+        except Exception as exc:
+            last_error = exc
+            if attempt == 1:
+                time.sleep(0.15)
+                continue
+    detail = str(last_error) if last_error else "未知错误"
+    return {
+        "healthy": False,
+        "status": "remote_unreachable",
+        "summary": "远端执行节点未连通",
+        "detail": detail,
+        "technicalDetail": detail,
+        "executionMode": "remote",
+        "remoteGatewayUrl": remote_gateway_url(config),
+    }
 
 
 def safe_host_ips(host: str) -> list[str]:
@@ -1100,7 +1125,67 @@ def default_config() -> dict[str, Any]:
         "executionMode": "local",
         "remoteGatewayUrl": "",
         "remoteGatewayToken": "",
+        "profiles": default_trading_profiles(),
     }
+
+
+def default_trading_profiles() -> dict[str, dict[str, Any]]:
+    return {
+        "okx_main_demo": {
+            "envPreset": "okx_main_demo",
+            "baseUrl": "https://www.okx.com",
+            "simulated": True,
+            "apiKey": "",
+            "secretKey": "",
+            "passphrase": "",
+        },
+        "okx_main_live": {
+            "envPreset": "okx_main_live",
+            "baseUrl": "https://www.okx.com",
+            "simulated": False,
+            "apiKey": "",
+            "secretKey": "",
+            "passphrase": "",
+        },
+        "okx_us_live": {
+            "envPreset": "okx_us_live",
+            "baseUrl": "https://us.okx.com",
+            "simulated": False,
+            "apiKey": "",
+            "secretKey": "",
+            "passphrase": "",
+        },
+        "custom_demo": {
+            "envPreset": "custom",
+            "baseUrl": "https://www.okx.com",
+            "simulated": True,
+            "apiKey": "",
+            "secretKey": "",
+            "passphrase": "",
+        },
+        "custom_live": {
+            "envPreset": "custom",
+            "baseUrl": "https://www.okx.com",
+            "simulated": False,
+            "apiKey": "",
+            "secretKey": "",
+            "passphrase": "",
+        },
+    }
+
+
+def config_profile_key(config: dict[str, Any]) -> str:
+    env_preset = str(config.get("envPreset") or "").strip() or "okx_main_demo"
+    simulated = bool(config.get("simulated"))
+    if env_preset == "okx_main_demo":
+        return "okx_main_demo"
+    if env_preset == "okx_main_live":
+        return "okx_main_live"
+    if env_preset == "okx_us_live":
+        return "okx_us_live"
+    if env_preset == "custom":
+        return "custom_demo" if simulated else "custom_live"
+    return "custom_demo" if simulated else "custom_live"
 
 
 def default_miner_state() -> dict[str, Any]:
@@ -1166,24 +1251,96 @@ class ConfigStore:
         self.runtime_config: dict[str, Any] = default_config()
         self.load()
 
+    def _normalize_state(self, payload: dict[str, Any]) -> dict[str, Any]:
+        state = deep_merge(default_config(), payload)
+        profiles = deep_merge(default_trading_profiles(), state.get("profiles") or {})
+        legacy_has_secret = any(str(state.get(key) or "").strip() for key in ("apiKey", "secretKey", "passphrase"))
+        active_key = config_profile_key(state)
+        active_profile = deep_merge(default_trading_profiles().get(active_key, {}), profiles.get(active_key) or {})
+        if legacy_has_secret and not any(
+            str(active_profile.get(key) or "").strip() for key in ("apiKey", "secretKey", "passphrase")
+        ):
+            for key in ("apiKey", "secretKey", "passphrase"):
+                active_profile[key] = str(state.get(key) or "").strip()
+            active_profile["baseUrl"] = str(state.get("baseUrl") or active_profile.get("baseUrl") or "").strip() or active_profile.get("baseUrl", "")
+            active_profile["simulated"] = bool(state.get("simulated"))
+            active_profile["envPreset"] = str(state.get("envPreset") or active_profile.get("envPreset") or "custom")
+            profiles[active_key] = active_profile
+        state["profiles"] = profiles
+        return state
+
+    def current_for_selection(
+        self, selection: dict[str, Any] | None = None, state_override: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        state = self._normalize_state(state_override if state_override is not None else self.runtime_config)
+        target = deep_merge(deep_merge(default_config(), state), selection or {})
+        profile_key = config_profile_key(target)
+        profiles = deep_merge(default_trading_profiles(), state.get("profiles") or {})
+        profile = deep_merge(default_trading_profiles().get(profile_key, {}), profiles.get(profile_key) or {})
+
+        merged = deep_merge(default_config(), state)
+        merged["envPreset"] = str(target.get("envPreset") or profile.get("envPreset") or merged.get("envPreset") or "custom")
+        merged["baseUrl"] = str(target.get("baseUrl") or profile.get("baseUrl") or merged.get("baseUrl") or "https://www.okx.com")
+        merged["simulated"] = bool(target.get("simulated", profile.get("simulated", merged.get("simulated"))))
+        for key in ("apiKey", "secretKey", "passphrase"):
+            merged[key] = str(profile.get(key) or "")
+        merged["profiles"] = profiles
+        return merged
+
     def load(self) -> None:
         with self.lock:
             loaded, _ = secure_load_json(self.path, dict)
-            self.runtime_config = deep_merge(default_config(), loaded)
+            self.runtime_config = self._normalize_state(loaded)
+
+    def snapshot(self) -> dict[str, Any]:
+        with self.lock:
+            return copy.deepcopy(self._normalize_state(self.runtime_config))
 
     def save(self, config: dict[str, Any], persist: bool) -> None:
         with self.lock:
-            self.runtime_config = deep_merge(default_config(), config)
+            state = self._normalize_state(self.runtime_config)
+            target = deep_merge(deep_merge(default_config(), state), config)
+            profile_key = config_profile_key(target)
+            profiles = deep_merge(default_trading_profiles(), state.get("profiles") or {})
+            profile = deep_merge(default_trading_profiles().get(profile_key, {}), profiles.get(profile_key) or {})
+
+            profile["envPreset"] = str(target.get("envPreset") or profile.get("envPreset") or "custom")
+            profile["baseUrl"] = str(target.get("baseUrl") or profile.get("baseUrl") or "https://www.okx.com")
+            profile["simulated"] = bool(target.get("simulated", profile.get("simulated")))
+            for key in ("apiKey", "secretKey", "passphrase"):
+                if key in config:
+                    incoming = str(config.get(key) or "").strip()
+                    if incoming:
+                        profile[key] = incoming
+                    elif not str(profile.get(key) or "").strip():
+                        profile[key] = ""
+            profiles[profile_key] = profile
+
+            for key in ("envPreset", "baseUrl", "simulated", "executionMode", "remoteGatewayUrl"):
+                if key in config:
+                    state[key] = target[key]
+            if "remoteGatewayToken" in config:
+                incoming_token = str(config.get("remoteGatewayToken") or "").strip()
+                if incoming_token:
+                    state["remoteGatewayToken"] = incoming_token
+                elif not str(state.get("remoteGatewayToken") or "").strip():
+                    state["remoteGatewayToken"] = ""
+
+            state["profiles"] = profiles
+            active = self.current_for_selection(state_override=state)
+            for key in ("apiKey", "secretKey", "passphrase"):
+                state[key] = active[key]
+            self.runtime_config = self._normalize_state(state)
             if persist:
                 secure_dump_json(self.path, self.runtime_config)
 
     def current(self) -> dict[str, Any]:
         with self.lock:
-            return deep_merge(default_config(), self.runtime_config)
+            return self.current_for_selection()
 
     def merged_with_existing_secrets(self, config: dict[str, Any]) -> dict[str, Any]:
         merged = deep_merge(default_config(), config)
-        existing = self.current()
+        existing = self.current_for_selection(merged)
         for key in ("apiKey", "secretKey", "passphrase", "remoteGatewayToken"):
             if not merged.get(key) and existing.get(key):
                 merged[key] = existing[key]
@@ -1197,6 +1354,7 @@ class ConfigStore:
             if value:
                 masks[f"{key}Mask"] = value[:4] + "..." + value[-2:]
                 config[key] = ""
+        config.pop("profiles", None)
         config.update(masks)
         return config
 
@@ -1789,6 +1947,28 @@ class OkxClient:
         except Exception:
             if self._paper_enabled():
                 return self._paper_account_balance()
+            raise
+
+    def get_funding_balances(self, ccy: str | None = None) -> dict[str, Any]:
+        params = {"ccy": ccy} if ccy else None
+        if self._paper_state_authoritative():
+            return {"code": "0", "data": [], "_paperSim": True}
+        try:
+            return self._request("GET", "/api/v5/asset/balances", params=params)
+        except Exception:
+            if self._paper_enabled():
+                return {"code": "0", "data": [], "_paperSim": True}
+            raise
+
+    def get_asset_valuation(self, ccy: str = "USDT") -> dict[str, Any]:
+        params = {"ccy": ccy} if ccy else None
+        if self._paper_state_authoritative():
+            return {"code": "0", "data": [{"ccy": ccy or "USDT", "totalBal": "0", "ts": str(int(time.time() * 1000))}], "_paperSim": True}
+        try:
+            return self._request("GET", "/api/v5/asset/asset-valuation", params=params)
+        except Exception:
+            if self._paper_enabled():
+                return {"code": "0", "data": [{"ccy": ccy or "USDT", "totalBal": "0", "ts": str(int(time.time() * 1000))}], "_paperSim": True}
             raise
 
     def get_positions(self, inst_id: str | None = None) -> dict[str, Any]:
@@ -3509,6 +3689,109 @@ def parse_balance_snapshot(raw: dict[str, Any]) -> dict[str, Any]:
         },
         "details": details,
     }
+
+
+def parse_funding_balance_snapshot(
+    raw: dict[str, Any],
+    valuation_raw: dict[str, Any] | None = None,
+    ccy: str = "USDT",
+) -> dict[str, Any]:
+    details = list(raw.get("data") or [])
+    details.sort(
+        key=lambda row: safe_decimal(
+            row.get("usdEq") or row.get("eqUsd") or row.get("bal") or row.get("availBal") or "0"
+        ),
+        reverse=True,
+    )
+    valuation_entries = (valuation_raw or {}).get("data") or []
+    valuation_top = valuation_entries[0] if valuation_entries else {}
+    total_bal = safe_decimal(valuation_top.get("totalBal"), "0")
+    if total_bal <= 0:
+        total_bal = sum(
+            safe_decimal(row.get("usdEq") or row.get("eqUsd") or row.get("bal") or row.get("availBal") or "0")
+            for row in details
+        )
+    return {
+        "summary": {
+            "totalBal": decimal_to_str(total_bal),
+            "ccy": valuation_top.get("ccy") or ccy,
+            "ts": valuation_top.get("ts", ""),
+        },
+        "details": details,
+    }
+
+
+def build_account_snapshot(
+    trading_snapshot: dict[str, Any],
+    funding_snapshot: dict[str, Any] | None = None,
+    positions: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    funding_snapshot = funding_snapshot or {"summary": {}, "details": []}
+    positions = positions or []
+    trading_summary = copy.deepcopy(trading_snapshot.get("summary") or {})
+    trading_total = safe_decimal(trading_summary.get("totalEq"), "0")
+    funding_summary = copy.deepcopy(funding_snapshot.get("summary") or {})
+    funding_total = safe_decimal(funding_summary.get("totalBal"), "0")
+    display_total = trading_total + funding_total
+    if display_total <= 0:
+        display_total = trading_total
+
+    if funding_total > 0 and trading_total > 0:
+        display_source = "资金账户 + 交易账户"
+        display_breakdown = (
+            f"资金账户 {format_decimal(funding_total, 2)} USDT · "
+            f"交易账户 {format_decimal(trading_total, 2)} USDT"
+        )
+    elif funding_total > 0:
+        display_source = "资金账户"
+        display_breakdown = f"资金账户 {format_decimal(funding_total, 2)} USDT"
+    elif trading_total > 0:
+        display_source = "交易账户"
+        display_breakdown = f"交易账户 {format_decimal(trading_total, 2)} USDT"
+    else:
+        display_source = "交易账户"
+        display_breakdown = ""
+
+    summary = {
+        **trading_summary,
+        "tradingTotalEq": decimal_to_str(trading_total),
+        "fundingTotalEq": decimal_to_str(funding_total),
+        "displayTotalEq": decimal_to_str(display_total),
+        "displaySource": display_source,
+        "displayBreakdown": display_breakdown,
+    }
+    summary["totalEq"] = summary["displayTotalEq"]
+
+    trading_balances = list(trading_snapshot.get("details") or [])
+    funding_balances = list(funding_snapshot.get("details") or [])
+    return {
+        "summary": summary,
+        "balances": trading_balances,
+        "tradingBalances": trading_balances,
+        "fundingBalances": funding_balances,
+        "fundingSummary": funding_summary,
+        "positions": positions,
+        "balanceCount": len(trading_balances) + len(funding_balances),
+        "positionCount": len(positions),
+    }
+
+
+def fetch_account_snapshot(client: OkxClient, include_positions: bool = True) -> dict[str, Any]:
+    trading_snapshot = parse_balance_snapshot(client.get_account_balance())
+    funding_warning = ""
+    funding_snapshot = {"summary": {"totalBal": "0", "ccy": "USDT", "ts": ""}, "details": []}
+    try:
+        funding_raw = client.get_funding_balances()
+        valuation_raw = client.get_asset_valuation("USDT")
+        funding_snapshot = parse_funding_balance_snapshot(funding_raw, valuation_raw, "USDT")
+    except Exception as exc:
+        funding_warning = str(exc)
+
+    positions = client.get_positions().get("data", []) if include_positions else []
+    payload = build_account_snapshot(trading_snapshot, funding_snapshot, positions)
+    if funding_warning:
+        payload["fundingWarning"] = funding_warning
+    return payload
 
 
 def find_balance_detail(snapshot: dict[str, Any], ccy: str) -> dict[str, Any]:
@@ -5735,6 +6018,9 @@ def write_http_response(
         handler.send_response(status)
         handler.send_header("Content-Type", content_type)
         handler.send_header("Content-Length", str(len(raw)))
+        handler.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+        handler.send_header("Pragma", "no-cache")
+        handler.send_header("Expires", "0")
         handler.end_headers()
         handler.wfile.write(raw)
     except BaseException as exc:
@@ -5787,17 +6073,35 @@ class AppHandler(BaseHTTPRequestHandler):
         return
 
     def do_HEAD(self) -> None:
-        if self.path == "/" or self.path.endswith(".html"):
-            candidate = STATIC_DIR / "index.html"
-            raw = candidate.read_bytes()
-            write_http_response(
-                self,
-                status=200,
-                content_type="text/html; charset=utf-8",
-                raw=raw,
-            )
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+        relative_path = "index.html" if path in ("", "/") else path.lstrip("/")
+        candidate = (STATIC_DIR / relative_path).resolve()
+        if not str(candidate).startswith(str(STATIC_DIR.resolve())) or not candidate.exists():
+            self.send_error(HTTPStatus.NOT_FOUND, "Not found")
             return
-        self.send_error(HTTPStatus.NOT_FOUND, "Not found")
+
+        content_type = "text/plain; charset=utf-8"
+        if candidate.suffix == ".html":
+            content_type = "text/html; charset=utf-8"
+        elif candidate.suffix == ".css":
+            content_type = "text/css; charset=utf-8"
+        elif candidate.suffix == ".js":
+            content_type = "application/javascript; charset=utf-8"
+
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(candidate.stat().st_size))
+            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("Expires", "0")
+            self.end_headers()
+        except BaseException as exc:
+            if is_disconnect_error(exc):
+                self.close_connection = True
+                return
+            raise
 
     def do_GET(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
@@ -5864,7 +6168,12 @@ class AppHandler(BaseHTTPRequestHandler):
             local_redacted = CONFIG.redacted()
             if is_remote_execution_enabled(local_config):
                 try:
-                    response = remote_gateway_request(local_config, "GET", self.path, timeout=1.2)
+                    response = remote_gateway_request(
+                        local_config,
+                        "GET",
+                        self.path,
+                        timeout=REMOTE_CONFIG_FETCH_TIMEOUT,
+                    )
                     remote_payload = response.json()
                     merged = merge_remote_redacted_config(local_redacted, remote_payload)
                     json_response(
@@ -5893,7 +6202,12 @@ class AppHandler(BaseHTTPRequestHandler):
         if path == "/api/automation/config":
             if is_remote_execution_enabled(config):
                 try:
-                    response = remote_gateway_request(config, "GET", self.path, timeout=1.2)
+                    response = remote_gateway_request(
+                        config,
+                        "GET",
+                        self.path,
+                        timeout=REMOTE_CONFIG_FETCH_TIMEOUT,
+                    )
                     relay_requests_response(self, response)
                 except Exception as exc:
                     json_response(
@@ -5929,10 +6243,12 @@ class AppHandler(BaseHTTPRequestHandler):
                 def fetch() -> dict[str, Any]:
                     ensure_live_route_ready(config, force=False)
                     client = OkxClient(config)
-                    balances = parse_balance_snapshot(client.get_account_balance())
+                    snapshot = fetch_account_snapshot(client, include_positions=False)
                     return {
-                        "summary": balances["summary"],
-                        "balanceCount": len(balances["details"]),
+                        "summary": snapshot["summary"],
+                        "fundingSummary": snapshot.get("fundingSummary", {}),
+                        "balanceCount": snapshot.get("balanceCount", 0),
+                        "positionCount": snapshot.get("positionCount", 0),
                     }
 
                 data, error_text, cached = load_cached_focus_section("account", 12.0, fetch)
@@ -5989,15 +6305,20 @@ class AppHandler(BaseHTTPRequestHandler):
             try:
                 route = ensure_live_route_ready(config, force=False)
                 client = OkxClient(config)
-                balances = parse_balance_snapshot(client.get_account_balance())
-                positions = client.get_positions().get("data", [])
+                snapshot = fetch_account_snapshot(client, include_positions=True)
                 json_response(
                     self,
                     {
                         "ok": True,
-                        "summary": balances["summary"],
-                        "balances": balances["details"],
-                        "positions": positions,
+                        "summary": snapshot["summary"],
+                        "balances": snapshot["balances"],
+                        "tradingBalances": snapshot.get("tradingBalances", []),
+                        "fundingBalances": snapshot.get("fundingBalances", []),
+                        "fundingSummary": snapshot.get("fundingSummary", {}),
+                        "positions": snapshot["positions"],
+                        "balanceCount": snapshot.get("balanceCount", 0),
+                        "positionCount": snapshot.get("positionCount", 0),
+                        "fundingWarning": snapshot.get("fundingWarning", ""),
                         "route": route,
                     },
                 )
@@ -6104,15 +6425,19 @@ class AppHandler(BaseHTTPRequestHandler):
         if not enforce_gateway_auth(self, path):
             return
         config = CONFIG.current()
+        config_state = CONFIG.snapshot()
 
         if path != "/api/config" and should_proxy_to_remote(config, path):
             try:
                 raw = read_raw_request(self)
                 content_type = str(self.headers.get("Content-Type") or "application/json; charset=utf-8")
                 if path == "/api/config/test":
-                    payload = read_json_request(self)
+                    if raw:
+                        payload = json.loads(raw.decode("utf-8"))
+                    else:
+                        payload = {}
                     proxy_config = build_proxy_runtime_config(config, payload)
-                    remote_payload = build_remote_trading_config(config, payload, persist=False)
+                    remote_payload = build_remote_trading_config(config_state, payload, persist=False)
                     raw = json.dumps(remote_payload, ensure_ascii=False).encode("utf-8")
                     content_type = "application/json; charset=utf-8"
                 else:
@@ -6141,7 +6466,7 @@ class AppHandler(BaseHTTPRequestHandler):
                     error_response(self, message, status=400)
                     return
                 CONFIG.save(local_runtime, persist=persist)
-                remote_payload = build_remote_trading_config(config, payload, persist=persist)
+                remote_payload = build_remote_trading_config(config_state, payload, persist=persist)
                 try:
                     response = remote_gateway_request(
                         proxy_config,

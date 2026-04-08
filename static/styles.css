@@ -1008,6 +1008,12 @@ label {
   color: var(--muted);
 }
 
+.field-hint {
+  font-size: 11px;
+  line-height: 1.45;
+  color: rgba(140, 152, 169, 0.92);
+}
+
 input,
 select {
   width: 100%;
