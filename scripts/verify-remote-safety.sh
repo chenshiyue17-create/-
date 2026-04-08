@@ -114,11 +114,11 @@ if simulated and Decimal(str(valuation_total or "0")) > 0 and display_source != 
 
 if simulated:
     if automation.get("allowLiveTrading"):
-        warnings.append("模拟盘下 allowLiveTrading 仍为开启")
+        errors.append("模拟盘下 allowLiveTrading 仍为开启")
     if automation.get("allowLiveManualOrders"):
-        warnings.append("模拟盘下 allowLiveManualOrders 仍为开启")
+        errors.append("模拟盘下 allowLiveManualOrders 仍为开启")
     if automation.get("allowLiveAutostart"):
-        warnings.append("模拟盘下 allowLiveAutostart 仍为开启")
+        errors.append("模拟盘下 allowLiveAutostart 仍为开启")
 else:
     if automation.get("allowLiveTrading"):
         warnings.append("实盘自动交易当前已解锁")

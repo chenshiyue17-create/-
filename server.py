@@ -1386,6 +1386,24 @@ def reset_automation_live_permissions(*, reason: str = "") -> dict[str, Any]:
     return updated
 
 
+def ensure_automation_permissions_match_environment(api_config: dict[str, Any]) -> dict[str, Any]:
+    current = AUTOMATION_CONFIG.current()
+    if not bool(api_config.get("simulated")):
+        return current
+    if not any(
+        bool(current.get(key))
+        for key in ("allowLiveManualOrders", "allowLiveTrading", "allowLiveAutostart")
+    ):
+        return current
+
+    def mutate(config: dict[str, Any]) -> None:
+        config["allowLiveManualOrders"] = False
+        config["allowLiveTrading"] = False
+        config["allowLiveAutostart"] = False
+
+    return AUTOMATION_CONFIG.update(mutate)
+
+
 class OkxApiError(RuntimeError):
     pass
 
@@ -1684,8 +1702,19 @@ class OkxClient:
     def _paper_enabled(self) -> bool:
         return self.simulated
 
+    def _has_private_credentials(self) -> bool:
+        return bool(
+            str(self.api_key or "").strip()
+            and str(self.secret_key or "").strip()
+            and str(self.passphrase or "").strip()
+        )
+
     def _paper_state_authoritative(self) -> bool:
-        return self._paper_enabled() and paper_state_has_activity(self._paper_state())
+        return (
+            self._paper_enabled()
+            and not self._has_private_credentials()
+            and paper_state_has_activity(self._paper_state())
+        )
 
     @staticmethod
     def _binance_symbol(inst_id: str) -> str:
@@ -6295,7 +6324,13 @@ class AppHandler(BaseHTTPRequestHandler):
                         },
                     )
                 return
-            json_response(self, {"ok": True, "config": AUTOMATION_CONFIG.current()})
+            json_response(
+                self,
+                {
+                    "ok": True,
+                    "config": ensure_automation_permissions_match_environment(CONFIG.current()),
+                },
+            )
             return
 
         if path == "/api/automation/state":
@@ -6643,6 +6678,14 @@ class AppHandler(BaseHTTPRequestHandler):
             if not ok:
                 error_response(self, message, status=400)
                 return
+            normalized = deep_merge(
+                ensure_automation_permissions_match_environment(CONFIG.current()),
+                normalized,
+            )
+            if bool(CONFIG.current().get("simulated")):
+                normalized["allowLiveManualOrders"] = False
+                normalized["allowLiveTrading"] = False
+                normalized["allowLiveAutostart"] = False
             AUTOMATION_CONFIG.replace(normalized)
             json_response(self, {"ok": True, "config": normalized})
             return
