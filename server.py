@@ -1542,12 +1542,15 @@ def summarize_basis_arb_watchlist(entries: list[dict[str, Any]]) -> dict[str, in
         "rollback": 0,
         "brokenPair": 0,
         "blocked": 0,
+        "reverseBasis": 0,
     }
     for entry in entries:
         summary = entry.get("summary") or {}
         stage = str(summary.get("arbStage") or "").strip().lower()
         if stage in {"window_open", "entry_wait"}:
             counts["windowOpen"] += 1
+        elif stage == "reverse_basis":
+            counts["reverseBasis"] += 1
         elif stage == "hedged":
             counts["hedged"] += 1
         elif stage in {"exit_wait", "exiting"}:
@@ -7206,12 +7209,15 @@ class AutomationEngine:
         rollback_pairs = int(arb_runtime.get("rollback") or 0)
         blocked_pairs = int(arb_runtime.get("blocked") or 0)
         broken_pairs = int(arb_runtime.get("brokenPair") or 0)
+        reverse_basis_pairs = int(arb_runtime.get("reverseBasis") or 0)
         if is_basis_arb:
             pipeline_summary = (
                 f"套利窗口 {window_open} 币 · "
                 f"对冲中 {hedged_pairs} 币对 · "
                 f"待回补 {exit_queue} 币对"
             )
+            if reverse_basis_pairs:
+                pipeline_summary += f" · 反向 {reverse_basis_pairs}"
             if rollback_pairs:
                 pipeline_summary += f" · 回滚 {rollback_pairs}"
             if blocked_pairs:
@@ -7225,6 +7231,8 @@ class AutomationEngine:
                 f" · 对冲 {hedged_pairs}"
                 f" · 回补 {exit_queue}"
             )
+            if reverse_basis_pairs:
+                mode_text += f" · 反向 {reverse_basis_pairs}"
             if rollback_pairs:
                 mode_text += f" · 回滚 {rollback_pairs}"
             last_strategy_detail = (
