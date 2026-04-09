@@ -1412,6 +1412,8 @@ def build_market_risk_label(target: dict[str, Any], market_kind: str) -> str:
 
 def basis_arb_stage_text(stage: str) -> str:
     normalized = str(stage or "").strip().lower()
+    if normalized == "reverse_basis":
+        return "当前负基差，不做这侧套利"
     if normalized == "window_open":
         return "套利窗口打开"
     if normalized == "entry_wait":
@@ -4916,8 +4918,9 @@ def build_basis_arb_analysis(
 
     blockers: list[str] = []
     warnings: list[str] = []
-    if entry_spread_pct <= 0:
-        warnings.append("永续盘口未形成可执行溢价")
+    reverse_basis = entry_spread_pct <= 0
+    if reverse_basis:
+        warnings.append("当前是负基差，这版只做现货多 / 永续空，不做反向套利")
     if require_funding_alignment and not funding_aligned:
         blockers.append("当前资金费不足以支撑现货多 / 永续空套利")
     if volatility_pct >= Decimal("4.5"):
@@ -4932,6 +4935,9 @@ def build_basis_arb_analysis(
     elif blockers:
         decision = "skip"
         decision_label = "暂停套利"
+    elif reverse_basis:
+        decision = "observe"
+        decision_label = "当前负基差，不做这侧套利"
     else:
         decision = "observe"
         decision_label = "等待价差扩大"
@@ -4947,6 +4953,8 @@ def build_basis_arb_analysis(
         summary_bits.append("允许开现货多 + 永续空对冲腿")
     elif blockers:
         summary_bits.append(blockers[0])
+    elif reverse_basis:
+        summary_bits.append("当前是负基差，这版先不做反向套利")
     else:
         summary_bits.append("继续等待入场价差扩大")
 
@@ -6909,11 +6917,14 @@ class AutomationEngine:
         opened_at = parse_iso(tracked_opened_at)
         if opened_at:
             hold_minutes = max(int((datetime.now() - opened_at).total_seconds() // 60), 0)
+        reverse_basis = entry_spread_pct <= 0
         arb_stage = "watching"
         if tracked_bias and not pair_active:
             arb_stage = "broken_pair"
         elif pair_active:
             arb_stage = "hedged"
+        elif reverse_basis:
+            arb_stage = "reverse_basis"
         elif entry_spread_pct >= entry_threshold and funding_aligned:
             arb_stage = "window_open"
         elif entry_spread_pct >= entry_threshold and not funding_aligned:
@@ -7054,9 +7065,13 @@ class AutomationEngine:
             self._set_market(spot_key, {"arbStage": "entry_wait", "lastMessage": f"套利窗口出现，但{cooldown_reason}"})
             self._set_market(swap_key, {"arbStage": "entry_wait", "lastMessage": f"套利窗口出现，但{cooldown_reason}"})
             return
+        if entry_spread_pct <= 0:
+            self._set_market(spot_key, {"arbStage": "reverse_basis", "lastMessage": f"{shared_label} · 当前是负基差，这版只做现货多 + 永续空"})
+            self._set_market(swap_key, {"arbStage": "reverse_basis", "lastMessage": f"{shared_label} · 当前是负基差，这版只做现货多 + 永续空"})
+            return
         if entry_spread_pct < entry_threshold:
-            self._set_market(spot_key, {"arbStage": "watching", "lastMessage": f"{shared_label} · 价差还没到入场阈值 {decimal_to_str(entry_threshold)}%"})
-            self._set_market(swap_key, {"arbStage": "watching", "lastMessage": f"{shared_label} · 价差还没到入场阈值 {decimal_to_str(entry_threshold)}%"})
+            self._set_market(spot_key, {"arbStage": "watching", "lastMessage": f"{shared_label} · 正基差还没到入场阈值 {decimal_to_str(entry_threshold)}%"})
+            self._set_market(swap_key, {"arbStage": "watching", "lastMessage": f"{shared_label} · 正基差还没到入场阈值 {decimal_to_str(entry_threshold)}%"})
             return
         if require_funding_alignment and not funding_aligned:
             self._set_market(spot_key, {"arbStage": "funding_blocked", "lastMessage": f"{shared_label} · 资金费低于阈值 {decimal_to_str(min_funding)}%"})
