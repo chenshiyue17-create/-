@@ -1327,7 +1327,7 @@ def build_execution_targets(config: dict[str, Any]) -> list[dict[str, Any]]:
     return targets
 
 
-def strategy_mode_label(mode: str) -> str:
+def strategy_mode_text(mode: str) -> str:
     normalized = str(mode or "").strip()
     if normalized == "short_only":
         return "只做空"
@@ -1412,7 +1412,7 @@ def build_watchlist_entry(
             "riskLabel": (
                 f"现货 {build_market_risk_label(target, 'spot')} · "
                 f"永续 {build_market_risk_label(target, 'swap')} · "
-                f"{strategy_mode_label(str(target.get('swapStrategyMode') or 'trend_follow'))}"
+                f"{strategy_mode_text(str(target.get('swapStrategyMode') or 'trend_follow'))}"
             ),
         },
     }
