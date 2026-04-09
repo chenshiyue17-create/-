@@ -73,6 +73,41 @@ OKX_DNS_CACHE_LOCK = threading.RLock()
 OKX_ROUTE_CACHE: dict[str, dict[str, Any]] = {}
 OKX_ROUTE_CACHE_LOCK = threading.RLock()
 ORIGINAL_GETADDRINFO = socket.getaddrinfo
+BASIS_ARB_SCAN_SYMBOL_LIMIT = 24
+BASIS_ARB_PREFERRED_SYMBOLS = (
+    "BTC",
+    "ETH",
+    "SOL",
+    "DOGE",
+    "XRP",
+    "ADA",
+    "SUI",
+    "TRX",
+    "LINK",
+    "AVAX",
+    "LTC",
+    "BCH",
+    "TON",
+    "ARB",
+    "PEPE",
+    "APT",
+    "DOT",
+    "NEAR",
+    "ETC",
+    "FIL",
+    "ATOM",
+    "WLD",
+    "OP",
+    "INJ",
+)
+BASIS_ARB_SCAN_LOCK = threading.RLock()
+BASIS_ARB_MARKET_UNIVERSE_CACHE: dict[str, Any] = {"ts": 0.0, "symbols": []}
+BASIS_ARB_MARKET_SCAN_CACHE: dict[str, Any] = {"ts": 0.0, "key": "", "rows": []}
+ONLY_STRATEGY_PRESET = "dip_swing"
+DIP_SWING_PULLBACK_PCT = Decimal("0.6")
+DIP_SWING_REBOUND_PCT = Decimal("0.10")
+DIP_SWING_MIN_LIQ_BUFFER_PCT = Decimal("18")
+DIP_SWING_MAX_LEVERAGE = Decimal("10")
 
 
 def _extract_a_records_from_doh(payload: dict[str, Any]) -> list[str]:
@@ -996,28 +1031,29 @@ def deep_merge(defaults: Any, current: Any) -> Any:
 
 def default_automation_config() -> dict[str, Any]:
     return {
-        "strategyPreset": "dual_engine",
+        "strategyPreset": ONLY_STRATEGY_PRESET,
         "spotInstId": "BTC-USDT",
         "swapInstId": "BTC-USDT-SWAP",
         "watchlistSymbols": "BTC",
         "watchlistOverrides": {},
-        "bar": "5m",
-        "fastEma": 9,
-        "slowEma": 21,
-        "pollSeconds": 20,
-        "cooldownSeconds": 180,
-        "maxOrdersPerDay": 20,
-        "spotEnabled": True,
-        "spotQuoteBudget": "100",
-        "spotMaxExposure": "300",
+        "bar": "15m",
+        "fastEma": 12,
+        "slowEma": 48,
+        "pollSeconds": 8,
+        "cooldownSeconds": 45,
+        "maxOrdersPerDay": 0,
+        "spotEnabled": False,
+        "spotQuoteBudget": "0",
+        "spotMaxExposure": "0",
         "swapEnabled": True,
         "swapContracts": "1",
-        "swapTdMode": "cross",
-        "swapLeverage": "5",
-        "swapStrategyMode": "trend_follow",
+        "swapTdMode": "isolated",
+        "swapLeverage": "10",
+        "swapStrategyMode": "long_only",
         "stopLossPct": "1.2",
-        "takeProfitPct": "2.4",
-        "maxDailyLossPct": "3.0",
+        "takeProfitPct": "8",
+        "maxDailyLossPct": "0.8",
+        "targetBalanceMultiple": "10",
         "arbEntrySpreadPct": "0.18",
         "arbExitSpreadPct": "0.05",
         "arbMinFundingRatePct": "0.005",
@@ -1029,6 +1065,37 @@ def default_automation_config() -> dict[str, Any]:
         "allowLiveAutostart": False,
         "enforceNetMode": True,
     }
+
+
+def enforce_only_dip_swing_strategy(config: dict[str, Any]) -> dict[str, Any]:
+    enforced = copy.deepcopy(config)
+    enforced["strategyPreset"] = ONLY_STRATEGY_PRESET
+    enforced["spotEnabled"] = False
+    enforced["spotQuoteBudget"] = "0"
+    enforced["spotMaxExposure"] = "0"
+    enforced["swapEnabled"] = True
+    enforced["swapTdMode"] = "isolated"
+    enforced["swapStrategyMode"] = "long_only"
+    return enforced
+
+
+def sanitize_only_dip_swing_override(override: dict[str, Any]) -> dict[str, Any]:
+    sanitized = copy.deepcopy(override)
+    for field in (
+        "spotEnabled",
+        "spotQuoteBudget",
+        "spotMaxExposure",
+        "arbEntrySpreadPct",
+        "arbExitSpreadPct",
+        "arbMinFundingRatePct",
+        "arbMaxHoldMinutes",
+        "arbRequireFundingAlignment",
+    ):
+        sanitized.pop(field, None)
+    sanitized["swapEnabled"] = True
+    sanitized["swapTdMode"] = "isolated"
+    sanitized["swapStrategyMode"] = "long_only"
+    return sanitized
 
 
 def default_market_state() -> dict[str, Any]:
@@ -1054,6 +1121,8 @@ def default_market_state() -> dict[str, Any]:
         "lastOrderId": "",
         "lastMessage": "",
         "lastTradeAt": "",
+        "liquidationPrice": "",
+        "liquidationBufferPct": "",
         "arbStage": "",
         "prepared": False,
     }
@@ -1072,6 +1141,10 @@ def default_automation_state() -> dict[str, Any]:
         "sessionStartEq": "",
         "currentEq": "",
         "maxObservedEq": "",
+        "targetBalanceEq": "",
+        "targetBalanceProgressPct": "0",
+        "targetBalanceRemainingEq": "",
+        "targetBalanceReached": False,
         "dailyDrawdownPct": "0",
         "orderCountToday": 0,
         "today": "",
@@ -1284,8 +1357,8 @@ def validate_single_automation_target(config: dict[str, Any]) -> str:
         return "轮询秒数需在 5 到 300 之间"
     if cooldown < 0 or cooldown > 3600:
         return "冷却秒数需在 0 到 3600 之间"
-    if max_orders < 1 or max_orders > 500:
-        return "每日最大订单数需在 1 到 500 之间"
+    if max_orders < 0 or max_orders > 500:
+        return "每日最大订单数需在 0 到 500 之间；0 代表不限制"
     if config.get("swapStrategyMode") not in ("long_only", "short_only", "trend_follow"):
         return "永续策略模式不支持"
     if config.get("swapTdMode") not in ("cross", "isolated"):
@@ -1298,6 +1371,7 @@ def validate_single_automation_target(config: dict[str, Any]) -> str:
         "stopLossPct",
         "takeProfitPct",
         "maxDailyLossPct",
+        "targetBalanceMultiple",
         "arbEntrySpreadPct",
         "arbExitSpreadPct",
         "arbMinFundingRatePct",
@@ -1322,6 +1396,20 @@ def validate_single_automation_target(config: dict[str, Any]) -> str:
             return "高频套利的回补价差不能小于 0"
         if exit_spread >= entry_spread:
             return "高频套利的回补价差必须小于入场价差"
+    if str(config.get("strategyPreset") or "") == "dip_swing":
+        if not config.get("swapEnabled"):
+            return "波段策略必须启用永续"
+        if str(config.get("swapStrategyMode") or "") != "long_only":
+            return "波段策略只支持 long_only"
+        if str(config.get("swapTdMode") or "") != "isolated":
+            return "波段策略必须使用 isolated 逐仓"
+        if safe_decimal(config.get("swapLeverage"), "1") > DIP_SWING_MAX_LEVERAGE:
+            return f"波段策略杠杆不能高于 {decimal_to_str(DIP_SWING_MAX_LEVERAGE)}x"
+        if safe_decimal(config.get("takeProfitPct"), "0") < Decimal("8"):
+            return "波段策略的目标止盈建议至少 8%"
+    target_multiple = safe_decimal(config.get("targetBalanceMultiple"), "1")
+    if target_multiple < Decimal("1") or target_multiple > Decimal("100"):
+        return "目标余额倍数需在 1 到 100 之间"
     return ""
 
 
@@ -1381,6 +1469,54 @@ def build_execution_targets(config: dict[str, Any]) -> list[dict[str, Any]]:
     return targets
 
 
+def resolve_selected_execution_target(config: dict[str, Any]) -> dict[str, Any]:
+    spot_inst_id = str(config.get("spotInstId") or "")
+    swap_inst_id = str(config.get("swapInstId") or "")
+    targets = build_execution_targets(config)
+    for target in targets:
+        if (
+            str(target.get("spotInstId") or "") == spot_inst_id
+            and str(target.get("swapInstId") or "") == swap_inst_id
+        ):
+            return target
+    return deep_merge(config, {})
+
+
+def resolve_target_balance_multiple(config: dict[str, Any]) -> Decimal:
+    raw = safe_decimal(config.get("targetBalanceMultiple"), "1")
+    if raw < Decimal("1"):
+        return Decimal("1")
+    if raw > Decimal("100"):
+        return Decimal("100")
+    return raw
+
+
+def build_target_balance_snapshot(
+    start_eq: Decimal,
+    current_eq: Decimal,
+    target_multiple: Decimal,
+) -> dict[str, Any]:
+    if start_eq <= 0 or current_eq <= 0 or target_multiple <= Decimal("1"):
+        return {
+            "targetEq": Decimal("0"),
+            "remainingEq": Decimal("0"),
+            "progressPct": Decimal("0"),
+            "currentMultiple": Decimal("1"),
+            "reached": False,
+        }
+    target_eq = start_eq * target_multiple
+    remaining_eq = max(target_eq - current_eq, Decimal("0"))
+    progress_pct = (current_eq / target_eq) * Decimal("100") if target_eq > 0 else Decimal("0")
+    current_multiple = current_eq / start_eq if start_eq > 0 else Decimal("1")
+    return {
+        "targetEq": target_eq,
+        "remainingEq": remaining_eq,
+        "progressPct": progress_pct,
+        "currentMultiple": current_multiple,
+        "reached": current_eq >= target_eq,
+    }
+
+
 def strategy_mode_text(mode: str) -> str:
     normalized = str(mode or "").strip()
     if normalized == "short_only":
@@ -1400,6 +1536,12 @@ def build_market_risk_label(target: dict[str, Any], market_kind: str) -> str:
             f"回补 ≤ {format_decimal(exit_spread, 3)}% · "
             f"资金费 ≥ {format_decimal(min_funding, 3)}%"
         )
+    if str(target.get("strategyPreset") or "") == "dip_swing":
+        return (
+            f"回撤 ≥ {format_decimal(DIP_SWING_PULLBACK_PCT, 1)}% · "
+            f"TP {format_decimal(safe_decimal(target.get('takeProfitPct'), '8'), 1)}% · "
+            f"缓冲 ≥ {format_decimal(DIP_SWING_MIN_LIQ_BUFFER_PCT, 0)}%"
+        )
     if market_kind == "spot":
         budget = safe_decimal(target.get("spotQuoteBudget"), "0")
         cap = safe_decimal(target.get("spotMaxExposure"), "0")
@@ -1410,8 +1552,38 @@ def build_market_risk_label(target: dict[str, Any], market_kind: str) -> str:
     return f"{format_decimal(contracts, 2)} 张 · {format_decimal(leverage, 0)}x · {td_mode}"
 
 
+def apply_target_market_allocation(
+    target: dict[str, Any],
+    market_kind: str,
+    market_state: dict[str, Any],
+) -> dict[str, Any]:
+    patched = copy.deepcopy(market_state or default_market_state())
+    if market_kind == "spot":
+        patched.update(
+            {
+                "riskBudget": decimal_to_str(safe_decimal(target.get("spotQuoteBudget"), "0")),
+                "riskCap": decimal_to_str(safe_decimal(target.get("spotMaxExposure"), "0")),
+                "riskMode": "basis_arb" if str(target.get("strategyPreset") or "") == "basis_arb" else "cash",
+                "riskLabel": build_market_risk_label(target, "spot"),
+            }
+        )
+        return patched
+
+    patched.update(
+        {
+            "riskBudget": decimal_to_str(safe_decimal(target.get("swapContracts"), "0")),
+            "riskCap": decimal_to_str(safe_decimal(target.get("swapLeverage"), "0")),
+            "riskMode": "basis_arb" if str(target.get("strategyPreset") or "") == "basis_arb" else str(target.get("swapTdMode") or "cross"),
+            "riskLabel": build_market_risk_label(target, "swap"),
+        }
+    )
+    return patched
+
+
 def basis_arb_stage_text(stage: str) -> str:
     normalized = str(stage or "").strip().lower()
+    if normalized == "reverse_basis":
+        return "当前负基差，不做这侧套利"
     if normalized == "window_open":
         return "套利窗口打开"
     if normalized == "entry_wait":
@@ -1441,6 +1613,8 @@ def build_watchlist_entry(
     spot_market: dict[str, Any],
     swap_market: dict[str, Any],
 ) -> dict[str, Any]:
+    spot_market = apply_target_market_allocation(target, "spot", spot_market)
+    swap_market = apply_target_market_allocation(target, "swap", swap_market)
     symbol_override = copy.deepcopy(target.get("watchlistOverride") or {})
     override_keys = sorted(symbol_override.keys())
     spot_notional = safe_decimal(spot_market.get("positionNotional"), "0")
@@ -1518,6 +1692,48 @@ def build_watchlist_entry(
     }
 
 
+def reconcile_runtime_state_with_automation(state: dict[str, Any], automation: dict[str, Any]) -> dict[str, Any]:
+    hydrated = copy.deepcopy(state)
+    if not hydrated.get("running") and not hydrated.get("watchlist"):
+        return hydrated
+
+    markets = hydrated.setdefault("markets", {})
+    targets = build_execution_targets(automation)
+    if not targets:
+        return hydrated
+
+    watchlist_entries: list[dict[str, Any]] = []
+    for target in targets:
+        spot_key = f"spot:{target['spotInstId']}"
+        swap_key = f"swap:{target['swapInstId']}"
+        spot_market = apply_target_market_allocation(
+            target,
+            "spot",
+            markets.get(spot_key) or default_market_state(),
+        )
+        swap_market = apply_target_market_allocation(
+            target,
+            "swap",
+            markets.get(swap_key) or default_market_state(),
+        )
+        markets[spot_key] = spot_market
+        markets[swap_key] = swap_market
+        watchlist_entries.append(
+            build_watchlist_entry(
+                str(target.get("watchlistSymbol") or ""),
+                target,
+                spot_market,
+                swap_market,
+            )
+        )
+
+    hydrated["watchlist"] = watchlist_entries
+    if watchlist_entries:
+        markets["spot"] = copy.deepcopy(watchlist_entries[0].get("spot") or default_market_state())
+        markets["swap"] = copy.deepcopy(watchlist_entries[0].get("swap") or default_market_state())
+    return hydrated
+
+
 def summarize_basis_arb_watchlist(entries: list[dict[str, Any]]) -> dict[str, int]:
     counts = {
         "watching": 0,
@@ -1527,12 +1743,15 @@ def summarize_basis_arb_watchlist(entries: list[dict[str, Any]]) -> dict[str, in
         "rollback": 0,
         "brokenPair": 0,
         "blocked": 0,
+        "reverseBasis": 0,
     }
     for entry in entries:
         summary = entry.get("summary") or {}
         stage = str(summary.get("arbStage") or "").strip().lower()
         if stage in {"window_open", "entry_wait"}:
             counts["windowOpen"] += 1
+        elif stage == "reverse_basis":
+            counts["reverseBasis"] += 1
         elif stage == "hedged":
             counts["hedged"] += 1
         elif stage in {"exit_wait", "exiting"}:
@@ -3132,21 +3351,20 @@ def explain_auth_error(message: str, config: dict[str, Any]) -> str:
 
 def validate_automation_config(config: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:
     normalized = deep_merge(default_automation_config(), config)
+    normalized = enforce_only_dip_swing_strategy(normalized)
     watchlist_symbols = normalize_watchlist_symbols(normalized.get("watchlistSymbols"), normalized)
     normalized["watchlistSymbols"] = ",".join(watchlist_symbols)
     watchlist_overrides, overrides_error = parse_watchlist_overrides(normalized.get("watchlistOverrides"))
     if overrides_error:
         return False, overrides_error, normalized
     normalized["watchlistOverrides"] = {
-        symbol: copy.deepcopy(override)
+        symbol: sanitize_only_dip_swing_override(override)
         for symbol, override in watchlist_overrides.items()
         if symbol in watchlist_symbols
     }
     primary_symbol = watchlist_symbols[0]
     normalized["spotInstId"] = f"{primary_symbol}-USDT"
     normalized["swapInstId"] = f"{primary_symbol}-USDT-SWAP"
-    if normalized.get("strategyPreset") not in ("dual_engine", "btc_lotto", "basis_arb"):
-        return False, "策略模式不支持", normalized
     if len(watchlist_symbols) > 8:
         return False, "多币 watchlist 最多支持 8 个标的", normalized
     base_error = validate_single_automation_target(normalized)
@@ -3161,11 +3379,7 @@ def validate_automation_config(config: dict[str, Any]) -> tuple[bool, str, dict[
 
 
 def strategy_label(preset: str) -> str:
-    return {
-        "dual_engine": "标准双引擎",
-        "btc_lotto": "BTC 乐透机",
-        "basis_arb": "高频套利",
-    }.get(preset, "标准双引擎")
+    return "波段"
 
 
 def strategy_symbol_label(config: dict[str, Any]) -> str:
@@ -3180,8 +3394,8 @@ def strategy_symbol_label(config: dict[str, Any]) -> str:
 
 
 def strategy_scope_label(config: dict[str, Any]) -> str:
-    if str(config.get("strategyPreset") or "") == "basis_arb":
-        return "现货 + 永续对冲"
+    if str(config.get("strategyPreset") or "") == "dip_swing":
+        return "逐仓永续波段"
     scopes: list[str] = []
     if config.get("spotEnabled"):
         scopes.append("现货")
@@ -3191,8 +3405,8 @@ def strategy_scope_label(config: dict[str, Any]) -> str:
 
 
 def strategy_mode_label(config: dict[str, Any]) -> str:
-    if str(config.get("strategyPreset") or "") == "basis_arb":
-        return "基差回归套利"
+    if str(config.get("strategyPreset") or "") == "dip_swing":
+        return "趋势转强 / 回踩接多"
     if not config.get("swapEnabled"):
         return "现货执行"
     mode = str(config.get("swapStrategyMode", "trend_follow"))
@@ -3204,8 +3418,8 @@ def strategy_mode_label(config: dict[str, Any]) -> str:
 
 
 def strategy_mode_badge(config: dict[str, Any]) -> str:
-    if str(config.get("strategyPreset") or "") == "basis_arb":
-        return "套利"
+    if str(config.get("strategyPreset") or "") == "dip_swing":
+        return "波段"
     if not config.get("swapEnabled"):
         return "现货"
     mode = str(config.get("swapStrategyMode", "trend_follow"))
@@ -3219,13 +3433,7 @@ def strategy_mode_badge(config: dict[str, Any]) -> str:
 def strategy_short_name(config: dict[str, Any], rank: int | None = None) -> str:
     prefix = f"S{rank:02d} " if rank else ""
     symbol = strategy_symbol_label(config)
-    preset_value = str(config.get("strategyPreset", "") or "")
-    if preset_value == "btc_lotto":
-        preset = "乐透"
-    elif preset_value == "basis_arb":
-        preset = "套利"
-    else:
-        preset = "双引擎"
+    preset = "波段"
     leverage = f"{int(safe_decimal(config.get('swapLeverage'), '1'))}x" if config.get("swapEnabled") else ""
     tail = " ".join(part for part in (strategy_mode_badge(config), leverage) if part)
     return f"{prefix}{symbol} {preset} {config.get('bar', '5m')} EMA{config['fastEma']}/{config['slowEma']}{(' ' + tail) if tail else ''}"
@@ -3233,6 +3441,8 @@ def strategy_short_name(config: dict[str, Any], rank: int | None = None) -> str:
 
 def strategy_detail_line(config: dict[str, Any], origin_label: str = "") -> str:
     if str(config.get("strategyPreset") or "") == "basis_arb":
+        selected_target = resolve_selected_execution_target(config)
+        watchlist_count = len(normalize_watchlist_symbols(config.get("watchlistSymbols"), config))
         parts = [
             "现货买入 + 永续对冲",
             f"入场价差 ≥ {config.get('arbEntrySpreadPct', '0.18')}%",
@@ -3240,6 +3450,26 @@ def strategy_detail_line(config: dict[str, Any], origin_label: str = "") -> str:
             f"最低资金费 {config.get('arbMinFundingRatePct', '0.005')}%",
             f"最长持有 {config.get('arbMaxHoldMinutes', 180)} 分钟",
         ]
+        if watchlist_count > 1:
+            parts.append(
+                f"{watchlist_count} 币并行 · 当前币约 {decimal_to_str(safe_decimal(selected_target.get('spotQuoteBudget'), '0'))}U / "
+                f"{decimal_to_str(safe_decimal(selected_target.get('swapContracts'), '0'))} 张"
+            )
+        if origin_label:
+            parts.append(origin_label)
+        return " · ".join(part for part in parts if part)
+    if str(config.get("strategyPreset") or "") == "dip_swing":
+        target_multiple = resolve_target_balance_multiple(config)
+        parts = [
+            "趋势转强 + 回踩接多",
+            f"只做多 · {config.get('swapTdMode', 'isolated')} {config.get('swapLeverage', '2')}x",
+            f"目标止盈 {config.get('takeProfitPct', '8')}%",
+            f"止损 {config.get('stopLossPct', '2.5')}%",
+            f"回撤阈值 {format_decimal(DIP_SWING_PULLBACK_PCT, 1)}%",
+            f"强平缓冲 ≥ {format_decimal(DIP_SWING_MIN_LIQ_BUFFER_PCT, 0)}%",
+        ]
+        if target_multiple > Decimal("1"):
+            parts.append(f"目标余额 {format_decimal(target_multiple, 0)}x")
         if origin_label:
             parts.append(origin_label)
         return " · ".join(part for part in parts if part)
@@ -3328,6 +3558,71 @@ def build_signal(candles: list[dict[str, Any]], fast: int, slow: int) -> dict[st
         "slowValue": decimal_to_str(curr_slow),
         "lastClose": decimal_to_str(closes[-1]),
     }
+
+
+def build_pullback_signal(
+    candles: list[dict[str, Any]],
+    fast: int,
+    slow: int,
+    *,
+    pullback_threshold_pct: Decimal = DIP_SWING_PULLBACK_PCT,
+    rebound_threshold_pct: Decimal = DIP_SWING_REBOUND_PCT,
+) -> dict[str, Any]:
+    closes = [row["close"] for row in candles]
+    if len(closes) < slow + 2:
+        raise OkxApiError("K 线样本不足，无法计算波段信号")
+    fast_values = ema(closes, fast)
+    slow_values = ema(closes, slow)
+    prev_fast = fast_values[-2]
+    prev_slow = slow_values[-2]
+    curr_fast = fast_values[-1]
+    curr_slow = slow_values[-1]
+    last_close = closes[-1]
+    prev_close = closes[-2]
+    sample = candles[-max(slow, 12):]
+    recent_high = max((row["high"] for row in sample), default=last_close)
+    recent_low = min((row["low"] for row in sample), default=last_close)
+    pullback_pct = pct_gap(recent_high, last_close)
+    rebound_pct = pct_gap(last_close, recent_low)
+    if curr_fast > curr_slow:
+        trend = "up"
+    elif curr_fast < curr_slow:
+        trend = "down"
+    else:
+        trend = "flat"
+    bull_cross = prev_fast <= prev_slow and curr_fast > curr_slow
+    bounce_ready = last_close >= prev_close and rebound_pct >= rebound_threshold_pct
+    if trend == "up" and bull_cross:
+        signal = "bull_cross_buy"
+    elif trend == "up" and pullback_pct >= pullback_threshold_pct and bounce_ready:
+        signal = "pullback_buy"
+    elif trend == "down":
+        signal = "trend_break"
+    else:
+        signal = "hold"
+    return {
+        "signal": signal,
+        "trend": trend,
+        "fastValue": decimal_to_str(curr_fast),
+        "slowValue": decimal_to_str(curr_slow),
+        "lastClose": decimal_to_str(last_close),
+        "recentHigh": decimal_to_str(recent_high),
+        "recentLow": decimal_to_str(recent_low),
+        "pullbackPct": decimal_to_str(pullback_pct),
+        "reboundPct": decimal_to_str(rebound_pct),
+        "bullCross": bull_cross,
+    }
+
+
+def liquidation_buffer_pct(last_price: Decimal, liq_price: Decimal, position_side: str) -> Decimal:
+    if liq_price <= 0 or last_price <= 0:
+        return Decimal("0")
+    side = str(position_side or "").strip().lower()
+    if side == "long":
+        return ((last_price - liq_price) / last_price) * Decimal("100")
+    if side == "short":
+        return ((liq_price - last_price) / last_price) * Decimal("100")
+    return Decimal("0")
 
 
 def normalize_research_options(payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -4855,34 +5150,304 @@ def pct_gap(numerator: Decimal, denominator: Decimal) -> Decimal:
     return ((numerator - denominator) / denominator) * Decimal("100")
 
 
+def build_basis_arb_scan_target(config: dict[str, Any], symbol: str) -> dict[str, Any]:
+    target = deep_merge({}, config)
+    target["watchlistSymbol"] = symbol
+    target["spotInstId"] = f"{symbol}-USDT"
+    target["swapInstId"] = f"{symbol}-USDT-SWAP"
+    return target
+
+
+def evaluate_basis_arb_target_snapshot(
+    target: dict[str, Any],
+    spot_ticker: dict[str, Any],
+    swap_ticker: dict[str, Any],
+    funding_row: dict[str, Any],
+) -> dict[str, Any]:
+    spot_bid = ticker_bid_price(spot_ticker)
+    spot_ask = ticker_ask_price(spot_ticker)
+    swap_bid = ticker_bid_price(swap_ticker)
+    swap_ask = ticker_ask_price(swap_ticker)
+    spot_last = safe_decimal(spot_ticker.get("last"), "0")
+    swap_last = safe_decimal(swap_ticker.get("last"), "0")
+    funding_rate_pct = safe_decimal(funding_row.get("fundingRate"), "0") * Decimal("100")
+    entry_threshold = safe_decimal(target.get("arbEntrySpreadPct"), "0")
+    exit_threshold = safe_decimal(target.get("arbExitSpreadPct"), "0")
+    min_funding = safe_decimal(target.get("arbMinFundingRatePct"), "0")
+    require_funding_alignment = bool(target.get("arbRequireFundingAlignment"))
+    funding_aligned = funding_rate_pct >= min_funding if require_funding_alignment else True
+    entry_spread_pct = pct_gap(swap_bid, spot_ask)
+    close_spread_pct = pct_gap(swap_ask, spot_bid)
+    reverse_basis = entry_spread_pct <= 0
+    funding_blocked = (
+        entry_spread_pct > 0
+        and entry_spread_pct >= entry_threshold
+        and require_funding_alignment
+        and not funding_aligned
+    )
+    return {
+        "symbol": str(target.get("watchlistSymbol") or target.get("spotInstId") or "").split("-")[0],
+        "target": target,
+        "spotTicker": spot_ticker,
+        "swapTicker": swap_ticker,
+        "spotLast": spot_last,
+        "swapLast": swap_last,
+        "fundingRatePct": funding_rate_pct,
+        "entrySpreadPct": entry_spread_pct,
+        "closeSpreadPct": close_spread_pct,
+        "entryThresholdPct": entry_threshold,
+        "exitThresholdPct": exit_threshold,
+        "fundingThresholdPct": min_funding,
+        "requireFundingAlignment": require_funding_alignment,
+        "fundingAligned": funding_aligned,
+        "reverseBasis": reverse_basis,
+        "fundingBlocked": funding_blocked,
+        "candidate": (not reverse_basis) and entry_spread_pct >= entry_threshold and funding_aligned,
+    }
+
+
+def fetch_basis_arb_target_snapshot(client: OkxClient, target: dict[str, Any]) -> dict[str, Any]:
+    spot_ticker = extract_first_row(client.get_ticker(target["spotInstId"]))
+    swap_ticker = extract_first_row(client.get_ticker(target["swapInstId"]))
+    funding_row = extract_first_row(client.get_funding_rate(target["swapInstId"]))
+    return evaluate_basis_arb_target_snapshot(target, spot_ticker, swap_ticker, funding_row)
+
+
+def list_basis_arb_market_symbols(
+    client: OkxClient,
+    config: dict[str, Any],
+    *,
+    limit: int = BASIS_ARB_SCAN_SYMBOL_LIMIT,
+) -> list[str]:
+    watchlist_symbols = normalize_watchlist_symbols(config.get("watchlistSymbols"), config)
+    now = time.time()
+    with BASIS_ARB_SCAN_LOCK:
+        cached_symbols = list(BASIS_ARB_MARKET_UNIVERSE_CACHE.get("symbols") or [])
+        cached_ts = float(BASIS_ARB_MARKET_UNIVERSE_CACHE.get("ts") or 0.0)
+    shared_symbols = cached_symbols
+    if not shared_symbols or now - cached_ts >= 900:
+        spot_rows = (client.get_public_instruments("SPOT").get("data") or [])
+        swap_rows = (client.get_public_instruments("SWAP").get("data") or [])
+
+        def collect_spot_symbols(rows: list[dict[str, Any]]) -> set[str]:
+            symbols: set[str] = set()
+            for row in rows:
+                inst_id = str(row.get("instId") or "")
+                if not inst_id.endswith("-USDT"):
+                    continue
+                state = str(row.get("state") or "live").strip().lower()
+                quote_ccy = str(row.get("quoteCcy") or "").strip().upper()
+                if state not in {"", "live"} or quote_ccy not in {"", "USDT"}:
+                    continue
+                symbol = normalize_symbol_token(inst_id)
+                if symbol:
+                    symbols.add(symbol)
+            return symbols
+
+        def collect_swap_symbols(rows: list[dict[str, Any]]) -> set[str]:
+            symbols: set[str] = set()
+            for row in rows:
+                inst_id = str(row.get("instId") or "")
+                if not inst_id.endswith("-USDT-SWAP"):
+                    continue
+                state = str(row.get("state") or "live").strip().lower()
+                settle_ccy = str(row.get("settleCcy") or "").strip().upper()
+                if state not in {"", "live"} or settle_ccy not in {"", "USDT"}:
+                    continue
+                symbol = normalize_symbol_token(inst_id)
+                if symbol:
+                    symbols.add(symbol)
+            return symbols
+
+        shared_symbols = sorted(collect_spot_symbols(spot_rows) & collect_swap_symbols(swap_rows))
+        with BASIS_ARB_SCAN_LOCK:
+            BASIS_ARB_MARKET_UNIVERSE_CACHE["ts"] = now
+            BASIS_ARB_MARKET_UNIVERSE_CACHE["symbols"] = list(shared_symbols)
+
+    ordered: list[str] = []
+    for symbol in watchlist_symbols:
+        if symbol in shared_symbols and symbol not in ordered:
+            ordered.append(symbol)
+    for symbol in BASIS_ARB_PREFERRED_SYMBOLS:
+        if symbol in shared_symbols and symbol not in ordered:
+            ordered.append(symbol)
+    for symbol in shared_symbols:
+        if symbol not in ordered:
+            ordered.append(symbol)
+        if len(ordered) >= max(limit, len(watchlist_symbols)):
+            break
+    return ordered[: max(limit, len(watchlist_symbols))]
+
+
+def scan_basis_arb_market_snapshots(
+    client: OkxClient,
+    config: dict[str, Any],
+    symbols: list[str],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    normalized_symbols = [normalize_symbol_token(symbol) for symbol in symbols if normalize_symbol_token(symbol)]
+    if not normalized_symbols:
+        return [], []
+    cache_key = json.dumps(
+        {
+            "symbols": normalized_symbols,
+            "entry": decimal_to_str(safe_decimal(config.get("arbEntrySpreadPct"), "0")),
+            "exit": decimal_to_str(safe_decimal(config.get("arbExitSpreadPct"), "0")),
+            "funding": decimal_to_str(safe_decimal(config.get("arbMinFundingRatePct"), "0")),
+            "requireFundingAlignment": bool(config.get("arbRequireFundingAlignment")),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    now = time.time()
+    with BASIS_ARB_SCAN_LOCK:
+        cached_key = str(BASIS_ARB_MARKET_SCAN_CACHE.get("key") or "")
+        cached_ts = float(BASIS_ARB_MARKET_SCAN_CACHE.get("ts") or 0.0)
+        if cached_key == cache_key and now - cached_ts < 20:
+            return copy.deepcopy(BASIS_ARB_MARKET_SCAN_CACHE.get("rows") or []), []
+
+    targets = [build_basis_arb_scan_target(config, symbol) for symbol in normalized_symbols]
+    rows: list[dict[str, Any]] = []
+    errors: list[str] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(len(targets), 8))) as executor:
+        future_map = {executor.submit(fetch_basis_arb_target_snapshot, client, target): target for target in targets}
+        for future in concurrent.futures.as_completed(future_map):
+            target = future_map[future]
+            try:
+                rows.append(future.result())
+            except Exception as exc:
+                errors.append(f"{target.get('watchlistSymbol') or target.get('spotInstId')}: {exc}")
+    if errors and not rows:
+        raise OkxApiError(f"扩展市场扫描失败: {'; '.join(errors)}")
+    with BASIS_ARB_SCAN_LOCK:
+        BASIS_ARB_MARKET_SCAN_CACHE["ts"] = now
+        BASIS_ARB_MARKET_SCAN_CACHE["key"] = cache_key
+        BASIS_ARB_MARKET_SCAN_CACHE["rows"] = copy.deepcopy(rows)
+    return rows, errors
+
+
 def build_basis_arb_analysis(
     automation: dict[str, Any],
     client: OkxClient,
 ) -> dict[str, Any]:
-    jobs: dict[str, Any] = {
-        "spotTicker": lambda: extract_first_row(client.get_ticker(automation["spotInstId"])),
-        "swapTicker": lambda: extract_first_row(client.get_ticker(automation["swapInstId"])),
-        "markPrice": lambda: extract_first_row(client.get_mark_price("SWAP", automation["swapInstId"])),
-        "fundingRate": lambda: extract_first_row(client.get_funding_rate(automation["swapInstId"])),
-        "openInterest": lambda: extract_first_row(client.get_open_interest("SWAP", automation["swapInstId"])),
+    targets = build_execution_targets(automation)
+    watchlist_count = len(targets)
+
+    target_snapshots: list[dict[str, Any]] = []
+    errors: list[str] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(len(targets), 8))) as executor:
+        future_map = {executor.submit(fetch_basis_arb_target_snapshot, client, target): target for target in targets}
+        for future in concurrent.futures.as_completed(future_map):
+            target = future_map[future]
+            try:
+                target_snapshots.append(future.result())
+            except Exception as exc:
+                errors.append(f"{target.get('watchlistSymbol') or target.get('spotInstId')}: {exc}")
+
+    if errors:
+        raise OkxApiError(f"联网分析失败: {'; '.join(errors)}")
+
+    candidate_snapshots = [row for row in target_snapshots if row.get("candidate")]
+    positive_snapshots = [row for row in target_snapshots if not row.get("reverseBasis")]
+    reverse_basis_count = sum(1 for row in target_snapshots if row.get("reverseBasis"))
+    funding_blocked_count = sum(1 for row in target_snapshots if row.get("fundingBlocked"))
+    watchlist_symbols = [str(row.get("symbol") or "") for row in target_snapshots if row.get("symbol")]
+
+    market_scan_symbols = list_basis_arb_market_symbols(client, automation)
+    extra_scan_symbols = [symbol for symbol in market_scan_symbols if symbol not in set(watchlist_symbols)]
+    extra_market_snapshots, market_scan_errors = scan_basis_arb_market_snapshots(client, automation, extra_scan_symbols)
+    market_snapshots = target_snapshots + extra_market_snapshots
+    market_candidate_snapshots = [row for row in market_snapshots if row.get("candidate")]
+    market_positive_snapshots = [row for row in market_snapshots if not row.get("reverseBasis")]
+    market_reverse_basis_count = sum(1 for row in market_snapshots if row.get("reverseBasis"))
+    market_funding_blocked_count = sum(1 for row in market_snapshots if row.get("fundingBlocked"))
+    market_candidate_count = len(market_candidate_snapshots)
+    market_top_candidates = [
+        {
+            "symbol": str(row.get("symbol") or ""),
+            "entrySpreadPct": compact_metric(safe_decimal(row.get("entrySpreadPct"), "0"), "0.001"),
+            "fundingRatePct": compact_metric(safe_decimal(row.get("fundingRatePct"), "0"), "0.001"),
+        }
+        for row in sorted(
+            market_candidate_snapshots,
+            key=lambda row: (
+                safe_decimal(row.get("entrySpreadPct"), "0"),
+                safe_decimal(row.get("fundingRatePct"), "0"),
+            ),
+            reverse=True,
+        )[:3]
+    ]
+    outside_watchlist_candidates = [
+        item for item in market_top_candidates if str(item.get("symbol") or "") not in set(watchlist_symbols)
+    ]
+
+    if candidate_snapshots:
+        selected_snapshot = max(
+            candidate_snapshots,
+            key=lambda row: (safe_decimal(row.get("entrySpreadPct"), "0"), safe_decimal(row.get("fundingRatePct"), "0")),
+        )
+    elif positive_snapshots:
+        selected_snapshot = max(
+            positive_snapshots,
+            key=lambda row: (safe_decimal(row.get("entrySpreadPct"), "0"), safe_decimal(row.get("fundingRatePct"), "0")),
+        )
+    elif target_snapshots:
+        selected_snapshot = max(
+            target_snapshots,
+            key=lambda row: safe_decimal(row.get("entrySpreadPct"), "-999"),
+        )
+    else:
+        selected_snapshot = {
+            "symbol": strategy_symbol_label(automation),
+            "target": resolve_selected_execution_target(automation),
+            "spotTicker": {},
+            "swapTicker": {},
+            "spotLast": Decimal("0"),
+            "swapLast": Decimal("0"),
+            "fundingRatePct": Decimal("0"),
+            "entrySpreadPct": Decimal("0"),
+            "closeSpreadPct": Decimal("0"),
+            "entryThresholdPct": safe_decimal(automation.get("arbEntrySpreadPct"), "0"),
+            "exitThresholdPct": safe_decimal(automation.get("arbExitSpreadPct"), "0"),
+            "fundingThresholdPct": safe_decimal(automation.get("arbMinFundingRatePct"), "0"),
+            "requireFundingAlignment": bool(automation.get("arbRequireFundingAlignment")),
+            "fundingAligned": True,
+            "reverseBasis": False,
+            "fundingBlocked": False,
+            "candidate": False,
+        }
+
+    selected_target = copy.deepcopy(selected_snapshot.get("target") or resolve_selected_execution_target(automation))
+    selected_symbol = str(selected_snapshot.get("symbol") or strategy_symbol_label(automation))
+    selected_config = deep_merge(
+        deep_merge({}, automation),
+        {
+            "spotInstId": selected_target.get("spotInstId"),
+            "swapInstId": selected_target.get("swapInstId"),
+        },
+    )
+    allocated_spot_budget = safe_decimal(selected_target.get("spotQuoteBudget"), "0")
+    allocated_swap_contracts = safe_decimal(selected_target.get("swapContracts"), "0")
+
+    detail_jobs: dict[str, Any] = {
+        "markPrice": lambda: extract_first_row(client.get_mark_price("SWAP", selected_target["swapInstId"])),
+        "openInterest": lambda: extract_first_row(client.get_open_interest("SWAP", selected_target["swapInstId"])),
         "spotCandles": lambda: get_closed_candles(
             client,
-            automation["spotInstId"],
-            automation["bar"],
-            max(int(automation.get("slowEma", 21)) + 20, 60),
+            selected_target["spotInstId"],
+            selected_target["bar"],
+            max(int(selected_target.get("slowEma", 21)) + 20, 60),
         ),
         "swapCandles": lambda: get_closed_candles(
             client,
-            automation["swapInstId"],
-            automation["bar"],
-            max(int(automation.get("slowEma", 21)) + 20, 60),
+            selected_target["swapInstId"],
+            selected_target["bar"],
+            max(int(selected_target.get("slowEma", 21)) + 20, 60),
         ),
     }
 
     fetched: dict[str, Any] = {}
-    errors: list[str] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs)) as executor:
-        future_map = {executor.submit(fn): key for key, fn in jobs.items()}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(detail_jobs)) as executor:
+        future_map = {executor.submit(fn): key for key, fn in detail_jobs.items()}
         for future in concurrent.futures.as_completed(future_map):
             key = future_map[future]
             try:
@@ -4893,50 +5458,90 @@ def build_basis_arb_analysis(
     if errors:
         raise OkxApiError(f"联网分析失败: {'; '.join(errors)}")
 
-    spot_ticker = fetched["spotTicker"]
-    swap_ticker = fetched["swapTicker"]
+    spot_ticker = selected_snapshot.get("spotTicker") or {}
+    swap_ticker = selected_snapshot.get("swapTicker") or {}
     mark_price = safe_decimal(fetched["markPrice"].get("markPx"), "0")
-    funding_rate_pct = safe_decimal(fetched["fundingRate"].get("fundingRate"), "0") * Decimal("100")
+    funding_rate_pct = safe_decimal(selected_snapshot.get("fundingRatePct"), "0")
     spot_bid = ticker_bid_price(spot_ticker)
     spot_ask = ticker_ask_price(spot_ticker)
     swap_bid = ticker_bid_price(swap_ticker)
     swap_ask = ticker_ask_price(swap_ticker)
-    spot_last = safe_decimal(spot_ticker.get("last"), "0")
-    swap_last = safe_decimal(swap_ticker.get("last"), "0")
-    entry_spread_pct = pct_gap(swap_bid, spot_ask)
-    close_spread_pct = pct_gap(swap_ask, spot_bid)
+    spot_last = safe_decimal(selected_snapshot.get("spotLast"), "0")
+    swap_last = safe_decimal(selected_snapshot.get("swapLast"), "0")
+    entry_spread_pct = safe_decimal(selected_snapshot.get("entrySpreadPct"), "0")
+    close_spread_pct = safe_decimal(selected_snapshot.get("closeSpreadPct"), "0")
+    candidate_count = len(candidate_snapshots)
     mid_spread_pct = pct_gap(swap_last, spot_last)
     basis_pct = pct_gap(swap_last, mark_price)
     volatility_pct = max(recent_range_pct(fetched["spotCandles"]), recent_range_pct(fetched["swapCandles"]))
-    entry_threshold = safe_decimal(automation.get("arbEntrySpreadPct"), "0")
-    exit_threshold = safe_decimal(automation.get("arbExitSpreadPct"), "0")
-    min_funding = safe_decimal(automation.get("arbMinFundingRatePct"), "0")
-    require_funding_alignment = bool(automation.get("arbRequireFundingAlignment"))
-    funding_aligned = funding_rate_pct >= min_funding if require_funding_alignment else True
+    entry_threshold = safe_decimal(selected_snapshot.get("entryThresholdPct"), "0")
+    exit_threshold = safe_decimal(selected_snapshot.get("exitThresholdPct"), "0")
+    min_funding = safe_decimal(selected_snapshot.get("fundingThresholdPct"), "0")
+    require_funding_alignment = bool(selected_snapshot.get("requireFundingAlignment"))
+    funding_aligned = bool(selected_snapshot.get("fundingAligned"))
 
     blockers: list[str] = []
     warnings: list[str] = []
-    if entry_spread_pct <= 0:
-        warnings.append("永续盘口未形成可执行溢价")
+    reverse_basis = bool(selected_snapshot.get("reverseBasis"))
+    if reverse_basis:
+        warnings.append(f"当前有 {reverse_basis_count} 币是负基差，这版只做现货多 / 永续空，不做反向套利")
     if require_funding_alignment and not funding_aligned:
         blockers.append("当前资金费不足以支撑现货多 / 永续空套利")
     if volatility_pct >= Decimal("4.5"):
         warnings.append("最近波动偏大，套利腿可能被趋势拉扯")
     if basis_pct <= Decimal("-0.10"):
         warnings.append("永续最新价低于标记价，套利窗口不稳定")
+    if funding_blocked_count:
+        warnings.append(f"当前有 {funding_blocked_count} 币资金费未对齐")
+    if watchlist_count > 1:
+        warnings.append(
+            f"当前 {watchlist_count} 币并行，当前优先币 {selected_symbol} 分到约 {decimal_to_str(allocated_spot_budget)}U 现货预算 / "
+            f"{decimal_to_str(allocated_swap_contracts)} 张永续"
+        )
+        if allocated_swap_contracts < Decimal("1"):
+            warnings.append(
+                f"当前币永续只分到 {decimal_to_str(allocated_swap_contracts)} 张，触发时可能因最小张数或步长被挡住"
+            )
+    if market_candidate_count == 0:
+        warnings.append(f"扩展市场已扫 {len(market_snapshots)} 币，当前也没有正基差候选")
+    elif outside_watchlist_candidates:
+        warnings.append(
+            "watchlist 暂时没窗口，但扩展市场有候选: "
+            + " / ".join(
+                f"{item['symbol']} {item['entrySpreadPct']}% · 资金费 {item['fundingRatePct']}%"
+                for item in outside_watchlist_candidates
+            )
+        )
+    elif market_candidate_count > candidate_count:
+        warnings.append(f"扩展市场共发现 {market_candidate_count} 币可做，watchlist 当前命中 {candidate_count} 币")
+    if market_scan_errors:
+        skipped_symbols = [str(item).split(":", 1)[0] for item in market_scan_errors[:3]]
+        warnings.append(
+            f"扩展扫描跳过 {len(market_scan_errors)} 币"
+            + (f": {', '.join(skipped_symbols)}" if skipped_symbols else "")
+        )
 
-    allow_new_entries = not blockers and entry_spread_pct >= entry_threshold
+    allow_new_entries = candidate_count > 0 and not blockers
     if allow_new_entries:
         decision = "execute"
-        decision_label = "套利窗口打开"
+        decision_label = f"可做 {candidate_count} 币"
+    elif market_candidate_count > 0:
+        decision = "observe"
+        decision_label = f"watchlist 无窗口，市场有 {market_candidate_count} 币"
     elif blockers:
         decision = "skip"
         decision_label = "暂停套利"
+    elif funding_blocked_count > 0 and candidate_count == 0 and reverse_basis_count < watchlist_count:
+        decision = "observe"
+        decision_label = "资金费未对齐"
+    elif reverse_basis:
+        decision = "observe"
+        decision_label = "当前负基差，不做这侧套利"
     else:
         decision = "observe"
         decision_label = "等待价差扩大"
 
-    symbol = strategy_symbol_label(automation)
+    symbol = selected_symbol if watchlist_count <= 1 else f"{selected_symbol} +{watchlist_count - 1}"
     summary_bits = [
         f"{symbol} 高频套利",
         f"入场 {decimal_to_str(entry_spread_pct.quantize(Decimal('0.001')))}%",
@@ -4944,11 +5549,22 @@ def build_basis_arb_analysis(
         f"资金费 {decimal_to_str(funding_rate_pct.quantize(Decimal('0.001')))}%",
     ]
     if allow_new_entries:
-        summary_bits.append("允许开现货多 + 永续空对冲腿")
+        summary_bits.append(
+            f"watchlist 可做 {candidate_count} / 市场候选 {market_candidate_count} / 反向 {reverse_basis_count}"
+        )
+    elif market_candidate_count > 0:
+        summary_bits.append(
+            "watchlist 暂时没窗口，但扩展市场有候选: "
+            + " / ".join(item["symbol"] for item in outside_watchlist_candidates or market_top_candidates)
+        )
     elif blockers:
         summary_bits.append(blockers[0])
+    elif funding_blocked_count > 0 and candidate_count == 0 and reverse_basis_count < watchlist_count:
+        summary_bits.append("正基差已出现，但资金费还不够整齐")
+    elif reverse_basis:
+        summary_bits.append("当前是负基差，这版先不做反向套利")
     else:
-        summary_bits.append("继续等待入场价差扩大")
+        summary_bits.append("继续等待正基差扩大")
 
     return {
         "statusText": "已联网分析",
@@ -4956,7 +5572,7 @@ def build_basis_arb_analysis(
         "decisionLabel": decision_label,
         "summary": " · ".join(summary_bits),
         "selectedStrategyName": f"{symbol} 高频套利",
-        "selectedStrategyDetail": strategy_detail_line(automation),
+        "selectedStrategyDetail": strategy_detail_line(selected_config),
         "selectedReturnPct": "",
         "selectedDrawdownPct": "",
         "selectedWinRatePct": "",
@@ -4977,6 +5593,18 @@ def build_basis_arb_analysis(
         "exitSpreadThresholdPct": compact_metric(exit_threshold, "0.001"),
         "fundingThresholdPct": compact_metric(min_funding, "0.001"),
         "fundingAligned": funding_aligned,
+        "watchlistCount": watchlist_count,
+        "candidateCount": candidate_count,
+        "reverseBasisCount": reverse_basis_count,
+        "fundingBlockedCount": funding_blocked_count,
+        "marketScanCount": len(market_snapshots),
+        "marketCandidateCount": market_candidate_count,
+        "marketReverseBasisCount": market_reverse_basis_count,
+        "marketFundingBlockedCount": market_funding_blocked_count,
+        "marketTopCandidates": market_top_candidates,
+        "selectedWatchlistSymbol": selected_symbol,
+        "allocatedSpotBudget": decimal_to_str(allocated_spot_budget),
+        "allocatedSwapContracts": decimal_to_str(allocated_swap_contracts),
         "openInterest": str(
             fetched["openInterest"].get("oiUsd")
             or fetched["openInterest"].get("oi")
@@ -4985,24 +5613,209 @@ def build_basis_arb_analysis(
         ),
         "warnings": warnings,
         "blockers": blockers,
-        "selectedConfig": deep_merge({}, automation),
+        "selectedConfig": selected_config,
         "research": {
             "running": False,
             "statusText": "套利分析模式",
             "mode": "basis_arb",
             "lastRunAt": now_local_iso(),
-            "historyLimit": max(int(automation.get("slowEma", 21)) + 20, 60),
+            "historyLimit": max(int(selected_target.get("slowEma", 21)) + 20, 60),
             "sampleCount": len(fetched["spotCandles"]),
             "summary": {
                 "entrySpreadPct": compact_metric(entry_spread_pct, "0.001"),
                 "closeSpreadPct": compact_metric(close_spread_pct, "0.001"),
                 "fundingRatePct": compact_metric(funding_rate_pct, "0.001"),
             },
-            "bestConfig": deep_merge({}, automation),
+            "bestConfig": deep_merge({}, selected_config),
             "leaderboard": [],
             "generationSummaries": [],
             "pipeline": {
                 "mode": "basis_arb",
+                "status": decision,
+            },
+            "markets": {},
+            "notes": [],
+            "equityCurve": [],
+        },
+    }
+
+
+def build_dip_swing_analysis(
+    automation: dict[str, Any],
+    client: OkxClient,
+) -> dict[str, Any]:
+    selected_target = resolve_selected_execution_target(automation)
+    inst_id = str(selected_target.get("swapInstId") or automation.get("swapInstId") or "")
+    if not inst_id:
+        raise OkxApiError("波段策略缺少永续交易对")
+    jobs: dict[str, Any] = {
+        "swapTicker": lambda: extract_first_row(client.get_ticker(inst_id)),
+        "markPrice": lambda: extract_first_row(client.get_mark_price("SWAP", inst_id)),
+        "fundingRate": lambda: extract_first_row(client.get_funding_rate(inst_id)),
+        "openInterest": lambda: extract_first_row(client.get_open_interest("SWAP", inst_id)),
+        "swapCandles": lambda: get_closed_candles(
+            client,
+            inst_id,
+            selected_target["bar"],
+            max(int(selected_target.get("slowEma", 21)) + 30, 80),
+        ),
+        "positions": lambda: client.get_positions(inst_id).get("data", []) if getattr(client, "api_key", "") else [],
+    }
+    fetched: dict[str, Any] = {}
+    errors: list[str] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs)) as executor:
+        future_map = {executor.submit(fn): key for key, fn in jobs.items()}
+        for future in concurrent.futures.as_completed(future_map):
+            key = future_map[future]
+            try:
+                fetched[key] = future.result()
+            except Exception as exc:
+                errors.append(f"{key}: {exc}")
+    if errors:
+        raise OkxApiError(f"联网分析失败: {'; '.join(errors)}")
+
+    candles = fetched["swapCandles"]
+    signal = build_pullback_signal(candles, int(selected_target["fastEma"]), int(selected_target["slowEma"]))
+    last_price = safe_decimal(signal.get("lastClose"), "0")
+    mark_price = safe_decimal(fetched["markPrice"].get("markPx"), "0")
+    funding_rate_pct = safe_decimal(fetched["fundingRate"].get("fundingRate"), "0") * Decimal("100")
+    basis_pct = pct_gap(last_price, mark_price)
+    pullback_pct = safe_decimal(signal.get("pullbackPct"), "0")
+    rebound_pct = safe_decimal(signal.get("reboundPct"), "0")
+    leverage = safe_decimal(selected_target.get("swapLeverage"), "1")
+    target_multiple = resolve_target_balance_multiple(selected_target)
+    positions = fetched["positions"] or []
+    open_position = next((row for row in positions if safe_decimal(row.get("pos"), "0") != 0), {})
+    pos_value = safe_decimal(open_position.get("pos"), "0")
+    position_side = "flat"
+    if pos_value > 0:
+        position_side = "long"
+    elif pos_value < 0:
+        position_side = "short"
+    liq_price = safe_decimal(open_position.get("liqPx"), "0")
+    liq_buffer = liquidation_buffer_pct(last_price, liq_price, position_side)
+    open_interest = (
+        fetched["openInterest"].get("oiUsd")
+        or fetched["openInterest"].get("oi")
+        or fetched["openInterest"].get("oiCcy")
+        or "--"
+    )
+
+    blockers: list[str] = []
+    warnings: list[str] = []
+    if str(selected_target.get("swapTdMode") or "") != "isolated":
+        blockers.append("波段策略要求逐仓，避免把整账户拖进强平")
+    if leverage > DIP_SWING_MAX_LEVERAGE:
+        blockers.append(f"当前杠杆 {decimal_to_str(leverage)}x 过高，已限制到 ≤ {decimal_to_str(DIP_SWING_MAX_LEVERAGE)}x")
+    if position_side == "long" and liq_buffer > 0 and liq_buffer <= DIP_SWING_MIN_LIQ_BUFFER_PCT:
+        blockers.append(f"当前强平缓冲只剩 {compact_metric(liq_buffer, '0.1')}%，不满足安全缓冲")
+    if funding_rate_pct >= Decimal("0.03"):
+        warnings.append("当前多头资金费偏热，抬高持仓成本")
+    if basis_pct >= Decimal("0.20"):
+        warnings.append("永续高于标记价较多，追高风险升高")
+    if signal["trend"] != "up":
+        warnings.append("当前趋势未转强，不做波段开多")
+    elif pullback_pct < DIP_SWING_PULLBACK_PCT:
+        warnings.append(
+            f"当前回撤 {compact_metric(pullback_pct, '0.1')}%，还没到波段回踩区 {format_decimal(DIP_SWING_PULLBACK_PCT, 1)}%"
+        )
+    elif signal["signal"] not in {"pullback_buy", "bull_cross_buy"}:
+        warnings.append(
+            f"回撤够了，但反弹确认只有 {compact_metric(rebound_pct, '0.1')}%，继续等确认"
+        )
+    if position_side == "short":
+        blockers.append("检测到空单残留，先清掉再切换到波段策略")
+
+    allow_new_entries = (
+        not blockers
+        and position_side == "flat"
+        and signal["trend"] == "up"
+        and signal["signal"] in {"pullback_buy", "bull_cross_buy"}
+    )
+    if blockers:
+        decision = "skip"
+        decision_label = "先收缩风险"
+    elif allow_new_entries:
+        decision = "execute"
+        decision_label = "允许波段开多"
+    elif signal["trend"] != "up":
+        decision = "observe"
+        decision_label = "趋势未转强"
+    else:
+        decision = "observe"
+        decision_label = "等待下一次回踩"
+
+    symbol = strategy_symbol_label(selected_target)
+    summary_bits = [
+        f"{symbol} 波段",
+        f"回撤 {compact_metric(pullback_pct, '0.1')}%",
+        f"反弹 {compact_metric(rebound_pct, '0.1')}%",
+        f"资金费 {compact_metric(funding_rate_pct, '0.001')}%",
+        f"目标止盈 {selected_target.get('takeProfitPct', '8')}%",
+    ]
+    if target_multiple > Decimal("1"):
+        summary_bits.append(f"目标余额 {format_decimal(target_multiple, 0)}x")
+    if position_side == "long" and liq_buffer > 0:
+        summary_bits.append(f"强平缓冲 {compact_metric(liq_buffer, '0.1')}%")
+    if blockers:
+        summary_bits.append(blockers[0])
+    elif allow_new_entries:
+        summary_bits.append(
+            "趋势转强、回踩或金叉条件已到，允许逐仓开多"
+            if signal["signal"] == "bull_cross_buy"
+            else "回踩和反弹确认都到位，允许逐仓开多"
+        )
+    elif signal["trend"] != "up":
+        summary_bits.append("趋势还没重新抬头，继续等")
+    else:
+        summary_bits.append("继续等下一次更好的回踩或更明确的反弹确认")
+
+    return {
+        "statusText": "已联网分析",
+        "decision": decision,
+        "decisionLabel": decision_label,
+        "summary": " · ".join(summary_bits),
+        "selectedStrategyName": f"{symbol} 波段",
+        "selectedStrategyDetail": strategy_detail_line(selected_target),
+        "selectedReturnPct": "",
+        "selectedDrawdownPct": "",
+        "selectedWinRatePct": "",
+        "selectedScore": "",
+        "allowNewEntries": allow_new_entries,
+        "optimizerRefreshed": False,
+        "lastAnalyzedAt": now_local_iso(),
+        "marketRegime": "趋势波段",
+        "spotTrend": "",
+        "swapTrend": f"{signal['trend']} / {signal['signal']}",
+        "volatilityPct": compact_metric(recent_range_pct(candles), "0.01"),
+        "spreadPct": "",
+        "basisPct": compact_metric(basis_pct, "0.01"),
+        "fundingRatePct": compact_metric(funding_rate_pct, "0.001"),
+        "openInterest": str(open_interest),
+        "warnings": warnings,
+        "blockers": blockers,
+        "selectedConfig": deep_merge({}, selected_target),
+        "pullbackPct": compact_metric(pullback_pct, "0.1"),
+        "reboundPct": compact_metric(rebound_pct, "0.1"),
+        "liquidationPrice": decimal_to_str(liq_price) if liq_price > 0 else "",
+        "liquidationBufferPct": compact_metric(liq_buffer, "0.1") if liq_buffer > 0 else "",
+        "research": {
+            "running": False,
+            "statusText": "波段模式",
+            "mode": "dip_swing",
+            "lastRunAt": now_local_iso(),
+            "historyLimit": len(candles),
+            "sampleCount": len(candles),
+            "summary": {
+                "pullbackPct": compact_metric(pullback_pct, "0.1"),
+                "reboundPct": compact_metric(rebound_pct, "0.1"),
+                "fundingRatePct": compact_metric(funding_rate_pct, "0.001"),
+            },
+            "bestConfig": deep_merge({}, selected_target),
+            "leaderboard": [],
+            "generationSummaries": [],
+            "pipeline": {
+                "mode": "dip_swing",
                 "status": decision,
             },
             "markets": {},
@@ -5018,6 +5831,8 @@ def build_execution_analysis(
 ) -> dict[str, Any]:
     if str(automation.get("strategyPreset") or "") == "basis_arb":
         return build_basis_arb_analysis(automation, client)
+    if str(automation.get("strategyPreset") or "") == "dip_swing":
+        return build_dip_swing_analysis(automation, client)
     research = research_optimize(automation, runtime_research_options(automation), client)
     best_entry = (research.get("leaderboard") or [{}])[0]
     best_config = deep_merge({}, research.get("bestConfig") or automation)
@@ -6328,9 +7143,14 @@ class AutomationEngine:
         self.thread: threading.Thread | None = None
         self.stop_event = threading.Event()
         self.lock = threading.RLock()
+        self._prepared_swap_signature: tuple[Any, ...] | None = None
 
     def snapshot(self) -> dict[str, Any]:
-        return self.state_store.current()
+        snapshot = self.state_store.current()
+        ok, _, automation = validate_automation_config(self.automation_store.current())
+        if not ok:
+            return snapshot
+        return reconcile_runtime_state_with_automation(snapshot, automation)
 
     def _update_state(self, mutator) -> dict[str, Any]:
         return self.state_store.update(mutator)
@@ -6373,9 +7193,10 @@ class AutomationEngine:
 
         self._update_state(mutate)
 
-    def _touch_session(self, total_eq: Decimal) -> dict[str, Any]:
+    def _touch_session(self, total_eq: Decimal, automation: dict[str, Any] | None = None) -> dict[str, Any]:
         today = datetime.now().date().isoformat()
         stamp = now_local_iso()
+        target_multiple = resolve_target_balance_multiple(automation or {})
 
         def mutate(state: dict[str, Any]) -> None:
             if state.get("today") != today:
@@ -6398,6 +7219,11 @@ class AutomationEngine:
             if start_eq > 0:
                 drawdown = ((total_eq - start_eq) / start_eq) * Decimal("100")
             state["dailyDrawdownPct"] = decimal_to_str(drawdown)
+            target_snapshot = build_target_balance_snapshot(start_eq, total_eq, target_multiple)
+            state["targetBalanceEq"] = decimal_to_str(target_snapshot["targetEq"])
+            state["targetBalanceProgressPct"] = decimal_to_str(target_snapshot["progressPct"])
+            state["targetBalanceRemainingEq"] = decimal_to_str(target_snapshot["remainingEq"])
+            state["targetBalanceReached"] = bool(target_snapshot["reached"])
             curve = state.setdefault("equityCurve", [])
             curve.append({"ts": stamp, "eq": decimal_to_str(total_eq)})
             state["equityCurve"] = curve[-120:]
@@ -6418,6 +7244,30 @@ class AutomationEngine:
             target["lastMessage"] = message
 
         self._update_state(mutate)
+
+    def _target_balance_snapshot(self, automation: dict[str, Any]) -> dict[str, Any]:
+        if not bool(self.config_store.current().get("simulated")):
+            return build_target_balance_snapshot(Decimal("0"), Decimal("0"), Decimal("1"))
+        state = self.state_store.current()
+        start_eq = safe_decimal(state.get("sessionStartEq"), "0")
+        current_eq = safe_decimal(state.get("currentEq"), "0")
+        target_multiple = resolve_target_balance_multiple(automation)
+        return build_target_balance_snapshot(start_eq, current_eq, target_multiple)
+
+    def _target_scaled_swap_contracts(self, automation: dict[str, Any], lot_size: Decimal) -> Decimal:
+        base_contracts = safe_decimal(automation.get("swapContracts"), "0")
+        rounded_base = round_down(base_contracts, lot_size)
+        if rounded_base <= 0:
+            return Decimal("0")
+        target_snapshot = self._target_balance_snapshot(automation)
+        target_multiple = resolve_target_balance_multiple(automation)
+        if target_multiple <= Decimal("1") or not bool(self.config_store.current().get("simulated")):
+            return rounded_base
+        current_multiple = safe_decimal(target_snapshot.get("currentMultiple"), "1")
+        if current_multiple <= 0:
+            current_multiple = Decimal("1")
+        aggressive_scale = max(Decimal("1"), target_multiple - min(current_multiple, target_multiple) + Decimal("1"))
+        return round_down(rounded_base * aggressive_scale, lot_size)
 
     def _cooldown_ready(self, market: str, cooldown_seconds: int) -> tuple[bool, str]:
         state = self.snapshot()["markets"].get(market, {})
@@ -6464,6 +7314,26 @@ class AutomationEngine:
                 target["swapTdMode"],
             )
             self._set_market(f"swap:{target['swapInstId']}", {"prepared": True, "instId": target["swapInstId"]})
+
+    def _swap_prepare_signature(self, automation: dict[str, Any]) -> tuple[Any, ...]:
+        targets = build_execution_targets(automation)
+        enabled_targets = [
+            (
+                str(target.get("swapInstId") or ""),
+                str(target.get("swapLeverage") or ""),
+                str(target.get("swapTdMode") or ""),
+            )
+            for target in targets
+            if target.get("swapEnabled")
+        ]
+        return (bool(automation.get("enforceNetMode")), tuple(enabled_targets))
+
+    def _ensure_swap_prepared(self, client: OkxClient, automation: dict[str, Any]) -> None:
+        signature = self._swap_prepare_signature(automation)
+        if signature == self._prepared_swap_signature:
+            return
+        self._prepare_swap(client, automation)
+        self._prepared_swap_signature = signature
 
     def _spot_reference_price(self, client: OkxClient, inst_id: str, side: str) -> Decimal:
         row = extract_first_row(client.get_ticker(inst_id))
@@ -6528,7 +7398,7 @@ class AutomationEngine:
             self._guard_live_mode(automation, api_config, autostart=autostart)
             client = OkxClient(api_config)
             client.get_account_balance()
-            self._prepare_swap(client, automation)
+            self._ensure_swap_prepared(client, automation)
             self.stop_event = threading.Event()
             self._update_state(
                 lambda state: state.update(
@@ -6566,6 +7436,7 @@ class AutomationEngine:
                 }
             )
         )
+        self._prepared_swap_signature = None
         self._log("info", reason)
 
     def run_once(self) -> None:
@@ -6579,7 +7450,7 @@ class AutomationEngine:
             raise OkxApiError(error)
         self._guard_live_mode(automation, api_config, autostart=False)
         client = OkxClient(api_config)
-        self._prepare_swap(client, automation)
+        self._ensure_swap_prepared(client, automation)
         self._run_cycle(client, automation)
 
     def _run_loop(self) -> None:
@@ -6599,6 +7470,7 @@ class AutomationEngine:
             try:
                 ensure_live_route_ready(api_config, force=False)
                 client = OkxClient(api_config)
+                self._ensure_swap_prepared(client, automation)
                 self._run_cycle(client, automation)
                 self._update_state(lambda state: state.update({"consecutiveErrors": 0}))
             except Exception as exc:
@@ -6650,7 +7522,7 @@ class AutomationEngine:
             or account_snapshot["summary"].get("totalEq"),
             "0",
         )
-        session_state = self._touch_session(total_eq)
+        session_state = self._touch_session(total_eq, effective_automation)
         targets = build_execution_targets(effective_automation)
         return {
             "accountSnapshot": account_snapshot,
@@ -6675,8 +7547,25 @@ class AutomationEngine:
         drawdown_pct = safe_decimal(session_state.get("dailyDrawdownPct"), "0")
         max_orders_per_day = int(effective_automation.get("maxOrdersPerDay", 20))
         order_count_today = int(session_state.get("orderCountToday", 0))
+        target_multiple = resolve_target_balance_multiple(effective_automation)
+        target_eq = safe_decimal(session_state.get("targetBalanceEq"), "0")
+        target_reached = bool(session_state.get("targetBalanceReached"))
         stop_reason = ""
         checks: list[dict[str, Any]] = []
+
+        if target_multiple > Decimal("1") and target_eq > 0:
+            checks.append(
+                {
+                    "name": "target_balance",
+                    "passed": not target_reached,
+                    "detail": (
+                        f"目标 {format_decimal(target_multiple, 0)}x · 当前 {format_decimal(safe_decimal(session_state.get('currentEq'), '0'), 2)} "
+                        f"/ 目标 {format_decimal(target_eq, 2)} USDT"
+                    ),
+                }
+            )
+            if target_reached and not stop_reason:
+                stop_reason = f"模拟盘目标已完成：余额达到 {format_decimal(target_multiple, 0)}x"
 
         if max_daily_loss > 0:
             passed = drawdown_pct > -max_daily_loss
@@ -6692,12 +7581,12 @@ class AutomationEngine:
             if not passed and not stop_reason:
                 stop_reason = "自动量化已停止：超过日内最大回撤"
 
-        passed_order_limit = order_count_today < max_orders_per_day
+        passed_order_limit = max_orders_per_day <= 0 or order_count_today < max_orders_per_day
         checks.append(
             {
                 "name": "max_orders_per_day",
                 "passed": passed_order_limit,
-                "detail": f"当日下单 {order_count_today} / 上限 {max_orders_per_day}",
+                "detail": f"当日下单 {order_count_today} / 上限 {'不限制' if max_orders_per_day <= 0 else max_orders_per_day}",
             }
         )
         if not passed_order_limit and not stop_reason:
@@ -6909,11 +7798,14 @@ class AutomationEngine:
         opened_at = parse_iso(tracked_opened_at)
         if opened_at:
             hold_minutes = max(int((datetime.now() - opened_at).total_seconds() // 60), 0)
+        reverse_basis = entry_spread_pct <= 0
         arb_stage = "watching"
         if tracked_bias and not pair_active:
             arb_stage = "broken_pair"
         elif pair_active:
             arb_stage = "hedged"
+        elif reverse_basis:
+            arb_stage = "reverse_basis"
         elif entry_spread_pct >= entry_threshold and funding_aligned:
             arb_stage = "window_open"
         elif entry_spread_pct >= entry_threshold and not funding_aligned:
@@ -7054,9 +7946,13 @@ class AutomationEngine:
             self._set_market(spot_key, {"arbStage": "entry_wait", "lastMessage": f"套利窗口出现，但{cooldown_reason}"})
             self._set_market(swap_key, {"arbStage": "entry_wait", "lastMessage": f"套利窗口出现，但{cooldown_reason}"})
             return
+        if entry_spread_pct <= 0:
+            self._set_market(spot_key, {"arbStage": "reverse_basis", "lastMessage": f"{shared_label} · 当前是负基差，这版只做现货多 + 永续空"})
+            self._set_market(swap_key, {"arbStage": "reverse_basis", "lastMessage": f"{shared_label} · 当前是负基差，这版只做现货多 + 永续空"})
+            return
         if entry_spread_pct < entry_threshold:
-            self._set_market(spot_key, {"arbStage": "watching", "lastMessage": f"{shared_label} · 价差还没到入场阈值 {decimal_to_str(entry_threshold)}%"})
-            self._set_market(swap_key, {"arbStage": "watching", "lastMessage": f"{shared_label} · 价差还没到入场阈值 {decimal_to_str(entry_threshold)}%"})
+            self._set_market(spot_key, {"arbStage": "watching", "lastMessage": f"{shared_label} · 正基差还没到入场阈值 {decimal_to_str(entry_threshold)}%"})
+            self._set_market(swap_key, {"arbStage": "watching", "lastMessage": f"{shared_label} · 正基差还没到入场阈值 {decimal_to_str(entry_threshold)}%"})
             return
         if require_funding_alignment and not funding_aligned:
             self._set_market(spot_key, {"arbStage": "funding_blocked", "lastMessage": f"{shared_label} · 资金费低于阈值 {decimal_to_str(min_funding)}%"})
@@ -7071,8 +7967,12 @@ class AutomationEngine:
             self._set_market(swap_key, {"arbStage": "blocked_budget", "lastMessage": "套利预算过小，现货腿无法开仓"})
             return
         if trade_contracts <= 0:
-            self._set_market(spot_key, {"arbStage": "blocked_hedge", "lastMessage": "永续张数为 0，无法建立套利对冲"})
-            self._set_market(swap_key, {"arbStage": "blocked_hedge", "lastMessage": "永续张数为 0，无法建立套利对冲"})
+            hedge_message = (
+                f"当前币只分到 {decimal_to_str(safe_decimal(automation.get('swapContracts'), '0'))} 张，"
+                f"按步长 {decimal_to_str(swap_lot_size)} 取整后为 0，无法建立套利对冲"
+            )
+            self._set_market(spot_key, {"arbStage": "blocked_hedge", "lastMessage": hedge_message})
+            self._set_market(swap_key, {"arbStage": "blocked_hedge", "lastMessage": hedge_message})
             return
 
         self._place_spot_order(
@@ -7151,12 +8051,18 @@ class AutomationEngine:
         rollback_pairs = int(arb_runtime.get("rollback") or 0)
         blocked_pairs = int(arb_runtime.get("blocked") or 0)
         broken_pairs = int(arb_runtime.get("brokenPair") or 0)
+        reverse_basis_pairs = int(arb_runtime.get("reverseBasis") or 0)
         if is_basis_arb:
+            candidate_count = int(analysis.get("candidateCount") or 0)
+            market_candidate_count = int(analysis.get("marketCandidateCount") or 0)
             pipeline_summary = (
-                f"套利窗口 {window_open} 币 · "
-                f"对冲中 {hedged_pairs} 币对 · "
-                f"待回补 {exit_queue} 币对"
+                f"可做 {candidate_count} · "
+                f"市场 {market_candidate_count} · "
+                f"对冲 {hedged_pairs} · "
+                f"回补 {exit_queue}"
             )
+            if reverse_basis_pairs:
+                pipeline_summary += f" · 反向 {reverse_basis_pairs}"
             if rollback_pairs:
                 pipeline_summary += f" · 回滚 {rollback_pairs}"
             if blocked_pairs:
@@ -7165,11 +8071,14 @@ class AutomationEngine:
                 pipeline_summary += f" · 断腿 {broken_pairs}"
             mode_text = (
                 f"{analysis.get('selectedStrategyName', strategy_label(effective_automation.get('strategyPreset', 'basis_arb')))}"
-                f" · {len(watchlist_entries)} 币观察"
-                f" · 窗口 {window_open}"
+                f" · {len(watchlist_entries)} 币"
+                f" · 可做 {candidate_count}"
+                f" · 市场 {market_candidate_count}"
                 f" · 对冲 {hedged_pairs}"
                 f" · 回补 {exit_queue}"
             )
+            if reverse_basis_pairs:
+                mode_text += f" · 反向 {reverse_basis_pairs}"
             if rollback_pairs:
                 mode_text += f" · 回滚 {rollback_pairs}"
             last_strategy_detail = (
@@ -7391,6 +8300,181 @@ class AutomationEngine:
             if sell_size >= min_size:
                 self._place_spot_order(client, inst_id, "sell", sell_size, "死叉离场", market_key=market_key)
 
+    def _run_dip_swing_swap_cycle(
+        self,
+        client: OkxClient,
+        automation: dict[str, Any],
+        allow_new_entries: bool,
+        analysis_label: str,
+        *,
+        market_key: str = "swap",
+    ) -> None:
+        inst_id = automation["swapInstId"]
+        meta = get_instrument_meta(client, "SWAP", inst_id)
+        candles = get_closed_candles(
+            client,
+            inst_id,
+            automation["bar"],
+            max(int(automation["slowEma"]) + 30, 80),
+        )
+        signal = build_pullback_signal(candles, int(automation["fastEma"]), int(automation["slowEma"]))
+        positions = client.get_positions(inst_id).get("data", [])
+        open_position = next((row for row in positions if safe_decimal(row.get("pos"), "0") != 0), {})
+        pos_value = safe_decimal(open_position.get("pos"), "0")
+        abs_pos = abs(pos_value)
+        entry_price = safe_decimal(open_position.get("avgPx"), "0")
+        last_price = safe_decimal(signal["lastClose"])
+        liq_price = safe_decimal(open_position.get("liqPx"), "0")
+        liq_buffer = liquidation_buffer_pct(last_price, liq_price, "long" if pos_value > 0 else "short" if pos_value < 0 else "flat")
+        lot_size = safe_decimal(meta.get("lotSz"), "1")
+        target_snapshot = self._target_balance_snapshot(automation)
+        planned_trade_contracts = self._target_scaled_swap_contracts(automation, lot_size)
+        position_side = "flat"
+        if pos_value > 0:
+            position_side = "long"
+        elif pos_value < 0:
+            position_side = "short"
+        floating_pnl = safe_decimal(open_position.get("upl"), "0")
+        floating_pnl_pct = Decimal("0")
+        if entry_price > 0 and last_price > 0 and position_side == "long":
+            floating_pnl_pct = ((last_price - entry_price) / entry_price) * Decimal("100")
+
+        status_text = (
+            f"回撤 {compact_metric(signal.get('pullbackPct'), '0.1')}% / "
+            f"反弹 {compact_metric(signal.get('reboundPct'), '0.1')}%"
+        )
+        if liq_buffer > 0:
+            status_text += f" / 强平缓冲 {compact_metric(liq_buffer, '0.1')}%"
+        if safe_decimal(target_snapshot.get("targetEq"), "0") > 0:
+            status_text += (
+                f" / 目标 {compact_metric(target_snapshot.get('progressPct'), '0.1')}%"
+                f" / 计划 {decimal_to_str(planned_trade_contracts)} 张"
+            )
+        self._set_market(
+            market_key,
+            {
+                "enabled": True,
+                "instId": inst_id,
+                "signal": signal["signal"],
+                "trend": signal["trend"],
+                "lastPrice": signal["lastClose"],
+                "positionSide": position_side,
+                "positionSize": decimal_to_str(abs_pos),
+                "positionNotional": decimal_to_str(abs_pos * last_price),
+                "entryPrice": decimal_to_str(entry_price) if entry_price > 0 else "",
+                "floatingPnl": decimal_to_str(floating_pnl),
+                "floatingPnlPct": decimal_to_str(floating_pnl_pct),
+                "pnlSource": "逐仓永续未实现盈亏",
+                "riskBudget": decimal_to_str(planned_trade_contracts),
+                "riskCap": decimal_to_str(safe_decimal(automation.get("swapLeverage"), "0")),
+                "riskMode": str(automation.get("swapTdMode") or "isolated"),
+                "riskLabel": build_market_risk_label(automation, "swap"),
+                "liquidationPrice": decimal_to_str(liq_price) if liq_price > 0 else "",
+                "liquidationBufferPct": decimal_to_str(liq_buffer) if liq_buffer > 0 else "",
+                "lastMessage": f"波段监控 · {status_text}",
+            },
+        )
+
+        if position_side == "short":
+            close_size = round_down(abs_pos, lot_size)
+            if close_size > 0:
+                self._place_swap_order(
+                    client,
+                    inst_id,
+                    "buy",
+                    close_size,
+                    automation["swapTdMode"],
+                    "切换波段策略，先平空单",
+                    reduce_only=True,
+                    market_key=market_key,
+                )
+            return
+
+        stop_loss = safe_decimal(automation.get("stopLossPct"), "0")
+        take_profit = safe_decimal(automation.get("takeProfitPct"), "0")
+        if position_side == "long" and entry_price > 0:
+            if liq_buffer > 0 and liq_buffer <= DIP_SWING_MIN_LIQ_BUFFER_PCT:
+                self._place_swap_order(
+                    client,
+                    inst_id,
+                    "sell",
+                    round_down(abs_pos, lot_size),
+                    automation["swapTdMode"],
+                    "强平缓冲不足，主动退场",
+                    reduce_only=True,
+                    market_key=market_key,
+                )
+                return
+            if stop_loss > 0 and last_price <= entry_price * (Decimal("1") - stop_loss / Decimal("100")):
+                self._place_swap_order(
+                    client,
+                    inst_id,
+                    "sell",
+                    round_down(abs_pos, lot_size),
+                    automation["swapTdMode"],
+                    "波段多单止损",
+                    reduce_only=True,
+                    market_key=market_key,
+                )
+                return
+            if take_profit > 0 and last_price >= entry_price * (Decimal("1") + take_profit / Decimal("100")):
+                self._place_swap_order(
+                    client,
+                    inst_id,
+                    "sell",
+                    round_down(abs_pos, lot_size),
+                    automation["swapTdMode"],
+                    "波段多单止盈",
+                    reduce_only=True,
+                    market_key=market_key,
+                )
+                return
+            cooldown_ready, reason = self._cooldown_ready(market_key, int(automation["cooldownSeconds"]))
+            if signal["trend"] != "up":
+                if cooldown_ready:
+                    self._place_swap_order(
+                        client,
+                        inst_id,
+                        "sell",
+                        round_down(abs_pos, lot_size),
+                        automation["swapTdMode"],
+                        "趋势转弱，主动平多",
+                        reduce_only=True,
+                        market_key=market_key,
+                    )
+                else:
+                    self._set_market(market_key, {"lastMessage": f"趋势转弱，但{reason}"})
+                return
+            self._set_market(market_key, {"lastMessage": f"波段持仓中 · {status_text} · 目标 {automation.get('takeProfitPct', '8')}%"})
+            return
+
+        trade_contracts = planned_trade_contracts
+        if trade_contracts <= 0:
+            self._set_market(market_key, {"lastMessage": "永续张数为 0，已停止发单"})
+            return
+        if signal["signal"] not in {"pullback_buy", "bull_cross_buy"}:
+            if signal["trend"] != "up":
+                self._set_market(market_key, {"lastMessage": f"趋势未转强 · {status_text}"})
+            else:
+                self._set_market(market_key, {"lastMessage": f"等待下一次更好的回踩 · {status_text}"})
+            return
+        if not allow_new_entries:
+            self._set_market(market_key, {"lastMessage": f"波段买点出现，但当前联网决策层为“{analysis_label}”，本轮不新开仓"})
+            return
+        cooldown_ready, reason = self._cooldown_ready(market_key, int(automation["cooldownSeconds"]))
+        if not cooldown_ready:
+            self._set_market(market_key, {"lastMessage": f"波段买点出现，但{reason}"})
+            return
+        self._place_swap_order(
+            client,
+            inst_id,
+            "buy",
+            trade_contracts,
+            automation["swapTdMode"],
+            "波段开多",
+            market_key=market_key,
+        )
+
     def _run_swap_cycle(
         self,
         client: OkxClient,
@@ -7400,6 +8484,15 @@ class AutomationEngine:
         *,
         market_key: str = "swap",
     ) -> None:
+        if str(automation.get("strategyPreset") or "") == "dip_swing":
+            self._run_dip_swing_swap_cycle(
+                client,
+                automation,
+                allow_new_entries,
+                analysis_label,
+                market_key=market_key,
+            )
+            return
         inst_id = automation["swapInstId"]
         meta = get_instrument_meta(client, "SWAP", inst_id)
         candles = get_closed_candles(

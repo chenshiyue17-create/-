@@ -38,7 +38,14 @@
             </div>
             <span class="pill" id="rail-strategy-pill">待同步</span>
           </div>
-          <div class="rail-strategy-summary">
+          <div class="rail-strategy-status-simple">
+            <span>当前状态</span>
+            <strong id="rail-strategy-status-sub">等待环境同步</strong>
+          </div>
+          <div class="rail-action-single">
+            <button id="rail-strategy-toggle" class="btn btn-primary" type="button">启动</button>
+          </div>
+          <div class="rail-strategy-summary rail-strategy-legacy">
             <div>
               <span>当前策略</span>
               <strong id="rail-strategy-meta">等待策略配置</strong>
@@ -52,7 +59,7 @@
               <strong id="rail-strategy-guard">等待环境检查</strong>
             </div>
           </div>
-          <div class="rail-strategy-live">
+          <div class="rail-strategy-live rail-strategy-legacy">
             <div>
               <span>应用状态</span>
               <strong id="rail-strategy-apply">等待应用</strong>
@@ -62,7 +69,7 @@
               <strong id="rail-strategy-pnl">--</strong>
             </div>
           </div>
-          <div class="rail-toggle-list">
+          <div class="rail-toggle-list rail-strategy-legacy">
             <label class="rail-toggle-row" for="railAutoAutostart">
               <span>自动启动</span>
               <input id="railAutoAutostart" type="checkbox" />
@@ -80,7 +87,7 @@
               <input id="railAutoAllowLiveAutostart" type="checkbox" />
             </label>
           </div>
-          <div class="rail-action-grid">
+          <div class="rail-action-grid rail-strategy-legacy">
             <button id="rail-save-automation" class="btn btn-secondary" type="button">保存</button>
             <button id="rail-run-automation-once" class="btn btn-ghost" type="button">跑一轮</button>
             <button id="rail-start-automation" class="btn btn-primary" type="button">启动</button>
@@ -92,6 +99,10 @@
             <span>总余额</span>
             <strong id="rail-balance-main">0.00</strong>
             <small id="rail-balance-sub">USDT</small>
+            <div class="rail-balance-goal">
+              <small id="rail-balance-target">目标 0.00 USDT</small>
+              <small id="rail-balance-progress">进度 0%</small>
+            </div>
           </div>
           <div class="rail-stat">
             <span>矿机收益</span>
@@ -121,7 +132,7 @@
               <strong class="dock-equity-main" id="dock-pnl-main">--</strong>
               <small class="dock-equity-sub" id="dock-pnl-sub">等待会话收益</small>
             </div>
-            <div class="dock-curve-shell">
+            <div class="dock-curve-shell curve-scroll-shell" id="dock-curve-shell">
               <svg id="dock-equity-curve" viewBox="0 0 960 130" preserveAspectRatio="none" aria-label="悬浮收益曲线"></svg>
             </div>
             <div class="dock-curve-stats" id="dock-curve-stats">
@@ -229,8 +240,13 @@
               <strong id="desk-cycle">--</strong>
               <small id="desk-cycle-sub">等待配置</small>
             </div>
-            <div class="cockpit-card">
+            <div class="cockpit-card status-card idle" id="desk-mode-card">
               <span>执行环境</span>
+              <div class="desk-mode-alert hidden" id="desk-mode-alert" aria-live="polite">
+                <div class="desk-mode-alert-eyebrow" id="desk-mode-alert-eyebrow">需要处理</div>
+                <div class="desk-mode-alert-main" id="desk-mode-alert-main">--</div>
+                <div class="desk-mode-alert-sub" id="desk-mode-alert-sub">--</div>
+              </div>
               <strong id="desk-mode">--</strong>
               <small id="desk-mode-sub">模拟 / 实盘 + 策略状态</small>
             </div>
@@ -447,13 +463,12 @@
           <div class="preset-surface">
             <div class="preset-copy">
               <span class="quick-label">策略模式</span>
-              <input id="autoStrategyPreset" type="hidden" value="dual_engine" />
-              <strong id="active-strategy-label">标准双引擎</strong>
-              <p id="active-strategy-description">均衡版现货+永续策略，适合常规 BTC / ETH / SOL 轮询。</p>
+              <input id="autoStrategyPreset" type="hidden" value="dip_swing" />
+              <strong id="active-strategy-label">波段</strong>
+              <p id="active-strategy-description">只保留波段策略。逐仓 10x 做趋势内波段，回踩或转强就接，固定 8% 止盈。</p>
             </div>
             <div class="chip-group" id="strategy-preset-group">
-              <button class="chip" type="button" data-strategy-preset="dual_engine">标准双引擎</button>
-              <button class="chip" type="button" data-strategy-preset="btc_lotto">BTC 乐透机</button>
+              <button class="chip active" type="button" data-strategy-preset="dip_swing">波段</button>
             </div>
           </div>
           <div class="research-surface">
@@ -584,6 +599,16 @@
                 <strong id="portfolio-context-main">等待 watchlist</strong>
                 <small id="portfolio-context-sub">每个币独立执行，统一受组合护栏约束。</small>
               </div>
+              <div class="portfolio-summary-card">
+                <span>执行流水线</span>
+                <strong id="portfolio-pipeline-main">等待本轮编排</strong>
+                <small id="portfolio-pipeline-sub">信号、组合、风控、执行会在这里告诉你卡在哪一层。</small>
+              </div>
+              <div class="portfolio-summary-card">
+                <span>风控护栏</span>
+                <strong id="portfolio-risk-main">等待风控检查</strong>
+                <small id="portfolio-risk-sub">日内回撤、下单次数、活跃币种等检查结果会显示在这里。</small>
+              </div>
             </div>
             <div id="portfolio-watchlist" class="portfolio-watchlist-grid empty">等待组合交易状态</div>
           </div>
@@ -624,6 +649,17 @@
               <span>多币 watchlist</span>
               <input id="autoWatchlistSymbols" placeholder="BTC,ETH,SOL" />
             </label>
+            <div class="wide-field watchlist-override-field">
+              <div class="watchlist-override-head">
+                <div>
+                  <span>按币覆盖参数</span>
+                  <small class="field-hint">不用手写 JSON。每个币直接填自己的参数，留空就继承组合总参数。</small>
+                </div>
+                <button type="button" class="ghost-button" id="watchlistOverrideReset">清空独立参数</button>
+              </div>
+              <div id="watchlistOverrideEditor" class="watchlist-override-editor"></div>
+              <textarea id="autoWatchlistOverrides" rows="8" hidden></textarea>
+            </div>
             <label class="checkbox-row">
               <span>启用现货策略</span>
               <input id="autoSpotEnabled" type="checkbox" checked />
@@ -674,6 +710,26 @@
             <label>
               <span>日内最大回撤 (%)</span>
               <input id="autoMaxDailyLossPct" type="number" min="0" step="0.1" value="3.0" />
+            </label>
+            <label data-arb-only class="hidden">
+              <span>套利入场价差 (%)</span>
+              <input id="autoArbEntrySpreadPct" type="number" min="0" step="0.001" value="0.18" />
+            </label>
+            <label data-arb-only class="hidden">
+              <span>套利回补价差 (%)</span>
+              <input id="autoArbExitSpreadPct" type="number" min="0" step="0.001" value="0.05" />
+            </label>
+            <label data-arb-only class="hidden">
+              <span>最低资金费 (%)</span>
+              <input id="autoArbMinFundingRatePct" type="number" min="0" step="0.001" value="0.005" />
+            </label>
+            <label data-arb-only class="hidden">
+              <span>最长持有 (分钟)</span>
+              <input id="autoArbMaxHoldMinutes" type="number" min="0" step="1" value="180" />
+            </label>
+            <label data-arb-only class="checkbox-row hidden">
+              <span>要求资金费同向</span>
+              <input id="autoArbRequireFundingAlignment" type="checkbox" checked />
             </label>
             <label class="checkbox-row">
               <span>服务启动后自动启动策略</span>
@@ -1107,10 +1163,27 @@
                 <strong id="order-summary-filled">0</strong>
               </div>
               <div class="order-summary-chip">
+                <span>异常 / 已撤</span>
+                <strong id="order-summary-risk">0</strong>
+              </div>
+              <div class="order-summary-chip">
+                <span>成交率</span>
+                <strong id="order-summary-rate">--</strong>
+              </div>
+              <div class="order-summary-chip">
                 <span>数据源</span>
                 <strong id="order-summary-source">-</strong>
               </div>
+              <div class="order-summary-chip">
+                <span>账本来源</span>
+                <strong id="order-summary-journal-source">-</strong>
+              </div>
+              <div class="order-summary-chip">
+                <span>最近对账</span>
+                <strong id="order-summary-reconciled">-</strong>
+              </div>
             </div>
+            <div id="orderSummaryInsight" class="order-summary-insight">订单终端会在这里提示最近的异常原因和成交概览。</div>
             <div id="orderGlobalSummary" class="order-global-summary empty">订单终端会在这里显示组合总收益、已实现、持仓浮动和现价估算。</div>
             <div id="orderSymbolOverview" class="order-symbol-overview empty">更多币种订单进来后，这里会按币显示独立订单流和收益汇总。</div>
             <div id="orderTerminalFocus" class="order-terminal-focus empty">聚焦某个币后，这里会显示当前订单流、收益拆分和下单上下文。</div>

@@ -67,59 +67,32 @@ const PAIR_PRESETS = {
   },
 };
 
+const ONLY_STRATEGY_PRESET = "dip_swing";
+
 const STRATEGY_PRESETS = {
-  dual_engine: {
-    label: "标准双引擎",
-    description: "均衡版现货+永续策略，适合常规 BTC / ETH / SOL 轮询。",
+  dip_swing: {
+    label: "波段",
+    description: "逐仓 10x 做趋势内波段，回踩或转强就接，固定 8% 止盈，强平缓冲不足时优先主动离场。",
     config: {
-      strategyPreset: "dual_engine",
-      bar: "5m",
-      fastEma: 9,
-      slowEma: 21,
-      pollSeconds: 20,
-      cooldownSeconds: 180,
-      maxOrdersPerDay: 20,
-      spotEnabled: true,
-      spotQuoteBudget: "100",
-      spotMaxExposure: "300",
-      swapEnabled: true,
-      swapContracts: "1",
-      swapTdMode: "cross",
-      swapStrategyMode: "trend_follow",
-      swapLeverage: "5",
-      stopLossPct: "1.2",
-      takeProfitPct: "2.4",
-      maxDailyLossPct: "3.0",
-      autostart: false,
-      allowLiveTrading: false,
-      allowLiveAutostart: false,
-      enforceNetMode: true,
-    },
-  },
-  btc_lotto: {
-    label: "BTC 乐透机",
-    description: "BTC 专用的小仓位高频模式，更快节奏、更紧风控，适合先在模拟盘跑波动试验。",
-    config: {
-      strategyPreset: "btc_lotto",
-      spotInstId: "BTC-USDT",
-      swapInstId: "BTC-USDT-SWAP",
-      bar: "1m",
-      fastEma: 4,
-      slowEma: 11,
+      strategyPreset: "dip_swing",
+      bar: "15m",
+      fastEma: 12,
+      slowEma: 48,
       pollSeconds: 8,
-      cooldownSeconds: 30,
-      maxOrdersPerDay: 80,
-      spotEnabled: true,
-      spotQuoteBudget: "30",
-      spotMaxExposure: "120",
+      cooldownSeconds: 45,
+      maxOrdersPerDay: 0,
+      spotEnabled: false,
+      spotQuoteBudget: "0",
+      spotMaxExposure: "0",
       swapEnabled: true,
       swapContracts: "1",
-      swapTdMode: "cross",
-      swapStrategyMode: "trend_follow",
-      swapLeverage: "5",
-      stopLossPct: "0.7",
-      takeProfitPct: "1.4",
-      maxDailyLossPct: "2.0",
+      swapTdMode: "isolated",
+      swapStrategyMode: "long_only",
+      swapLeverage: "10",
+      stopLossPct: "1.2",
+      takeProfitPct: "8",
+      maxDailyLossPct: "0.8",
+      targetBalanceMultiple: "10",
       autostart: false,
       allowLiveTrading: false,
       allowLiveAutostart: false,
@@ -231,6 +204,8 @@ const dashboardState = {
   recentOrders: [],
   recentOrdersAll: [],
   orderFeedMeta: null,
+  orderJournal: null,
+  orderJournalSymbols: [],
   selectedOrderSymbol: "",
   orderStateFilter: "all",
   orderMarketFilter: "all",
@@ -254,15 +229,310 @@ function formatStrategyMode(mode) {
   return "只做多";
 }
 
+const WATCHLIST_OVERRIDE_EDITOR_FIELDS = [
+  {
+    key: "bar",
+    label: "周期",
+    kind: "select",
+    options: [
+      ["", "继承组合"],
+      ["1m", "1m"],
+      ["3m", "3m"],
+      ["5m", "5m"],
+      ["15m", "15m"],
+      ["1H", "1H"],
+      ["4H", "4H"],
+    ],
+  },
+  { key: "fastEma", label: "快 EMA", kind: "int", min: 1, step: 1 },
+  { key: "slowEma", label: "慢 EMA", kind: "int", min: 2, step: 1 },
+  { key: "pollSeconds", label: "轮询秒数", kind: "int", min: 1, step: 1 },
+  { key: "cooldownSeconds", label: "冷却秒数", kind: "int", min: 0, step: 1 },
+  { key: "maxOrdersPerDay", label: "每日订单上限", kind: "int", min: 0, step: 1 },
+  { key: "swapContracts", label: "永续张数", kind: "string-number", min: 0, step: 1 },
+  { key: "swapLeverage", label: "永续杠杆", kind: "string-number", min: 1, max: 10, step: 1 },
+  { key: "stopLossPct", label: "止损 (%)", kind: "string-number", min: 0, step: 0.1 },
+  { key: "takeProfitPct", label: "止盈 (%)", kind: "string-number", min: 0, step: 0.1 },
+  { key: "maxDailyLossPct", label: "日内最大回撤 (%)", kind: "string-number", min: 0, step: 0.1 },
+];
+
+const WATCHLIST_OVERRIDE_EDITOR_FIELD_MAP = Object.fromEntries(
+  WATCHLIST_OVERRIDE_EDITOR_FIELDS.map((field) => [field.key, field])
+);
+
+function normalizeWatchlistOverrideSymbol(raw) {
+  let value = String(raw || "").trim().toUpperCase();
+  if (value.includes("-")) value = value.split("-")[0];
+  return value.replace(/[^A-Z0-9]/g, "");
+}
+
+function parseWatchlistOverridesValue(raw, watchlist = []) {
+  if (!raw || (typeof raw === "string" && !raw.trim())) return {};
+  let parsed = raw;
+  if (typeof raw === "string") {
+    try {
+      parsed = JSON.parse(raw);
+    } catch (_) {
+      return {};
+    }
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+  const watchlistSet = new Set((watchlist || []).map((symbol) => normalizeWatchlistOverrideSymbol(symbol)).filter(Boolean));
+  const normalized = {};
+  Object.entries(parsed).forEach(([symbolKey, override]) => {
+    const symbol = normalizeWatchlistOverrideSymbol(symbolKey);
+    if (!symbol || !override || typeof override !== "object" || Array.isArray(override)) return;
+    if (watchlistSet.size && !watchlistSet.has(symbol)) return;
+    const next = {};
+    Object.entries(override).forEach(([field, value]) => {
+      if (["fastEma", "slowEma", "pollSeconds", "cooldownSeconds", "maxOrdersPerDay", "arbMaxHoldMinutes"].includes(field)) {
+        const num = Number(value);
+        if (Number.isFinite(num)) next[field] = Math.trunc(num);
+      } else if (["spotEnabled", "swapEnabled", "arbRequireFundingAlignment"].includes(field)) {
+        next[field] = Boolean(value);
+      } else if (
+        [
+          "bar",
+          "spotQuoteBudget",
+          "spotMaxExposure",
+          "swapContracts",
+          "swapTdMode",
+          "swapStrategyMode",
+          "swapLeverage",
+          "stopLossPct",
+          "takeProfitPct",
+          "maxDailyLossPct",
+          "arbEntrySpreadPct",
+          "arbExitSpreadPct",
+          "arbMinFundingRatePct",
+        ].includes(field)
+      ) {
+        next[field] = String(value ?? "").trim();
+      }
+    });
+    if (Object.keys(next).length) normalized[symbol] = next;
+  });
+  return normalized;
+}
+
+function serializeWatchlistOverrides(raw, watchlist = []) {
+  const normalized = parseWatchlistOverridesValue(raw, watchlist);
+  const ordered = {};
+  Object.keys(normalized).sort().forEach((symbol) => {
+    ordered[symbol] = normalized[symbol];
+  });
+  return Object.keys(ordered).length ? JSON.stringify(ordered, null, 2) : "";
+}
+
+function getWatchlistOverrideParseError(raw) {
+  const text = String(raw || "").trim();
+  if (!text) return "";
+  try {
+    const parsed = JSON.parse(text);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return "按币覆盖参数必须是 JSON 对象，例如 {\"BTC\": {\"fastEma\": 12}}";
+    }
+    return "";
+  } catch (error) {
+    return `按币覆盖参数不是合法 JSON: ${error.message}`;
+  }
+}
+
+function collectWatchlistOverridesFromEditor() {
+  const editor = $("watchlistOverrideEditor");
+  const watchlist = parseWatchlistSymbols(
+    $("autoWatchlistSymbols")?.value,
+    $("spotInstId")?.value,
+    $("swapInstId")?.value
+  );
+  if (!editor) {
+    return parseWatchlistOverridesValue($("autoWatchlistOverrides")?.value, watchlist);
+  }
+  const overrides = {};
+  editor.querySelectorAll("[data-watchlist-symbol]").forEach((card) => {
+    const symbol = normalizeWatchlistOverrideSymbol(card.dataset.watchlistSymbol || "");
+    if (!symbol) return;
+    const next = {};
+    card.querySelectorAll("[data-override-field]").forEach((input) => {
+      const field = WATCHLIST_OVERRIDE_EDITOR_FIELD_MAP[input.dataset.overrideField];
+      if (!field) return;
+      const rawValue = String(input.value ?? "").trim();
+      if (!rawValue) return;
+      if (field.kind === "int") {
+        const num = Number(rawValue);
+        if (Number.isFinite(num)) next[field.key] = Math.trunc(num);
+        return;
+      }
+      if (field.kind === "bool-select") {
+        next[field.key] = rawValue === "true";
+        return;
+      }
+      next[field.key] = rawValue;
+    });
+    if (Object.keys(next).length) overrides[symbol] = next;
+  });
+  return parseWatchlistOverridesValue(overrides, watchlist);
+}
+
+function syncWatchlistOverridesValueFromEditor() {
+  const watchlist = parseWatchlistSymbols(
+    $("autoWatchlistSymbols")?.value,
+    $("spotInstId")?.value,
+    $("swapInstId")?.value
+  );
+  const textarea = $("autoWatchlistOverrides");
+  if (!textarea) return {};
+  const overrides = collectWatchlistOverridesFromEditor();
+  textarea.value = serializeWatchlistOverrides(overrides, watchlist);
+  updateWatchlistOverrideEditorState(overrides);
+  return overrides;
+}
+
+function updateWatchlistOverrideEditorState(overrides = collectWatchlistOverridesFromEditor()) {
+  const editor = $("watchlistOverrideEditor");
+  if (!editor) return;
+  editor.querySelectorAll("[data-watchlist-symbol]").forEach((card) => {
+    const symbol = normalizeWatchlistOverrideSymbol(card.dataset.watchlistSymbol || "");
+    const activeKeys = Object.keys(overrides[symbol] || {});
+    card.classList.toggle("is-active", activeKeys.length > 0);
+    const badge = card.querySelector("[data-override-badge]");
+    if (badge) {
+      badge.textContent = activeKeys.length ? `${activeKeys.length} 项独立参数` : "继承组合";
+    }
+    const note = card.querySelector("[data-override-note]");
+    if (note) {
+      note.textContent = activeKeys.length
+        ? `当前币已单独覆盖：${activeKeys.map((key) => WATCHLIST_OVERRIDE_EDITOR_FIELD_MAP[key]?.label || key).join("、")}`
+        : "留空即继承组合总参数，不需要自己手写 JSON。";
+    }
+  });
+}
+
+function buildWatchlistOverrideCard(symbol, override = {}) {
+  const fields = WATCHLIST_OVERRIDE_EDITOR_FIELDS.map((field) => {
+    if (field.kind === "select" || field.kind === "bool-select") {
+      const options = field.options
+        .map(([value, label]) => `<option value="${escapeHtml(value)}"${String(override[field.key] ?? "") === String(value) ? " selected" : ""}>${escapeHtml(label)}</option>`)
+        .join("");
+      return `
+        <label>
+          <span>${field.label}</span>
+          <select data-override-field="${field.key}">${options}</select>
+        </label>
+      `;
+    }
+    const value = override[field.key] ?? "";
+    const maxAttr = field.max !== undefined ? ` max="${field.max}"` : "";
+    return `
+      <label>
+        <span>${field.label}</span>
+        <input
+          data-override-field="${field.key}"
+          type="number"
+          value="${escapeHtml(value)}"
+          min="${field.min ?? 0}"
+          step="${field.step ?? 1}"${maxAttr}
+          placeholder="继承组合"
+        />
+      </label>
+    `;
+  }).join("");
+  return `
+    <article class="watchlist-override-card" data-watchlist-symbol="${escapeHtml(symbol)}">
+      <div class="watchlist-override-card-head">
+        <div class="watchlist-override-card-title">
+          <strong>${escapeHtml(symbol)}</strong>
+          <small>${escapeHtml(symbol)}-USDT / ${escapeHtml(symbol)}-USDT-SWAP</small>
+        </div>
+        <span class="watchlist-override-badge" data-override-badge>继承组合</span>
+      </div>
+      <div class="watchlist-override-grid">${fields}</div>
+      <div class="watchlist-override-note" data-override-note>留空即继承组合总参数，不需要自己手写 JSON。</div>
+    </article>
+  `;
+}
+
+function renderWatchlistOverrideEditor(rawOverrides = $("autoWatchlistOverrides")?.value || "") {
+  const editor = $("watchlistOverrideEditor");
+  const textarea = $("autoWatchlistOverrides");
+  if (!editor || !textarea) return;
+  const watchlist = parseWatchlistSymbols(
+    $("autoWatchlistSymbols")?.value,
+    $("spotInstId")?.value,
+    $("swapInstId")?.value
+  );
+  const overrides = parseWatchlistOverridesValue(rawOverrides, watchlist);
+  textarea.value = serializeWatchlistOverrides(overrides, watchlist);
+  if (!watchlist.length) {
+    editor.innerHTML = '<div class="watchlist-override-empty">先填多币 watchlist，例如 BTC,ETH,SOL。每个币的独立参数会直接在这里展开。</div>';
+    return;
+  }
+  editor.innerHTML = watchlist.map((symbol) => buildWatchlistOverrideCard(symbol, overrides[symbol] || {})).join("");
+  updateWatchlistOverrideEditorState(overrides);
+}
+
+function allocateWatchlistNumericField(symbols, overrides, field, total) {
+  const normalizedSymbols = (symbols || []).map((symbol) => normalizeWatchlistOverrideSymbol(symbol)).filter(Boolean);
+  const totalValue = Number(total || 0);
+  const explicit = {};
+  normalizedSymbols.forEach((symbol) => {
+    if (overrides[symbol] && overrides[symbol][field] !== undefined && overrides[symbol][field] !== "") {
+      const value = Number(overrides[symbol][field]);
+      if (Number.isFinite(value)) explicit[symbol] = value;
+    }
+  });
+  const reserved = Object.values(explicit).reduce((sum, value) => sum + Number(value || 0), 0);
+  const remainingSymbols = normalizedSymbols.filter((symbol) => explicit[symbol] === undefined);
+  const remaining = Math.max(totalValue - reserved, 0);
+  const perSymbol = remainingSymbols.length ? remaining / remainingSymbols.length : 0;
+  const allocations = {};
+  normalizedSymbols.forEach((symbol) => {
+    allocations[symbol] = explicit[symbol] !== undefined ? explicit[symbol] : perSymbol;
+  });
+  return allocations;
+}
+
+function buildDraftExecutionTargets(config = collectAutomationConfig()) {
+  const normalized = normalizeAutomationConfigForCompare(config);
+  const watchlist = normalized.watchlistSymbols.split(",").filter(Boolean);
+  const overrides = parseWatchlistOverridesValue(normalized.watchlistOverrides, watchlist);
+  const spotBudgetAllocations = allocateWatchlistNumericField(watchlist, overrides, "spotQuoteBudget", normalized.spotQuoteBudget);
+  const spotCapAllocations = allocateWatchlistNumericField(watchlist, overrides, "spotMaxExposure", normalized.spotMaxExposure);
+  const swapContractAllocations = allocateWatchlistNumericField(watchlist, overrides, "swapContracts", normalized.swapContracts);
+  return watchlist.map((symbol, index) => {
+    const override = overrides[symbol] || {};
+    const target = {
+      ...normalized,
+      watchlistSymbols: watchlist.join(","),
+      watchlistSymbol: symbol,
+      watchlistIndex: index,
+      watchlistCount: watchlist.length,
+      spotInstId: `${symbol}-USDT`,
+      swapInstId: `${symbol}-USDT-SWAP`,
+      watchlistOverride: override,
+    };
+    if (target.spotEnabled) {
+      target.spotQuoteBudget = String(spotBudgetAllocations[symbol] ?? 0);
+      target.spotMaxExposure = String(spotCapAllocations[symbol] ?? 0);
+    }
+    if (target.swapEnabled) {
+      target.swapContracts = String(swapContractAllocations[symbol] ?? 0);
+    }
+    return { ...target, ...override, watchlistOverride: override };
+  });
+}
+
 function normalizeAutomationConfigForCompare(config = {}) {
   const spotInstId = String(config.spotInstId || "BTC-USDT").trim().toUpperCase();
   const swapInstId = String(config.swapInstId || "BTC-USDT-SWAP").trim().toUpperCase();
   const watchlistSymbols = parseWatchlistSymbols(config.watchlistSymbols, spotInstId, swapInstId).join(",");
+  const watchlist = watchlistSymbols.split(",").filter(Boolean);
   return {
-    strategyPreset: String(config.strategyPreset || "dual_engine"),
+    strategyPreset: ONLY_STRATEGY_PRESET,
     spotInstId,
     swapInstId,
     watchlistSymbols,
+    watchlistOverrides: serializeWatchlistOverrides(config.watchlistOverrides, watchlist),
     bar: String(config.bar || "5m"),
     fastEma: Number(config.fastEma ?? 9),
     slowEma: Number(config.slowEma ?? 21),
@@ -280,6 +550,12 @@ function normalizeAutomationConfigForCompare(config = {}) {
     stopLossPct: String(config.stopLossPct ?? "1.2"),
     takeProfitPct: String(config.takeProfitPct ?? "2.4"),
     maxDailyLossPct: String(config.maxDailyLossPct ?? "3.0"),
+    targetBalanceMultiple: String(config.targetBalanceMultiple ?? "1"),
+    arbEntrySpreadPct: String(config.arbEntrySpreadPct ?? "0.18"),
+    arbExitSpreadPct: String(config.arbExitSpreadPct ?? "0.05"),
+    arbMinFundingRatePct: String(config.arbMinFundingRatePct ?? "0.005"),
+    arbMaxHoldMinutes: Number(config.arbMaxHoldMinutes ?? 180),
+    arbRequireFundingAlignment: config.arbRequireFundingAlignment !== false,
     autostart: Boolean(config.autostart),
     allowLiveManualOrders: Boolean(config.allowLiveManualOrders),
     allowLiveTrading: Boolean(config.allowLiveTrading),
@@ -296,11 +572,13 @@ function isAutomationConfigDirty() {
 
 function buildStrategyFormSummary(config = {}) {
   const normalized = normalizeAutomationConfigForCompare(config);
-  const preset = STRATEGY_PRESETS[normalized.strategyPreset] || STRATEGY_PRESETS.dual_engine;
+  const preset = STRATEGY_PRESETS[ONLY_STRATEGY_PRESET];
   const watchlist = normalized.watchlistSymbols
     ? normalized.watchlistSymbols.split(",").filter(Boolean)
     : ["BTC"];
-  return `${preset.label} · ${normalized.bar} · EMA ${normalized.fastEma}/${normalized.slowEma} · ${watchlist.join(" / ")} · ${watchlist.length} 币组合`;
+  const overrideCount = Object.keys(parseWatchlistOverridesValue(normalized.watchlistOverrides, watchlist)).length;
+  const presetDetail = `${normalized.bar} 波段 · 逐仓 ${normalized.swapLeverage}x · TP ${normalized.takeProfitPct}%`;
+  return `${preset.label} · ${presetDetail} · ${watchlist.join(" / ")} · ${watchlist.length} 币组合${overrideCount ? ` · ${overrideCount} 币独立覆盖` : ""}`;
 }
 
 function setStrategyApplyState(stage, title, detail = "") {
@@ -314,49 +592,86 @@ function setStrategyApplyState(stage, title, detail = "") {
 }
 
 function buildDraftPortfolioEntries(config = collectAutomationConfig()) {
-  const normalized = normalizeAutomationConfigForCompare(config);
-  const watchlist = normalized.watchlistSymbols.split(",").filter(Boolean);
-  const count = Math.max(1, watchlist.length);
-  const perSpotBudget = Number(normalized.spotQuoteBudget || 0) / count;
-  const perSpotCap = Number(normalized.spotMaxExposure || 0) / count;
-  const perSwapContracts = Number(normalized.swapContracts || 0) / count;
-  return watchlist.map((symbol) => ({
-    symbol,
+  return buildDraftExecutionTargets(config).map((target) => {
+    const symbol = target.watchlistSymbol || target.spotInstId.split("-")[0];
+    const perSpotBudget = Number(target.spotQuoteBudget || 0);
+    const perSpotCap = Number(target.spotMaxExposure || 0);
+    const perSwapContracts = Number(target.swapContracts || 0);
+    const overrideFields = Object.keys(target.watchlistOverride || {});
+    const isBasisArb = target.strategyPreset === "basis_arb";
+    const isDipSwing = target.strategyPreset === "dip_swing";
+    const summaryDetail = isBasisArb
+      ? [
+          `入场 ${target.arbEntrySpreadPct}% / 回补 ${target.arbExitSpreadPct}%`,
+          `资金费 ${target.arbMinFundingRatePct}% / 最长 ${target.arbMaxHoldMinutes} 分钟`,
+          overrideFields.length ? `独立覆盖 ${overrideFields.length} 项` : "沿用组合参数",
+        ].join(" · ")
+      : isDipSwing
+        ? [
+            `${target.bar} · 趋势波段`,
+            `逐仓 ${target.swapLeverage}x · SL ${target.stopLossPct}% / TP ${target.takeProfitPct}%`,
+            overrideFields.length ? `独立覆盖 ${overrideFields.length} 项` : "沿用组合参数",
+          ].join(" · ")
+      : [
+          `${target.bar} · EMA ${target.fastEma}/${target.slowEma}`,
+          `SL ${target.stopLossPct}% / TP ${target.takeProfitPct}%`,
+          overrideFields.length ? `独立覆盖 ${overrideFields.length} 项` : "沿用组合参数",
+        ].join(" · ");
+    return {
+      symbol,
+      allocation: {
+      strategyPreset: target.strategyPreset || ONLY_STRATEGY_PRESET,
+      spotBudget: String(target.spotQuoteBudget || "0"),
+      spotMaxExposure: String(target.spotMaxExposure || "0"),
+      swapContracts: String(target.swapContracts || "0"),
+      swapLeverage: String(target.swapLeverage || "0"),
+      swapTdMode: target.swapTdMode || "cross",
+      swapStrategyMode: target.swapStrategyMode || "trend_follow",
+      overrideKeys: overrideFields,
+    },
+    overrideActive: overrideFields.length > 0,
     spot: {
-      enabled: normalized.spotEnabled,
+      enabled: target.spotEnabled,
       instId: `${symbol}-USDT`,
       signal: "hold",
       trend: "flat",
       positionSide: "flat",
       positionSize: "0",
       positionNotional: "0",
-      lastMessage: normalized.spotEnabled ? "保存并启动后开始独立现货决策" : "现货策略未启用",
+      lastMessage: target.spotEnabled ? "保存并启动后开始独立现货决策" : "现货策略未启用",
       floatingPnl: "0",
       floatingPnlPct: "0",
-      riskLabel: `单次 ${formatMoney(perSpotBudget)}U · 上限 ${formatMoney(perSpotCap)}U`,
+      riskLabel: isBasisArb
+        ? `入场 ${target.arbEntrySpreadPct}% · 回补 ${target.arbExitSpreadPct}% · 资金费 ${target.arbMinFundingRatePct}%`
+        : `单次 ${formatMoney(perSpotBudget)}U · 上限 ${formatMoney(perSpotCap)}U`,
     },
     swap: {
-      enabled: normalized.swapEnabled,
+      enabled: target.swapEnabled,
       instId: `${symbol}-USDT-SWAP`,
       signal: "hold",
       trend: "flat",
       positionSide: "flat",
       positionSize: "0",
       positionNotional: "0",
-      lastMessage: normalized.swapEnabled ? "保存并启动后开始独立永续决策" : "永续策略未启用",
+      lastMessage: target.swapEnabled ? "保存并启动后开始独立永续决策" : "永续策略未启用",
       floatingPnl: "0",
       floatingPnlPct: "0",
-      riskLabel: `${formatMoney(perSwapContracts)} 张 · ${normalized.swapLeverage}x · ${normalized.swapTdMode === "isolated" ? "逐仓" : "全仓"}`,
+      riskLabel: isBasisArb
+        ? `对冲 ${formatMoney(perSwapContracts)} 张 · ${target.swapLeverage}x · 资金费同向`
+        : `${formatMoney(perSwapContracts)} 张 · ${target.swapLeverage}x · ${target.swapTdMode === "isolated" ? "逐仓" : "全仓"}`,
     },
     summary: {
       status: "待启动",
-      detail: "当前只是组合草稿，保存并启动后才会变成真实执行状态",
+      detail: summaryDetail,
       exposureTotal: "0",
       floatingPnl: "0",
       floatingPnlPct: "0",
-      riskLabel: `现货 ${formatMoney(perSpotBudget)}U / ${formatMoney(perSpotCap)}U · 永续 ${formatMoney(perSwapContracts)} 张 · ${formatStrategyMode(normalized.swapStrategyMode)}`,
+      riskLabel: isBasisArb
+        ? `现货多 + 永续空 · 入场 ${target.arbEntrySpreadPct}% · 回补 ${target.arbExitSpreadPct}% · 最长 ${target.arbMaxHoldMinutes} 分钟`
+        : `现货 ${formatMoney(perSpotBudget)}U / ${formatMoney(perSpotCap)}U · 永续 ${formatMoney(perSwapContracts)} 张 · ${formatStrategyMode(target.swapStrategyMode)}`,
     },
-  }));
+  };
+  });
 }
 
 function inferEnvPreset(envPreset, baseUrl, simulated) {
@@ -414,6 +729,7 @@ function setPendingEnvironmentUi() {
   if ($("portfolio-context-sub")) $("portfolio-context-sub").textContent = "正在同步每个币的独立决策、风控和仓位摘要";
   if ($("rail-strategy-apply")) $("rail-strategy-apply").textContent = "等待应用";
   if ($("rail-strategy-pnl")) $("rail-strategy-pnl").textContent = "--";
+  if ($("rail-strategy-status-sub")) $("rail-strategy-status-sub").textContent = "正在同步当前环境与策略状态";
   document.querySelectorAll("[data-env-preset]").forEach((button) => {
     button.classList.remove("active");
   });
@@ -450,6 +766,7 @@ function syncRailStrategyButtons() {
   const runOnce = $("rail-run-automation-once");
   const stop = $("rail-stop-automation");
   const save = $("rail-save-automation");
+  const toggle = $("rail-strategy-toggle");
 
   if (save) {
     save.disabled = Boolean(dashboardState.configSaving || dashboardState.configTesting);
@@ -465,6 +782,12 @@ function syncRailStrategyButtons() {
   if (stop) {
     stop.disabled = !running;
     stop.title = running ? "" : "当前策略未运行";
+  }
+  if (toggle) {
+    toggle.disabled = !running && blocked;
+    toggle.title = !running && blocked ? (dashboardState.routeHealth?.summary || "当前实盘链路不可用") : "";
+    toggle.textContent = running ? "停止" : "启动";
+    toggle.className = running ? "btn rail-strategy-toggle-stop" : "btn btn-primary";
   }
 }
 
@@ -489,11 +812,18 @@ function renderRailStrategyControls() {
   const state = $("rail-strategy-state");
   const pill = $("rail-strategy-pill");
   const meta = $("rail-strategy-meta");
+  const statusSub = $("rail-strategy-status-sub");
   const watchlistLabel = $("rail-strategy-watchlist");
   const guard = $("rail-strategy-guard");
+  const summaryText = running
+    ? `${env.label} · 自动量化运行中`
+    : (automation?.stopReason || automation?.lastError || `${env.label} · 当前待机`);
 
   if (state) {
     state.textContent = running ? "策略运行中" : "策略待机";
+  }
+  if (statusSub) {
+    statusSub.textContent = summaryText;
   }
   if (meta) {
     meta.textContent = `${$("active-strategy-label")?.textContent || "策略未设置"} · ${env.label}`;
@@ -1094,6 +1424,36 @@ function buildGridMarkup(width, height, left, right, top, bottom, min, max, form
   }).join("");
 }
 
+function bindCurveAutoFollow(shell) {
+  if (!shell || shell.dataset.followBound === "1") return;
+  shell.dataset.followBound = "1";
+  shell.dataset.autoFollow = "1";
+  shell.addEventListener("scroll", () => {
+    const tailGap = Math.max(shell.scrollWidth - shell.clientWidth - shell.scrollLeft, 0);
+    shell.dataset.autoFollow = tailGap <= 24 ? "1" : "0";
+  });
+}
+
+function computeCurveRenderWidth(sampleCount, shell, baseWidth, stepWidth, paddingX) {
+  const visibleWidth = Math.max(shell?.clientWidth || 0, baseWidth);
+  if (sampleCount <= 1) return visibleWidth;
+  return Math.max(visibleWidth, paddingX * 2 + (sampleCount - 1) * stepWidth);
+}
+
+function applyCurveViewport(svg, renderWidth, renderHeight) {
+  if (!svg) return;
+  svg.setAttribute("viewBox", `0 0 ${renderWidth} ${renderHeight}`);
+  svg.style.width = `${renderWidth}px`;
+  const shell = svg.parentElement;
+  if (!shell) return;
+  bindCurveAutoFollow(shell);
+  requestAnimationFrame(() => {
+    if (shell.dataset.autoFollow !== "0") {
+      shell.scrollLeft = Math.max(shell.scrollWidth - shell.clientWidth, 0);
+    }
+  });
+}
+
 function renderEquityCurve(curve) {
   const svg = $("equity-curve");
   const dockSvg = $("dock-equity-curve");
@@ -1119,9 +1479,11 @@ function renderEquityCurve(curve) {
       </text>
     `;
     if (svg) {
+      applyCurveViewport(svg, 960, 220);
       svg.innerHTML = emptyMarkup;
     }
     if (dockSvg) {
+      applyCurveViewport(dockSvg, 960, 130);
       dockSvg.innerHTML = `
         <rect x="0" y="0" width="960" height="130" rx="14" fill="rgba(255,255,255,0.015)"></rect>
         <line x1="30" y1="44" x2="930" y2="44" stroke="rgba(255,255,255,0.06)" stroke-dasharray="5 8"></line>
@@ -1146,7 +1508,7 @@ function renderEquityCurve(curve) {
     return;
   }
 
-  const width = 960;
+  const width = computeCurveRenderWidth(samples.length, svg?.parentElement, 960, 38, 18);
   const height = 220;
   const paddingX = 18;
   const paddingY = 16;
@@ -1175,6 +1537,8 @@ function renderEquityCurve(curve) {
   const peakPoint = points[peakIndex];
   const troughPoint = points[troughIndex];
   const gridMarkup = buildGridMarkup(width, height, paddingX, width - paddingX, paddingY, mainBottom, min, max, formatMoney, true);
+
+  applyCurveViewport(svg, width, height);
 
   if (svg) {
     svg.innerHTML = `
@@ -1226,8 +1590,9 @@ function renderEquityCurve(curve) {
     const dockHeight = 130;
     const dockPaddingX = 14;
     const dockPaddingY = 12;
+    const dockWidth = computeCurveRenderWidth(samples.length, dockSvg.parentElement, 960, 26, dockPaddingX);
     const dockBottom = dockHeight - dockPaddingY;
-    const dockStep = samples.length > 1 ? (width - dockPaddingX * 2) / (samples.length - 1) : 0;
+    const dockStep = samples.length > 1 ? (dockWidth - dockPaddingX * 2) / (samples.length - 1) : 0;
     const dockPoints = samples.map((point, index) => {
       const x = dockPaddingX + dockStep * index;
       const y = dockBottom - ((point.eq - min) / span) * (dockHeight - dockPaddingY * 2);
@@ -1236,7 +1601,8 @@ function renderEquityCurve(curve) {
     const dockLinePath = buildSmoothPath(dockPoints);
     const dockAreaPath = buildAreaPath(dockPoints, dockBottom);
     const dockLatestPoint = dockPoints[dockPoints.length - 1];
-    const dockGridMarkup = buildGridMarkup(width, dockHeight, dockPaddingX, width - dockPaddingX, dockPaddingY, dockBottom, min, max, formatMoney, false);
+    const dockGridMarkup = buildGridMarkup(dockWidth, dockHeight, dockPaddingX, dockWidth - dockPaddingX, dockPaddingY, dockBottom, min, max, formatMoney, false);
+    applyCurveViewport(dockSvg, dockWidth, dockHeight);
     dockSvg.innerHTML = `
       <defs>
         <linearGradient id="equityFillDock" x1="0" y1="0" x2="0" y2="1">
@@ -1248,7 +1614,7 @@ function renderEquityCurve(curve) {
           <stop offset="100%" stop-color="${up ? "#45d6c4" : "#ff6b6b"}"></stop>
         </linearGradient>
       </defs>
-      <rect x="0" y="0" width="960" height="${dockHeight}" rx="14" fill="rgba(255,255,255,0.015)"></rect>
+      <rect x="0" y="0" width="${dockWidth}" height="${dockHeight}" rx="14" fill="rgba(255,255,255,0.015)"></rect>
       ${dockGridMarkup}
       <path d="${dockAreaPath}" fill="url(#equityFillDock)" stroke="none"></path>
       <path d="${dockLinePath}" fill="none" stroke="url(#equityStrokeDock)" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round"></path>
@@ -1313,6 +1679,12 @@ function renderDeskGuards() {
 
 function renderAnalysisState(analysis) {
   const data = analysis || {};
+  const isBasisArb = data.selectedStrategyName?.includes("高频套利");
+  const isDipSwing =
+    data.selectedStrategyName?.includes("波段") ||
+    data.selectedStrategyDetail?.includes("回踩接多") ||
+    data.research?.mode === "dip_swing";
+  const marketTopCandidates = Array.isArray(data.marketTopCandidates) ? data.marketTopCandidates : [];
   $("analysis-decision").textContent =
     data.decisionLabel
       ? `${data.decisionLabel}${data.selectedScore ? ` · 分数 ${data.selectedScore}` : ""}`
@@ -1323,14 +1695,52 @@ function renderAnalysisState(analysis) {
       : "先联网分析，再给出本轮最优策略";
   $("analysis-market").textContent =
     data.marketRegime
-      ? `${data.marketRegime} · 现货 ${data.spotTrend || "--"} · 永续 ${data.swapTrend || "--"}`
+      ? (
+        isBasisArb
+          ? [
+            data.marketRegime,
+            `watchlist 可做 ${data.candidateCount || 0}`,
+            `市场候选 ${data.marketCandidateCount || 0}`,
+            `反向 ${data.reverseBasisCount || 0}`,
+            data.marketFundingBlockedCount ? `资金费阻断 ${data.marketFundingBlockedCount}` : "",
+          ].filter(Boolean).join(" · ")
+          : isDipSwing
+            ? [
+              data.marketRegime,
+              `回撤 ${data.pullbackPct || "--"}%`,
+              `反弹 ${data.reboundPct || "--"}%`,
+              data.liquidationBufferPct ? `强平缓冲 ${data.liquidationBufferPct}%` : "",
+            ].filter(Boolean).join(" · ")
+          : `${data.marketRegime} · 现货 ${data.spotTrend || "--"} · 永续 ${data.swapTrend || "--"}`
+      )
       : "等待波动、价差、资金费和趋势分析";
   $("analysis-refresh").textContent =
     data.lastAnalyzedAt
-      ? `${data.lastAnalyzedAt} · 波动 ${data.volatilityPct || "--"}% · 价差 ${data.spreadPct || "--"}% · 资金费 ${data.fundingRatePct || "--"}%`
+      ? (
+        isBasisArb
+          ? [
+            data.lastAnalyzedAt,
+            `当前币 ${data.selectedWatchlistSymbol || "--"}`,
+            `入场价差 ${data.entrySpreadPct || "--"}%`,
+            `回补价差 ${data.closeSpreadPct || "--"}%`,
+            `资金费 ${data.fundingRatePct || "--"}%`,
+            data.marketScanCount ? `已扫 ${data.marketScanCount} 币` : "",
+          ].filter(Boolean).join(" · ")
+          : isDipSwing
+            ? [
+              data.lastAnalyzedAt,
+              `资金费 ${data.fundingRatePct || "--"}%`,
+              data.basisPct ? `基差 ${data.basisPct}%` : "",
+              data.liquidationPrice ? `强平价 ${data.liquidationPrice}` : "",
+            ].filter(Boolean).join(" · ")
+          : `${data.lastAnalyzedAt} · 波动 ${data.volatilityPct || "--"}% · 价差 ${data.spreadPct || "--"}% · 资金费 ${data.fundingRatePct || "--"}%`
+      )
       : "等待最新分析时间";
   const reasonBits = [];
   if (data.summary) reasonBits.push(data.summary);
+  if (isBasisArb && marketTopCandidates.length) {
+    reasonBits.push(`市场候选: ${marketTopCandidates.map((item) => `${item.symbol} ${item.entrySpreadPct}% / 费 ${item.fundingRatePct}%`).join("；")}`);
+  }
   if (data.blockers?.length) reasonBits.push(`阻断: ${data.blockers.join("；")}`);
   else if (data.warnings?.length) reasonBits.push(`提醒: ${data.warnings.join("；")}`);
   $("analysis-reason").textContent =
@@ -1364,13 +1774,89 @@ function renderAnalysisState(analysis) {
   if (dockSub) {
     const dockSummaryBits = [];
     if (data.marketRegime) dockSummaryBits.push(data.marketRegime);
-    if (data.volatilityPct) dockSummaryBits.push(`波动 ${data.volatilityPct}%`);
+    if (!isBasisArb && data.volatilityPct) dockSummaryBits.push(`波动 ${data.volatilityPct}%`);
+    if (isBasisArb && data.entrySpreadPct) dockSummaryBits.push(`入场 ${data.entrySpreadPct}%`);
+    if (isBasisArb && data.closeSpreadPct) dockSummaryBits.push(`回补 ${data.closeSpreadPct}%`);
     if (data.fundingRatePct) dockSummaryBits.push(`资金费 ${data.fundingRatePct}%`);
     if (data.selectedReturnPct) dockSummaryBits.push(`收益 ${formatPercentValue(data.selectedReturnPct)}`);
     if (data.blockers?.length) dockSummaryBits.push(`阻断 ${data.blockers[0]}`);
     else if (data.warnings?.length) dockSummaryBits.push(`提醒 ${data.warnings[0]}`);
     dockSub.textContent = dockSummaryBits.join(" · ") || "顶部固定显示当前策略、联网判断和执行环境。";
   }
+}
+
+function extractAutomationStopReason(statusText = "", lastError = "") {
+  const rawStatus = String(statusText || "").trim();
+  const rawError = String(lastError || "").trim();
+  const trimmedStatus = rawStatus
+    .replace(/^自动量化已停止[:：]?\s*/, "")
+    .replace(/^组合策略已停止[:：]?\s*/, "")
+    .replace(/^已停止[:：]?\s*/, "")
+    .trim();
+  if (rawError && rawError !== rawStatus) return rawError;
+  if (trimmedStatus && trimmedStatus !== rawStatus) return trimmedStatus;
+  return rawError || trimmedStatus || rawStatus;
+}
+
+function deriveDeskModePresentation(automation = {}, modeText = "模拟盘") {
+  const statusText = String(automation.statusText || "").trim();
+  const modeDetail = String(automation.modeText || "").trim();
+  const running = Boolean(automation.running);
+  const consecutiveErrors = Number(automation.consecutiveErrors || 0);
+  const stopReason = extractAutomationStopReason(statusText, automation.lastError);
+  const hasHardStop = !running && (
+    consecutiveErrors > 0
+    || /连续错误过多|错误|失败|异常/.test(statusText)
+    || /连续错误过多|错误|失败|异常/.test(stopReason)
+  );
+
+  if (hasHardStop) {
+    return {
+      tone: "danger",
+      title: "自动量化已停机",
+      sub: `${modeText} · ${modeDetail || "组合交易执行已暂停"}`,
+      alert: {
+        eyebrow: "需要处理",
+        main: /连续错误过多/.test(`${statusText} ${stopReason}`)
+          ? "连续错误过多，系统已自动熔断"
+          : "最近一轮执行失败，系统已停止",
+        sub: stopReason && stopReason !== statusText
+          ? stopReason
+          : (consecutiveErrors > 0
+            ? `最近已连续报错 ${consecutiveErrors} 次，请先处理后再重启。`
+            : "当前组合已自动暂停，请先处理最近一次错误。"),
+      },
+    };
+  }
+
+  if (!running && /已停止|已手动停止/.test(statusText)) {
+    return {
+      tone: "warn",
+      title: "自动量化已暂停",
+      sub: `${modeText} · ${modeDetail || "组合交易未运行"}`,
+      alert: {
+        eyebrow: "当前待机",
+        main: extractAutomationStopReason(statusText, "") || "已手动停止",
+        sub: "仓位摘要和收益会继续展示，但不会再自动发单。",
+      },
+    };
+  }
+
+  if (running) {
+    return {
+      tone: "ok",
+      title: `${modeText} · 自动量化运行中`,
+      sub: modeDetail || "组合交易正在轮询、独立决策与风控。",
+      alert: null,
+    };
+  }
+
+  return {
+    tone: "idle",
+    title: `${modeText} · ${statusText || "未启动"}`,
+    sub: modeDetail || "模拟 / 实盘 + 策略状态",
+    alert: null,
+  };
 }
 
 function renderDeskOverview() {
@@ -1395,17 +1881,27 @@ function renderDeskOverview() {
   const pollSeconds = Number($("autoPollSeconds").value || 0);
   const cycleDurationMs = Number(automation.lastCycleDurationMs || 0);
   const modeText = $("simulated").value === "true" ? "模拟盘" : "实盘";
+  const modePresentation = deriveDeskModePresentation(automation, modeText);
   const dockPnlMain = $("dock-pnl-main");
   const dockPnlSub = $("dock-pnl-sub");
   const minerDailyUsd = Number(minerProgress.dailyUsd || 0);
   const railBalanceMain = $("rail-balance-main");
   const railBalanceSub = $("rail-balance-sub");
+  const railBalanceTarget = $("rail-balance-target");
+  const railBalanceProgress = $("rail-balance-progress");
   const railMinerMain = $("rail-miner-main");
   const railMinerSub = $("rail-miner-sub");
   const balanceBreakdown = summary.displayBreakdown
     || (fundingTotalEq > 0
       ? `资金账户 ${formatMoney(fundingTotalEq)} USDT · 交易账户 ${formatMoney(tradingTotalEq)} USDT`
       : (tradingTotalEq > 0 ? `交易账户 ${formatMoney(tradingTotalEq)} USDT` : ""));
+  const balanceGoalBase = startEq > 0 ? startEq : totalEq;
+  const stateTargetEq = Number(automation.targetBalanceEq || 0);
+  const stateTargetProgressPct = Number(automation.targetBalanceProgressPct || 0);
+  const balanceTargetEq = stateTargetEq > 0 ? stateTargetEq : (balanceGoalBase > 0 ? balanceGoalBase * 10 : 0);
+  const balanceTargetProgressPct = stateTargetEq > 0
+    ? stateTargetProgressPct
+    : (balanceTargetEq > 0 ? (totalEq / balanceTargetEq) * 100 : 0);
 
   $("desk-total-equity").textContent = totalEq > 0 ? `${formatMoney(totalEq)} USDT` : "--";
   $("desk-total-equity-sub").textContent =
@@ -1441,8 +1937,30 @@ function renderDeskOverview() {
     ? `上一轮耗时 ${cycleDurationMs} ms`
     : "等待第一轮执行完成";
 
-  $("desk-mode").textContent = `${modeText} · ${automation.statusText || "未启动"}`;
-  $("desk-mode-sub").textContent = automation.modeText || "模拟 / 实盘 + 策略状态";
+  $("desk-mode").textContent = modePresentation.title;
+  $("desk-mode-sub").textContent = modePresentation.sub;
+  const deskModeCard = $("desk-mode-card");
+  if (deskModeCard) {
+    deskModeCard.classList.remove("danger", "warn", "ok", "idle");
+    deskModeCard.classList.add(modePresentation.tone || "idle");
+  }
+  const deskModeAlert = $("desk-mode-alert");
+  const deskModeAlertEyebrow = $("desk-mode-alert-eyebrow");
+  const deskModeAlertMain = $("desk-mode-alert-main");
+  const deskModeAlertSub = $("desk-mode-alert-sub");
+  if (deskModeAlert && deskModeAlertEyebrow && deskModeAlertMain && deskModeAlertSub) {
+    if (modePresentation.alert) {
+      deskModeAlert.classList.remove("hidden");
+      deskModeAlertEyebrow.textContent = modePresentation.alert.eyebrow || "需要处理";
+      deskModeAlertMain.textContent = modePresentation.alert.main || "";
+      deskModeAlertSub.textContent = modePresentation.alert.sub || "";
+    } else {
+      deskModeAlert.classList.add("hidden");
+      deskModeAlertEyebrow.textContent = "";
+      deskModeAlertMain.textContent = "";
+      deskModeAlertSub.textContent = "";
+    }
+  }
 
   const blockHeight = minerNetwork.tipHeight || "--";
   const fastFee = minerFees.fastestFee;
@@ -1463,6 +1981,16 @@ function renderDeskOverview() {
     railBalanceSub.textContent = balanceBreakdown || (totalEq > 0
       ? `USDT · 调整后 ${formatMoney(Number(summary.adjEq || totalEq))}`
       : "USDT");
+  }
+  if (railBalanceTarget) {
+    railBalanceTarget.textContent = balanceTargetEq > 0
+      ? `目标 ${formatMoney(balanceTargetEq)} USDT`
+      : "目标等待余额";
+  }
+  if (railBalanceProgress) {
+    railBalanceProgress.textContent = balanceTargetEq > 0
+      ? `进度 ${formatPercentValue(balanceTargetProgressPct)}`
+      : "进度 0%";
   }
   if (railMinerMain) {
     railMinerMain.textContent = formatMoney(minerDailyUsd || 0);
@@ -2292,11 +2820,14 @@ function collectPublicConfigForAnalysis() {
 }
 
 function collectAutomationConfig() {
+  syncWatchlistOverridesValueFromEditor();
+  const strategyPreset = ONLY_STRATEGY_PRESET;
   return {
-    strategyPreset: $("autoStrategyPreset").value || "dual_engine",
+    strategyPreset,
     spotInstId: $("spotInstId").value.trim(),
     swapInstId: $("swapInstId").value.trim(),
     watchlistSymbols: $("autoWatchlistSymbols").value.trim(),
+    watchlistOverrides: $("autoWatchlistOverrides").value.trim(),
     bar: $("autoBar").value,
     fastEma: Number($("autoFastEma").value || 9),
     slowEma: Number($("autoSlowEma").value || 21),
@@ -2314,6 +2845,12 @@ function collectAutomationConfig() {
     stopLossPct: $("autoStopLossPct").value.trim(),
     takeProfitPct: $("autoTakeProfitPct").value.trim(),
     maxDailyLossPct: $("autoMaxDailyLossPct").value.trim(),
+    targetBalanceMultiple: "10",
+    arbEntrySpreadPct: $("autoArbEntrySpreadPct")?.value.trim() || "0.18",
+    arbExitSpreadPct: $("autoArbExitSpreadPct")?.value.trim() || "0.05",
+    arbMinFundingRatePct: $("autoArbMinFundingRatePct")?.value.trim() || "0.005",
+    arbMaxHoldMinutes: Number($("autoArbMaxHoldMinutes")?.value || 180),
+    arbRequireFundingAlignment: $("autoArbRequireFundingAlignment")?.checked ?? true,
     autostart: $("autoAutostart").checked,
     allowLiveManualOrders: $("autoAllowLiveManualOrders").checked,
     allowLiveTrading: $("autoAllowLiveTrading").checked,
@@ -2351,44 +2888,62 @@ function collectMinerConfig() {
   };
 }
 
-function setStrategyPresetUi(presetKey) {
-  const preset = STRATEGY_PRESETS[presetKey] || STRATEGY_PRESETS.dual_engine;
-  $("autoStrategyPreset").value = presetKey in STRATEGY_PRESETS ? presetKey : "dual_engine";
-  $("active-strategy-label").textContent = preset.label;
-  $("active-strategy-description").textContent = preset.description;
-  document.querySelectorAll("[data-strategy-preset]").forEach((button) => {
-    button.classList.toggle("active", button.dataset.strategyPreset === $("autoStrategyPreset").value);
+function toggleArbitrageConfigVisibility(presetKey = $("autoStrategyPreset")?.value || ONLY_STRATEGY_PRESET) {
+  document.querySelectorAll("[data-arb-only]").forEach((node) => {
+    node.classList.add("hidden");
   });
 }
 
+function setStrategyPresetUi(presetKey) {
+  const lockedPresetKey = ONLY_STRATEGY_PRESET;
+  const preset = STRATEGY_PRESETS[lockedPresetKey];
+  $("autoStrategyPreset").value = lockedPresetKey;
+  $("active-strategy-label").textContent = preset.label;
+  $("active-strategy-description").textContent = preset.description;
+  document.querySelectorAll("[data-strategy-preset]").forEach((button) => {
+    button.classList.toggle("active", button.dataset.strategyPreset === lockedPresetKey);
+  });
+  toggleArbitrageConfigVisibility(lockedPresetKey);
+}
+
 function fillAutomationForm(config) {
-  $("autoStrategyPreset").value = config.strategyPreset || "dual_engine";
+  $("autoStrategyPreset").value = ONLY_STRATEGY_PRESET;
   $("spotInstId").value = config.spotInstId || "BTC-USDT";
   $("swapInstId").value = config.swapInstId || "BTC-USDT-SWAP";
   $("autoWatchlistSymbols").value = config.watchlistSymbols || (config.spotInstId || "BTC-USDT").split("-")[0];
-  $("autoBar").value = config.bar || "5m";
-  $("autoFastEma").value = config.fastEma ?? 9;
-  $("autoSlowEma").value = config.slowEma ?? 21;
-  $("autoPollSeconds").value = config.pollSeconds ?? 20;
-  $("autoCooldownSeconds").value = config.cooldownSeconds ?? 180;
-  $("autoMaxOrdersPerDay").value = config.maxOrdersPerDay ?? 20;
-  $("autoSpotEnabled").checked = Boolean(config.spotEnabled);
-  $("autoSpotQuoteBudget").value = config.spotQuoteBudget ?? "100";
-  $("autoSpotMaxExposure").value = config.spotMaxExposure ?? "300";
-  $("autoSwapEnabled").checked = Boolean(config.swapEnabled);
+  $("autoWatchlistOverrides").value = serializeWatchlistOverrides(
+    config.watchlistOverrides,
+    parseWatchlistSymbols(config.watchlistSymbols, config.spotInstId || "BTC-USDT", config.swapInstId || "BTC-USDT-SWAP")
+  );
+  renderWatchlistOverrideEditor($("autoWatchlistOverrides").value);
+  $("autoBar").value = config.bar || "15m";
+  $("autoFastEma").value = config.fastEma ?? 12;
+  $("autoSlowEma").value = config.slowEma ?? 48;
+  $("autoPollSeconds").value = config.pollSeconds ?? 8;
+  $("autoCooldownSeconds").value = config.cooldownSeconds ?? 45;
+  $("autoMaxOrdersPerDay").value = config.maxOrdersPerDay ?? 0;
+  $("autoSpotEnabled").checked = false;
+  $("autoSpotQuoteBudget").value = "0";
+  $("autoSpotMaxExposure").value = "0";
+  $("autoSwapEnabled").checked = true;
   $("autoSwapContracts").value = config.swapContracts ?? "1";
-  $("autoSwapTdMode").value = config.swapTdMode || "cross";
-  $("autoSwapStrategyMode").value = config.swapStrategyMode || "trend_follow";
-  $("autoSwapLeverage").value = config.swapLeverage ?? "5";
+  $("autoSwapTdMode").value = "isolated";
+  $("autoSwapStrategyMode").value = "long_only";
+  $("autoSwapLeverage").value = config.swapLeverage ?? "10";
   $("autoStopLossPct").value = config.stopLossPct ?? "1.2";
-  $("autoTakeProfitPct").value = config.takeProfitPct ?? "2.4";
-  $("autoMaxDailyLossPct").value = config.maxDailyLossPct ?? "3.0";
+  $("autoTakeProfitPct").value = config.takeProfitPct ?? "8";
+  $("autoMaxDailyLossPct").value = config.maxDailyLossPct ?? "0.8";
+  if ($("autoArbEntrySpreadPct")) $("autoArbEntrySpreadPct").value = config.arbEntrySpreadPct ?? "0.18";
+  if ($("autoArbExitSpreadPct")) $("autoArbExitSpreadPct").value = config.arbExitSpreadPct ?? "0.05";
+  if ($("autoArbMinFundingRatePct")) $("autoArbMinFundingRatePct").value = config.arbMinFundingRatePct ?? "0.005";
+  if ($("autoArbMaxHoldMinutes")) $("autoArbMaxHoldMinutes").value = config.arbMaxHoldMinutes ?? 180;
+  if ($("autoArbRequireFundingAlignment")) $("autoArbRequireFundingAlignment").checked = config.arbRequireFundingAlignment !== false;
   $("autoAutostart").checked = Boolean(config.autostart);
   $("autoAllowLiveManualOrders").checked = Boolean(config.allowLiveManualOrders);
   $("autoAllowLiveTrading").checked = Boolean(config.allowLiveTrading);
   $("autoAllowLiveAutostart").checked = Boolean(config.allowLiveAutostart);
   $("autoEnforceNetMode").checked = config.enforceNetMode !== false;
-  setStrategyPresetUi(config.strategyPreset || "dual_engine");
+  setStrategyPresetUi(ONLY_STRATEGY_PRESET);
   syncRailAutomationToggles();
   updateQuickState();
   renderDeskGuards();
@@ -2413,7 +2968,7 @@ function fillMinerForm(config) {
 }
 
 function applyStrategyPreset(presetKey, { announce = true, refresh = false } = {}) {
-  const preset = STRATEGY_PRESETS[presetKey];
+  const preset = STRATEGY_PRESETS[ONLY_STRATEGY_PRESET];
   if (!preset) return;
   fillAutomationForm({ ...collectAutomationConfig(), ...preset.config });
   if (announce) {
@@ -2484,6 +3039,31 @@ function getOrderSideLabel(order) {
   return `${side}${posSide}${tdMode}`;
 }
 
+function getOrderArbPhase(order) {
+  const action = String(order?.strategyAction || "").trim().toLowerCase();
+  if (["entry", "hedge", "exit", "cover", "rollback"].includes(action)) {
+    return action === "cover" ? "exit" : action;
+  }
+  const tag = String(order?.strategyTag || order?.tag || "").trim().toLowerCase();
+  if (!tag.startsWith("arb_")) return "";
+  if (tag.includes("entry")) return "entry";
+  if (tag.includes("hedge")) return "hedge";
+  if (tag.includes("cover") || tag.includes("exit")) return "exit";
+  if (tag.includes("rollback") || tag.endsWith("_rb")) return "rollback";
+  return "arb";
+}
+
+function getOrderArbPhaseLabel(phase) {
+  const labels = {
+    entry: "现货开腿",
+    hedge: "永续对冲",
+    exit: "套利退场",
+    rollback: "回滚处理",
+    arb: "套利动作",
+  };
+  return labels[phase] || "普通订单";
+}
+
 function formatOrderTime(value) {
   const num = Number(value);
   if (!Number.isFinite(num) || num <= 0) return "--";
@@ -2542,6 +3122,127 @@ function getOrderCurrentPrice(order, account = dashboardState.account || {}) {
   return 0;
 }
 
+function getSpotOrderHolding(order, account = dashboardState.account || {}) {
+  const instId = String(order?.instId || "");
+  const baseCcy = instId.split("-")[0] || "";
+  if (!baseCcy) {
+    return { baseCcy: "", quantity: 0 };
+  }
+  const balanceRows = [...(account.tradingBalances || []), ...(account.balances || [])];
+  const baseBalance = balanceRows.find((row) => String(row.ccy || "").toUpperCase() === baseCcy.toUpperCase());
+  return {
+    baseCcy,
+    quantity: toOrderNumber(baseBalance?.eq || baseBalance?.cashBal || baseBalance?.availBal),
+  };
+}
+
+function buildOrderLifecycleContext(order, meta = {}) {
+  const account = dashboardState.account || {};
+  const state = String(order?.state || "");
+  const filledSize = toOrderNumber(order?.accFillSz || order?.fillSz || order?.sz);
+  const side = String(order?.side || "").toLowerCase();
+  const hasExplicitPnl = ["realizedPnl", "fillPnl", "pnl"].some(
+    (key) => order?.[key] !== undefined && order?.[key] !== null && order?.[key] !== ""
+  );
+
+  if (state === "partially_filled" && filledSize > 0) {
+    return {
+      title: "当前状态",
+      valueText: "部分成交",
+      toneClass: "pnl-muted",
+      scopeText: "订单还没完全成交完",
+      detailText: "这笔单已经成交了一部分，但还没有完整结束，所以仓位和最终收益都还在变化。",
+      noteText: "等它完全成交、撤单或结束后，这里会再明确告诉你现在到底是持仓中还是已离场。",
+    };
+  }
+
+  if (state !== "filled" || filledSize <= 0) {
+    return {
+      title: "当前状态",
+      valueText: "待成交",
+      toneClass: "pnl-muted",
+      scopeText: "订单还没形成最终仓位",
+      detailText: "这笔单还没有完成成交，所以现在谈不上持仓还是已卖出/已平仓。",
+      noteText: "等成交后，这里会直接告诉你当前还有没有同标的仓位。",
+    };
+  }
+
+  if (isSwapOrder(order)) {
+    const position = (account.positions || []).find(
+      (item) => item.instId === order.instId && Math.abs(toOrderNumber(item.pos)) > 0
+    );
+    if (position) {
+      const pos = toOrderNumber(position.pos);
+      return {
+        title: "当前状态",
+        valueText: "持仓中",
+        toneClass: "pnl-positive",
+        scopeText: `同合约当前仍有 ${formatOrderValue(pos)} 张仓位`,
+        detailText: "这笔合约单成交后，当前同合约还有活跃仓位，所以它不是已卖出/已平仓。",
+        noteText: "收益金额优先看下面的持仓浮动；那代表当前整笔仓位还没锁定的盈亏。",
+      };
+    }
+    return {
+      title: "当前状态",
+      valueText: hasExplicitPnl ? "已平仓" : "当前无仓",
+      toneClass: "pnl-muted",
+      scopeText: "当前同合约没有活跃仓位",
+      detailText: hasExplicitPnl
+        ? "这笔合约单已经离场，交易所也回了已实现收益。"
+        : "这笔合约单已经成交，但当前同合约没有仓位；通常说明已经平仓或离场了。",
+      noteText: meta?.source === "local_cache"
+        ? "这是本地恢复出来的订单记录，仓位判断以当前账户快照为准。"
+        : "如果你想确认最终赚亏多少，看交易所回报里的已实现收益；如果没有回，就只能确认它现在已经不在持仓里了。",
+    };
+  }
+
+  const holding = getSpotOrderHolding(order, account);
+  if (side === "buy") {
+    if (holding.quantity > 0) {
+      return {
+        title: "当前状态",
+        valueText: "持币中",
+        toneClass: "pnl-positive",
+        scopeText: `当前账户约有 ${formatOrderValue(holding.quantity)} ${holding.baseCcy || ""}`.trim(),
+        detailText: "这笔现货买单成交后，当前账户里还有这枚币，说明它还没有全部卖掉。",
+        noteText: "收益金额会按当前现价估算，这还是浮动收益，不是最终已实现收益。",
+      };
+    }
+    return {
+      title: "当前状态",
+      valueText: "当前无币",
+      toneClass: "pnl-muted",
+      scopeText: `当前账户没有明显 ${holding.baseCcy || "该币"} 持仓`,
+      detailText: "这笔现货买单成交后，目前账户里已经看不到这枚币；通常说明后来已经卖出或转走。",
+      noteText: "如果你要精确已实现收益，仍然需要这笔买入对应的卖出成本口径。",
+    };
+  }
+
+  if (side === "sell") {
+    return {
+      title: "当前状态",
+      valueText: holding.quantity > 0 ? "已卖出 · 仍有余仓" : "已卖出",
+      toneClass: "pnl-muted",
+      scopeText: holding.quantity > 0
+        ? `卖出后当前账户还剩 ${formatOrderValue(holding.quantity)} ${holding.baseCcy || ""}`.trim()
+        : "卖出后当前账户已无这枚币",
+      detailText: holding.quantity > 0
+        ? "这笔卖单已经成交，但账户里还有同币余仓，所以它不是彻底清仓。"
+        : "这笔卖单已经成交，而且当前账户里没有这枚币，说明它已经卖出了。",
+      noteText: "单看卖单仍然不能直接算最终收益，需要结合对应买入成本。",
+    };
+  }
+
+  return {
+    title: "当前状态",
+    valueText: "待判断",
+    toneClass: "pnl-muted",
+    scopeText: "当前口径不足",
+    detailText: "这笔订单已经成交，但当前上下文还不足以判断它现在到底是持仓还是已离场。",
+    noteText: "等账户持仓或交易所成交回报更完整后，这里会自动变得更明确。",
+  };
+}
+
 function buildOrderPnlContext(order, meta = {}) {
   const account = dashboardState.account || {};
   const fillPrice = toOrderNumber(order?.avgPx || order?.fillPx || order?.px);
@@ -2593,15 +3294,15 @@ function buildOrderPnlContext(order, meta = {}) {
       };
     }
     return {
-      title: "收益状态",
-      valueText: "待持仓",
+      title: "收益金额",
+      valueText: "待回报",
       toneClass: "pnl-muted",
-      scopeText: "需结合当前持仓或平仓结果",
+      scopeText: "当前无同合约持仓",
       currentPriceText: currentPrice > 0 ? formatOrderValue(currentPrice) : "--",
-      detailText: "这是一笔合约成交，但当前拿不到可直接归因到这笔单的已实现收益。",
+      detailText: "这是一笔合约成交，当前同合约已经没有持仓；通常说明它已经平仓/离场，但交易所还没把已实现收益直接回到这笔订单里。",
       noteText: meta?.source === "local_cache"
-        ? "当前是本地恢复出来的订单记录，优先把它当成成交痕迹；精确收益请看交易所回报或当前持仓。"
-        : "如果这笔单已经平仓，请优先看交易所回报里的 realized PnL；如果仍持仓，请看相关持仓未实现收益。",
+        ? "当前是本地恢复出来的订单记录，优先把它当成成交痕迹；现在能确定的是当前已经没有同合约仓位。"
+        : "如果交易所稍后回了 realized PnL，这里会直接变成已实现收益；在那之前，只能先明确它现在已经不在持仓里。",
     };
   }
 
@@ -2620,7 +3321,7 @@ function buildOrderPnlContext(order, meta = {}) {
       };
     }
     return {
-      title: "收益状态",
+      title: "收益金额",
       valueText: "待现价",
       toneClass: "pnl-muted",
       scopeText: "等待现价或账户快照",
@@ -2635,7 +3336,7 @@ function buildOrderPnlContext(order, meta = {}) {
       ? `卖出后现价 ${formatOrderValue(currentPrice)}，相对卖出价 ${formatPercentValue(((currentPrice - fillPrice) / fillPrice) * 100)}。`
       : "当前拿不到现价，无法显示卖出后的价格偏移。";
     return {
-      title: "收益状态",
+      title: "收益金额",
       valueText: "待成本口径",
       toneClass: "pnl-muted",
       scopeText: "仅凭卖单无法直接算已实现收益",
@@ -2646,7 +3347,7 @@ function buildOrderPnlContext(order, meta = {}) {
   }
 
   return {
-    title: "收益状态",
+    title: "收益金额",
     valueText: "待判断",
     toneClass: "pnl-muted",
     scopeText: "当前口径不足",
@@ -2688,7 +3389,7 @@ function estimateOrderPnl(order, meta = {}) {
         quality: "position",
       };
     }
-    return { value: null, scope: "待持仓", quality: "unknown" };
+    return { value: null, scope: "当前无仓，待交易所回报", quality: "unknown" };
   }
 
   if (String(order?.side || "").toLowerCase() === "buy" && fillPrice > 0 && filledSize > 0 && currentPrice > 0) {
@@ -2713,8 +3414,31 @@ function groupOrdersBySymbol(orders, meta = {}) {
   });
 
   return Array.from(groups.entries()).map(([symbol, items]) => {
-    const working = items.filter((item) => ["live", "effective", "partially_filled"].includes(item.state)).length;
-    const filled = items.filter((item) => item.state === "filled").length;
+    const executionStats = collectOrderExecutionStats(items);
+    const arbCounts = {
+      total: 0,
+      entry: 0,
+      hedge: 0,
+      exit: 0,
+      rollback: 0,
+    };
+    items.forEach((item) => {
+      const phase = getOrderArbPhase(item);
+      if (!phase) return;
+      arbCounts.total += 1;
+      if (phase === "entry") arbCounts.entry += 1;
+      else if (phase === "hedge") arbCounts.hedge += 1;
+      else if (phase === "exit") arbCounts.exit += 1;
+      else if (phase === "rollback") arbCounts.rollback += 1;
+    });
+    const arbRealizedPnl = items.reduce((sum, item) => {
+      if (!getOrderArbPhase(item)) return sum;
+      return sum + toOrderNumber(item?.pnl || item?.realizedPnl || item?.fillPnl);
+    }, 0);
+    const arbTotalFees = items.reduce((sum, item) => {
+      if (!getOrderArbPhase(item)) return sum;
+      return sum + toOrderNumber(item?.fee);
+    }, 0);
     const estimates = items.map((item) => estimateOrderPnl(item, meta));
     const numeric = estimates.filter((item) => Number.isFinite(item.value));
     const realizedPnl = estimates
@@ -2750,8 +3474,20 @@ function groupOrdersBySymbol(orders, meta = {}) {
     return {
       symbol,
       orders: items.slice().sort((a, b) => Number(b.uTime || b.cTime || 0) - Number(a.uTime || a.cTime || 0)),
-      working,
-      filled,
+      working: executionStats.working,
+      filled: executionStats.filled,
+      riskCount: executionStats.risk,
+      successRate: executionStats.successRate,
+      topCancelReason: executionStats.topCancelReason,
+      latestCancelReason: executionStats.latestCancelReason,
+      arbOrderCount: arbCounts.total,
+      arbEntryOrders: arbCounts.entry,
+      arbHedgeOrders: arbCounts.hedge,
+      arbExitOrders: arbCounts.exit,
+      arbRollbackOrders: arbCounts.rollback,
+      arbRealizedPnl,
+      arbTotalFees,
+      arbNetPnl: arbRealizedPnl + arbTotalFees,
       orderCount: items.length,
       pnlTotal,
       realizedPnl,
@@ -2896,7 +3632,7 @@ function matchesOrderStateFilter(order, filter) {
   const state = String(order?.state || "");
   if (filter === "working") return ["live", "effective", "partially_filled"].includes(state);
   if (filter === "filled") return state === "filled";
-  if (filter === "risk") return ["canceled", "mmp_canceled", "failed", "rejected"].includes(state);
+  if (filter === "risk") return isRiskOrder(order);
   return true;
 }
 
@@ -2905,6 +3641,127 @@ function matchesOrderMarketFilter(order, filter) {
   if (filter === "spot") return instId && !instId.endsWith("-SWAP");
   if (filter === "swap") return instId.endsWith("-SWAP");
   return true;
+}
+
+function isRiskOrder(order) {
+  return ["canceled", "mmp_canceled", "order_failed", "failed", "rejected"].includes(String(order?.state || ""));
+}
+
+function getOrderCancelReason(order) {
+  return String(
+    order?.cancelSourceReason
+      || order?.sMsg
+      || order?.failCodeMsg
+      || order?.msg
+      || ""
+  ).trim();
+}
+
+function summarizeOrderCancelReason(reason) {
+  const text = String(reason || "").trim();
+  if (!text) return "";
+  const lower = text.toLowerCase();
+  if (
+    lower.includes("estimated fill price exceeded the price limit")
+    || lower.includes("slipped beyond the best bid or ask price by at least 5%")
+  ) {
+    return "滑点 / 价格保护触发，交易所取消了这笔单。";
+  }
+  if (lower.includes("insufficient")) return "资金或可用仓位不足。";
+  if (lower.includes("reduce only")) return "仅减仓限制触发。";
+  if (lower.includes("post only")) return "Post Only 条件未满足。";
+  if (lower.includes("risk")) return "交易所风控拦截。";
+  if (text.length > 44) return `${text.slice(0, 44)}...`;
+  return text;
+}
+
+function collectOrderExecutionStats(orders) {
+  const list = orders || [];
+  const working = list.filter((item) => ["live", "effective", "partially_filled"].includes(String(item.state || ""))).length;
+  const filled = list.filter((item) => String(item.state || "") === "filled").length;
+  const risk = list.filter((item) => isRiskOrder(item)).length;
+  const successRate = list.length ? (filled / list.length) * 100 : 0;
+  const reasonCounts = new Map();
+  let latestRiskOrder = null;
+
+  list.forEach((order) => {
+    if (!isRiskOrder(order)) return;
+    const summarized = summarizeOrderCancelReason(getOrderCancelReason(order));
+    if (summarized) {
+      reasonCounts.set(summarized, (reasonCounts.get(summarized) || 0) + 1);
+    }
+    const stamp = Number(order?.uTime || order?.cTime || 0);
+    if (!latestRiskOrder || stamp >= Number(latestRiskOrder?.uTime || latestRiskOrder?.cTime || 0)) {
+      latestRiskOrder = order;
+    }
+  });
+
+  const topCancelReason = Array.from(reasonCounts.entries())
+    .sort((left, right) => right[1] - left[1])[0]?.[0] || "";
+
+  return {
+    total: list.length,
+    working,
+    filled,
+    risk,
+    successRate,
+    topCancelReason,
+    latestCancelReason: summarizeOrderCancelReason(getOrderCancelReason(latestRiskOrder)),
+  };
+}
+
+function buildDerivedOrderJournal(orders, source = "", symbols = []) {
+  const list = Array.isArray(orders) ? orders : [];
+  const stats = collectOrderExecutionStats(list);
+  const canceledOrders = list.filter((item) => String(item?.state || "") === "canceled").length;
+  const rejectedOrders = list.filter((item) => String(item?.state || "") === "rejected").length;
+  const arbCounts = {
+    total: 0,
+    entry: 0,
+    hedge: 0,
+    exit: 0,
+    rollback: 0,
+  };
+  list.forEach((item) => {
+    const phase = getOrderArbPhase(item);
+    if (!phase) return;
+    arbCounts.total += 1;
+    if (phase === "entry") arbCounts.entry += 1;
+    else if (phase === "hedge") arbCounts.hedge += 1;
+    else if (phase === "exit") arbCounts.exit += 1;
+    else if (phase === "rollback") arbCounts.rollback += 1;
+  });
+  const arbRealizedPnl = list.reduce((sum, item) => {
+    if (!getOrderArbPhase(item)) return sum;
+    return sum + toOrderNumber(item?.pnl || item?.realizedPnl || item?.fillPnl);
+  }, 0);
+  const arbTotalFees = list.reduce((sum, item) => {
+    if (!getOrderArbPhase(item)) return sum;
+    return sum + toOrderNumber(item?.fee);
+  }, 0);
+  const latestStamp = list.reduce((latest, item) => {
+    const stamp = Number(item?.uTime || item?.cTime || item?.fillTime || 0);
+    return stamp > latest ? stamp : latest;
+  }, 0);
+  return {
+    totalOrders: stats.total,
+    workingOrders: stats.working,
+    filledOrders: stats.filled,
+    canceledOrders,
+    rejectedOrders,
+    lastCancelReason: stats.latestCancelReason || stats.topCancelReason || "",
+    arbOrderCount: arbCounts.total,
+    arbEntryOrders: arbCounts.entry,
+    arbHedgeOrders: arbCounts.hedge,
+    arbExitOrders: arbCounts.exit,
+    arbRollbackOrders: arbCounts.rollback,
+    arbRealizedPnl,
+    arbTotalFees,
+    arbNetPnl: arbRealizedPnl + arbTotalFees,
+    lastSource: source || "",
+    lastReconciledAt: latestStamp ? String(latestStamp) : "",
+    symbols: Array.isArray(symbols) ? symbols : [],
+  };
 }
 
 function renderOrderTerminalToolbar(groups, hasVisibleGroups = true) {
@@ -3003,6 +3860,20 @@ function renderOrderGlobalSummary(groups) {
   const estimated = groups.reduce((sum, group) => sum + Number(group.estimatedPnl || 0), 0);
   const activeSymbols = groups.length;
   const visibleOrders = groups.reduce((sum, group) => sum + Number(group.orderCount || 0), 0);
+  const journal = dashboardState.orderJournal || buildDerivedOrderJournal(groups.flatMap((group) => group.orders || []), dashboardState.orderFeedMeta?.source || "", dashboardState.orderJournalSymbols || []);
+  const execution = collectOrderExecutionStats(groups.flatMap((group) => group.orders || []));
+  const filledCount = Number(journal.filledOrders ?? execution.filled ?? 0);
+  const riskCount = Number((journal.canceledOrders ?? 0)) + Number((journal.rejectedOrders ?? 0));
+  const totalCount = Number(journal.totalOrders ?? execution.total ?? 0);
+  const arbOrderCount = Number(journal.arbOrderCount ?? groups.reduce((sum, group) => sum + Number(group.arbOrderCount || 0), 0));
+  const arbEntryOrders = Number(journal.arbEntryOrders ?? groups.reduce((sum, group) => sum + Number(group.arbEntryOrders || 0), 0));
+  const arbHedgeOrders = Number(journal.arbHedgeOrders ?? groups.reduce((sum, group) => sum + Number(group.arbHedgeOrders || 0), 0));
+  const arbExitOrders = Number(journal.arbExitOrders ?? groups.reduce((sum, group) => sum + Number(group.arbExitOrders || 0), 0));
+  const arbRollbackOrders = Number(journal.arbRollbackOrders ?? groups.reduce((sum, group) => sum + Number(group.arbRollbackOrders || 0), 0));
+  const arbRealizedPnl = Number(journal.arbRealizedPnl ?? groups.reduce((sum, group) => sum + Number(group.arbRealizedPnl || 0), 0));
+  const arbTotalFees = Number(journal.arbTotalFees ?? groups.reduce((sum, group) => sum + Number(group.arbTotalFees || 0), 0));
+  const arbNetPnl = Number(journal.arbNetPnl ?? (arbRealizedPnl + arbTotalFees));
+  const successRate = totalCount ? (filledCount / totalCount) * 100 : execution.successRate;
   const totalTone = total > 0 ? "positive" : total < 0 ? "negative" : "muted";
   const stateLabelMap = {
     all: "全部状态",
@@ -3024,7 +3895,7 @@ function renderOrderGlobalSummary(groups) {
       <div>
         <span class="order-global-summary-eyebrow">组合订单收益总览</span>
         <strong class="tone-${totalTone}">${formatSignedMoney(total)} USDT</strong>
-        <small>${activeSymbols} 个币种 · ${visibleOrders} 笔当前可见订单 · 过滤后的组合口径</small>
+        <small>${activeSymbols} 个币种 · ${visibleOrders} 笔当前可见订单 · 账本成交 ${filledCount} / 异常 ${riskCount}${arbOrderCount ? ` · 套利 ${arbOrderCount} 笔` : ""}</small>
       </div>
     </div>
     <div class="order-global-summary-grid">
@@ -3044,10 +3915,30 @@ function renderOrderGlobalSummary(groups) {
         <small>没有明确收益字段时的估算</small>
       </div>
       <div class="order-global-summary-card">
+        <span>成交 / 异常</span>
+        <strong>${filledCount} / ${riskCount}</strong>
+        <small>${totalCount ? `${formatPercentValue(successRate)} 成功率` : "等待订单样本"}</small>
+      </div>
+      <div class="order-global-summary-card">
         <span>当前聚焦</span>
         <strong>${escapeHtml(dashboardState.selectedOrderSymbol || groups[0]?.symbol || "--")}</strong>
         <small>${escapeHtml(stateLabel)} · ${escapeHtml(marketLabel)}</small>
       </div>
+      ${arbOrderCount ? `
+      <div class="order-global-summary-card">
+        <span>套利净收益</span>
+        <strong class="tone-${arbNetPnl > 0 ? "positive" : arbNetPnl < 0 ? "negative" : "muted"}">${formatSignedMoney(arbNetPnl)} USDT</strong>
+        <small>已实现 ${formatSignedMoney(arbRealizedPnl)} · 手续费 ${formatSignedMoney(arbTotalFees)}</small>
+      </div>
+      ` : ""}
+    </div>
+    <div class="order-global-summary-note">
+      <b>${arbOrderCount ? "套利腿进度" : "最近异常"}</b>
+      <span>${escapeHtml(
+        arbOrderCount
+          ? `现货开腿 ${arbEntryOrders} · 永续对冲 ${arbHedgeOrders} · 退场 ${arbExitOrders} · 回滚 ${arbRollbackOrders}`
+          : (journal.lastCancelReason || execution.latestCancelReason || execution.topCancelReason || "当前没有明显异常撤单，订单终端会在这里提示最近一次失败或取消的原因。")
+      )}</span>
     </div>
   `;
 }
@@ -3077,9 +3968,18 @@ function renderOrderSymbolOverview(groups, meta = {}) {
         <div class="order-symbol-metrics">
           <div><b>收益汇总</b><span class="tone-${pnlClass}">${group.hasPnl ? `${formatSignedMoney(group.pnlTotal)} USDT` : "--"}</span></div>
           <div><b>收益口径</b><span>${escapeHtml(group.scopeLabel)}</span></div>
-          <div><b>工作中 / 已成交</b><span>${group.working} / ${group.filled}</span></div>
+          <div><b>套利净收益</b><span>${group.arbOrderCount ? `${formatSignedMoney(group.arbNetPnl)} USDT` : "--"}</span></div>
+          <div><b>工作中 / 已成交 / 异常</b><span>${group.working} / ${group.filled} / ${group.riskCount}</span></div>
+          <div><b>成交率</b><span>${group.orderCount ? formatPercentValue(group.successRate) : "--"}</span></div>
+          <div><b>套利腿</b><span>${group.arbOrderCount ? `${group.arbEntryOrders}/${group.arbHedgeOrders}/${group.arbExitOrders}/${group.arbRollbackOrders}` : "--"}</span></div>
           <div><b>最新更新时间</b><span>${escapeHtml(group.latestAt)}</span></div>
         </div>
+        ${group.topCancelReason ? `
+          <div class="order-warning-note">
+            <b>最近异常</b>
+            <span>${escapeHtml(group.topCancelReason)}</span>
+          </div>
+        ` : ""}
         <div class="order-symbol-actions">
           <button class="btn btn-ghost order-symbol-filter" type="button" data-order-symbol="${escapeHtml(group.symbol)}">看这条订单流</button>
           <button class="btn btn-secondary order-symbol-switch" type="button" data-order-symbol="${escapeHtml(group.symbol)}">切到下单上下文</button>
@@ -3177,6 +4077,10 @@ function renderOrderTerminalFocus(selectedGroup, meta = {}) {
       <div><b>待成交 / 待补口径</b><span>${selectedGroup.pendingCount} / ${selectedGroup.unresolvedCount}</span></div>
       <div><b>watchlist</b><span>${escapeHtml(watchlistLabel)}</span></div>
       <div><b>工作中 / 已成交</b><span>${selectedGroup.working} / ${selectedGroup.filled}</span></div>
+      <div><b>异常 / 成交率</b><span>${selectedGroup.riskCount} / ${formatPercentValue(selectedGroup.successRate)}</span></div>
+      <div><b>套利净收益</b><span>${selectedGroup.arbOrderCount ? `${formatSignedMoney(selectedGroup.arbNetPnl)} USDT` : "--"}</span></div>
+      <div><b>套利腿进度</b><span>${selectedGroup.arbOrderCount ? `开腿 ${selectedGroup.arbEntryOrders} · 对冲 ${selectedGroup.arbHedgeOrders} · 退场 ${selectedGroup.arbExitOrders} · 回滚 ${selectedGroup.arbRollbackOrders}` : "当前不是套利腿订单流"}</span></div>
+      <div><b>最近异常</b><span>${escapeHtml(selectedGroup.topCancelReason || "当前没有明显异常撤单")}</span></div>
     </div>
   `;
 
@@ -3276,14 +4180,45 @@ function renderOrderSummary(data, orders) {
     : data?.source === "local_echo"
       ? "本地回执"
       : data?.source === "rest_multi"
-        ? "REST 聚合"
+      ? "REST 聚合"
         : "REST";
-  const working = orders.filter((item) => ["live", "effective", "partially_filled"].includes(item.state)).length;
-  const filled = orders.filter((item) => item.state === "filled").length;
-  $("order-summary-count").textContent = String((data?.orders || []).length || 0);
-  $("order-summary-working").textContent = String(working);
-  $("order-summary-filled").textContent = String(filled);
+  const stats = collectOrderExecutionStats(orders);
+  const journal = data?.journal || dashboardState.orderJournal || {};
+  const journalSource = journal?.lastSource === "private_ws"
+    ? "私有账本"
+    : journal?.lastSource === "paper_state_recovered"
+      ? "本地恢复"
+      : journal?.lastSource === "rest_multi"
+        ? "REST 聚合"
+        : journal?.lastSource === "rest"
+          ? "REST"
+          : journal?.lastSource
+            ? journal.lastSource
+            : "--";
+  const reconciledAt = journal?.lastReconciledAt ? formatOrderTime(journal.lastReconciledAt) : "--";
+  const totalCount = Number(journal.totalOrders ?? (((data?.orders || []).length) || 0));
+  const workingCount = Number(journal.workingOrders ?? stats.working ?? 0);
+  const filledCount = Number(journal.filledOrders ?? stats.filled ?? 0);
+  const riskCount = Number(journal.canceledOrders ?? 0) + Number(journal.rejectedOrders ?? 0);
+  const arbOrderCount = Number(journal.arbOrderCount ?? 0);
+  const arbEntryOrders = Number(journal.arbEntryOrders ?? 0);
+  const arbHedgeOrders = Number(journal.arbHedgeOrders ?? 0);
+  const arbExitOrders = Number(journal.arbExitOrders ?? 0);
+  const arbRollbackOrders = Number(journal.arbRollbackOrders ?? 0);
+  const successRate = totalCount ? (filledCount / totalCount) * 100 : stats.successRate;
+  $("order-summary-count").textContent = String(totalCount);
+  $("order-summary-working").textContent = String(workingCount);
+  $("order-summary-filled").textContent = String(filledCount);
+  if ($("order-summary-risk")) $("order-summary-risk").textContent = String(riskCount);
+  if ($("order-summary-rate")) $("order-summary-rate").textContent = totalCount ? formatPercentValue(successRate) : "--";
   $("order-summary-source").textContent = source;
+  if ($("order-summary-journal-source")) $("order-summary-journal-source").textContent = journalSource;
+  if ($("order-summary-reconciled")) $("order-summary-reconciled").textContent = reconciledAt;
+  if ($("orderSummaryInsight")) {
+    $("orderSummaryInsight").innerHTML = riskCount
+      ? `<b>最近异常</b><span>${escapeHtml(journal.lastCancelReason || stats.latestCancelReason || stats.topCancelReason || "存在已撤或失败订单，详情区会继续显示交易所原始原因。")} · 账本 ${escapeHtml(journalSource)} · 最近对账 ${escapeHtml(reconciledAt)}${arbOrderCount ? ` · 套利开腿 ${arbEntryOrders} / 对冲 ${arbHedgeOrders} / 退场 ${arbExitOrders} / 回滚 ${arbRollbackOrders}` : ""}</span>`
+      : `<b>当前概览</b><span>${totalCount ? `最近 ${totalCount} 笔里成交 ${filledCount} 笔，当前没有明显异常撤单。账本 ${journalSource}，最近对账 ${reconciledAt}。${arbOrderCount ? `套利开腿 ${arbEntryOrders} / 对冲 ${arbHedgeOrders} / 退场 ${arbExitOrders} / 回滚 ${arbRollbackOrders}。` : ""}` : "订单一进来，这里会直接告诉你成功率、账本来源和最近异常原因。"}</span>`;
+  }
 }
 
 function renderOrderDetail(order, meta = {}) {
@@ -3293,7 +4228,7 @@ function renderOrderDetail(order, meta = {}) {
     target.innerHTML = `
       <div class="order-detail-empty">
         <strong>选中一笔订单</strong>
-        <span>这里会显示状态、成交、价格、时间、订单号和执行标记。</span>
+        <span>这里会直接告诉你这笔单现在是不是还在持仓、有没有卖出，以及收益到底是浮动还是已实现。</span>
       </div>
     `;
     return;
@@ -3315,7 +4250,19 @@ function renderOrderDetail(order, meta = {}) {
   const avgPrice = formatOrderValue(order.avgPx || order.fillPx);
   const requestSize = formatOrderValue(order.sz);
   const filledSize = formatOrderValue(order.accFillSz || order.fillSz || 0);
+  const lifecycle = buildOrderLifecycleContext(order, meta);
   const pnl = buildOrderPnlContext(order, meta);
+  const cancelReason = getOrderCancelReason(order);
+  const cancelReasonShort = summarizeOrderCancelReason(cancelReason);
+  const arbPhase = getOrderArbPhase(order);
+  const strategyAttribution = arbPhase
+    ? `${getOrderArbPhaseLabel(arbPhase)} · ${order.strategyLeg === "swap" ? "永续腿" : order.strategyLeg === "spot" ? "现货腿" : "套利订单"}`
+    : (order.strategyReason || "普通订单");
+  const executionSummary = isRiskOrder(order)
+    ? (cancelReasonShort || "这笔单被交易所撤销或拒绝。")
+    : order.state === "filled"
+      ? lifecycle.detailText
+      : "这笔单当前还在工作中或等待成交完成。";
 
   target.className = "order-detail";
   target.innerHTML = `
@@ -3340,13 +4287,15 @@ function renderOrderDetail(order, meta = {}) {
         <strong>${escapeHtml(avgPrice)}</strong>
       </div>
       <div class="order-hero-card">
-        <span>${escapeHtml(pnl.title)}</span>
-        <strong class="${escapeHtml(pnl.toneClass)}">${escapeHtml(pnl.valueText)}</strong>
+        <span>${escapeHtml(lifecycle.title)}</span>
+        <strong class="${escapeHtml(lifecycle.toneClass)}">${escapeHtml(lifecycle.valueText)}</strong>
       </div>
     </div>
     <div class="order-detail-grid">
       <div><b>委托数量</b><span>${escapeHtml(requestSize)}</span></div>
       <div><b>保证金 / 模式</b><span>${escapeHtml(order.tdMode || "--")}</span></div>
+      <div><b>当前状态</b><span>${escapeHtml(lifecycle.scopeText)}</span></div>
+      <div><b>收益金额</b><span class="${escapeHtml(pnl.toneClass)}">${escapeHtml(pnl.valueText)}</span></div>
       <div><b>收益口径</b><span>${escapeHtml(pnl.scopeText)}</span></div>
       <div><b>当前价格 / 标记价</b><span>${escapeHtml(pnl.currentPriceText)}</span></div>
       <div><b>订单号</b><span>${escapeHtml(order.ordId || "--")}</span></div>
@@ -3355,13 +4304,19 @@ function renderOrderDetail(order, meta = {}) {
       <div><b>最近更新时间</b><span>${escapeHtml(updatedAt)}</span></div>
       <div><b>手续费</b><span>${escapeHtml(formatOrderValue(order.fee))}</span></div>
       <div><b>订单标签</b><span>${escapeHtml(order.tag || "--")}</span></div>
+      <div><b>执行归因</b><span>${escapeHtml(strategyAttribution)}</span></div>
       <div><b>仅减仓</b><span>${order.reduceOnly ? "是" : "否"}</span></div>
       <div><b>成交来源</b><span>${escapeHtml(meta?.stream?.connected ? "实时推送" : source)}</span></div>
+      <div><b>订单结果</b><span>${escapeHtml(executionSummary)}</span></div>
+      <div><b>取消来源</b><span>${escapeHtml(order.cancelSource || "--")}</span></div>
+      <div><b>仓位判断</b><span>${escapeHtml(lifecycle.detailText)}</span></div>
       <div><b>收益判断</b><span>${escapeHtml(pnl.detailText)}</span></div>
-      <div><b>收益说明</b><span>${escapeHtml(pnl.noteText)}</span></div>
+      <div class="span-wide"><b>状态说明</b><span>${escapeHtml(lifecycle.noteText)}</span></div>
+      <div class="span-wide"><b>收益说明</b><span>${escapeHtml(pnl.noteText)}</span></div>
+      <div class="span-wide"><b>取消原因</b><span>${escapeHtml(cancelReason || "当前没有取消原因，这笔单不是撤单/失败单，或交易所没有返回额外说明。")}</span></div>
     </div>
     <div class="order-detail-note">
-      最近一笔会优先高亮；如果下单后私有 WS 还没回报，这里会先显示本地回执，再自动切换成交易所最新状态。收益区会明确告诉你：现在显示的是已实现收益、相关持仓浮盈，还是当前还不能从这笔订单单独算出收益。
+      最近一笔会优先高亮；如果下单后私有 WS 还没回报，这里会先显示本地回执，再自动切换成交易所最新状态。现在这块会先把“当前还有没有仓”说清楚，再告诉你收益金额到底是已实现、持仓浮动，还是暂时拿不到精确口径。
     </div>
   `;
 }
@@ -3369,8 +4324,18 @@ function renderOrderDetail(order, meta = {}) {
 function renderOrderFeed(data) {
   const allOrders = data?.orders || [];
   const target = $("recentOrders");
+  const fallbackJournal = buildDerivedOrderJournal(allOrders, data?.lastSource || data?.source || "", data?.symbols || []);
   dashboardState.recentOrdersAll = allOrders;
-  dashboardState.orderFeedMeta = { source: data?.source || "rest", stream: data?.stream || null };
+  dashboardState.orderJournal = data?.journal || fallbackJournal;
+  dashboardState.orderJournalSymbols = data?.symbols || fallbackJournal.symbols || [];
+  dashboardState.orderFeedMeta = {
+    source: data?.source || "rest",
+    stream: data?.stream || null,
+    journal: data?.journal || fallbackJournal,
+    symbols: data?.symbols || fallbackJournal.symbols || [],
+    lastReconciledAt: data?.lastReconciledAt || fallbackJournal.lastReconciledAt || "",
+    lastSource: data?.lastSource || fallbackJournal.lastSource || "",
+  };
   const baseGroups = groupOrdersBySymbol(allOrders, dashboardState.orderFeedMeta);
   const stateFilter = dashboardState.orderStateFilter || "all";
   const marketFilter = dashboardState.orderMarketFilter || "all";
@@ -3467,9 +4432,16 @@ function renderOrderFeed(data) {
             <div class="orders-group-metrics">
               <div><b>收益汇总</b><span class="tone-${pnlClass}">${group.hasPnl ? `${formatSignedMoney(group.pnlTotal)} USDT` : "--"}</span></div>
               <div><b>收益口径</b><span>${escapeHtml(group.scopeLabel)}</span></div>
-              <div><b>工作中 / 已成交</b><span>${group.working} / ${group.filled}</span></div>
+              <div><b>工作中 / 已成交 / 异常</b><span>${group.working} / ${group.filled} / ${group.riskCount}</span></div>
+              <div><b>成交率</b><span>${group.orderCount ? formatPercentValue(group.successRate) : "--"}</span></div>
               <div><b>最近更新时间</b><span>${escapeHtml(group.latestAt)}</span></div>
             </div>
+            ${group.topCancelReason ? `
+              <div class="order-warning-note">
+                <b>最近异常</b>
+                <span>${escapeHtml(group.topCancelReason)}</span>
+              </div>
+            ` : ""}
             ${filteredOrders.length ? `<div class="orders-group-cards">
               ${groupOrders.map((order) => {
                 const key = getOrderKey(order);
@@ -3477,6 +4449,7 @@ function renderOrderFeed(data) {
                 const sideClass = order.side === "sell" ? "down" : "up";
                 const activeClass = key === dashboardState.selectedOrderKey ? "active" : "";
                 const targetPrice = order.ordType === "market" ? "市价" : formatOrderValue(order.px);
+                const cancelReason = summarizeOrderCancelReason(getOrderCancelReason(order));
                 return `
                   <button type="button" class="order-card compact ${sideClass} ${activeClass}" data-order-key="${escapeHtml(key)}" data-order-symbol="${escapeHtml(group.symbol)}">
                     <div class="order-card-head">
@@ -3491,6 +4464,12 @@ function renderOrderFeed(data) {
                       <div><b>数量</b><span>${escapeHtml(formatOrderValue(order.sz))}</span></div>
                       <div><b>已成交</b><span>${escapeHtml(formatOrderValue(order.accFillSz || order.fillSz || 0))}</span></div>
                     </div>
+                    ${cancelReason ? `
+                      <div class="order-card-reason">
+                        <b>异常原因</b>
+                        <span>${escapeHtml(cancelReason)}</span>
+                      </div>
+                    ` : ""}
                     <div class="order-card-foot">
                       <span>${escapeHtml(formatOrderTime(order.cTime))}</span>
                       <span>${escapeHtml(order.clOrdId || order.ordId || "--")}</span>
@@ -3780,6 +4759,11 @@ function renderPortfolioWatchlist(entries = []) {
     const swapState = swap.enabled
       ? `${swap.signal || "hold"} · ${swap.positionSide || "flat"} · ${swap.positionSize || "0"}`
       : "未启用";
+    const strategyPill = entry.allocation?.strategyPreset === "basis_arb"
+      ? "高频套利"
+      : entry.allocation?.strategyPreset === "dip_swing"
+        ? "波段"
+        : formatStrategyMode(entry.allocation?.swapStrategyMode || $("autoSwapStrategyMode")?.value || "trend_follow");
     return `
       <article class="portfolio-coin-card tone-${toneClass}">
         <div class="portfolio-coin-head">
@@ -3787,7 +4771,7 @@ function renderPortfolioWatchlist(entries = []) {
             <strong>${entry.symbol || "--"}</strong>
             <span>${summary.status || "观察中"}</span>
           </div>
-          <span class="pill portfolio-coin-pill">${formatStrategyMode(entry.allocation?.swapStrategyMode || $("autoSwapStrategyMode")?.value || "trend_follow")}</span>
+          <span class="pill portfolio-coin-pill">${strategyPill}${entry.overrideActive ? " · 独立参数" : ""}</span>
         </div>
         <div class="portfolio-coin-hero">
           <div class="portfolio-hero-block">
@@ -3815,7 +4799,7 @@ function renderPortfolioWatchlist(entries = []) {
           <div>
             <b>独立风控</b>
             <span>${summary.riskLabel || "等待风控拆分"}</span>
-            <small>现货与永续各自按预算、上限、张数和杠杆拆分</small>
+            <small>${entry.overrideActive ? `当前币已单独覆盖 ${((entry.allocation?.overrideKeys || []).length || 0)} 项参数` : "现货与永续各自按预算、上限、张数和杠杆拆分"}</small>
           </div>
           <div>
             <b>独立仓位摘要</b>
@@ -3831,6 +4815,9 @@ function renderPortfolioWatchlist(entries = []) {
 function renderStrategyPortfolio() {
   const automation = dashboardState.automation || {};
   const analysis = automation.analysis || {};
+  const pipeline = automation.lastPipeline || {};
+  const riskReport = automation.lastRiskReport || {};
+  const executionJournal = automation.executionJournal || dashboardState.orderJournal || {};
   const saved = dashboardState.savedAutomationConfig;
   const draft = normalizeAutomationConfigForCompare(collectAutomationConfig());
   const dirty = isAutomationConfigDirty();
@@ -3843,8 +4830,12 @@ function renderStrategyPortfolio() {
   const pnlAmount = startEq > 0 ? currentEq - startEq : 0;
   const pnlPct = startEq > 0 ? (pnlAmount / startEq) * 100 : 0;
   const running = Boolean(automation.running);
+  const arbRuntime = pipeline.executionSummary?.arbRuntime || {};
+  const riskChecks = Array.isArray(riskReport.checks) ? riskReport.checks : [];
   const activeConfig = dirty ? draft : (saved || draft);
   const activeSummary = buildStrategyFormSummary(activeConfig);
+  const isBasisArb = activeConfig?.strategyPreset === "basis_arb";
+  const isDipSwing = activeConfig?.strategyPreset === "dip_swing";
   let badge = "待同步";
   let statusTitle = "等待应用策略";
   let detail = "从研究榜单应用或保存配置后，这里会明确告诉你当前组合是否已经生效。";
@@ -3874,8 +4865,60 @@ function renderStrategyPortfolio() {
     : "收益会按组合会话持续更新，不再只靠订单详情猜测";
   $("portfolio-context-main").textContent = activeSummary;
   $("portfolio-context-sub").textContent = running
-    ? `${analysis.selectedStrategyName || "当前策略"} · ${analysis.decisionLabel || "组合执行中"}`
+    ? (
+      isBasisArb
+        ? `${analysis.selectedStrategyName || "高频套利"} · 可做 ${analysis.candidateCount || 0} · 市场 ${analysis.marketCandidateCount || 0} · 对冲 ${arbRuntime.hedged || 0} · 回补 ${arbRuntime.exitQueue || 0}${analysis.reverseBasisCount ? ` · 反向 ${analysis.reverseBasisCount}` : ""}${arbRuntime.rollback ? ` · 回滚 ${arbRuntime.rollback}` : ""}`
+        : isDipSwing
+          ? `${analysis.selectedStrategyName || "波段"} · ${analysis.decisionLabel || "观察中"} · 回撤 ${analysis.pullbackPct || "--"}% · 反弹 ${analysis.reboundPct || "--"}%${analysis.liquidationBufferPct ? ` · 缓冲 ${analysis.liquidationBufferPct}%` : ""}`
+        : `${analysis.selectedStrategyName || "当前策略"} · ${analysis.decisionLabel || "组合执行中"}`
+    )
     : `${watchlist.length} 个币各自独立决策、独立风控、独立仓位摘要`;
+  if ($("portfolio-pipeline-main")) {
+    $("portfolio-pipeline-main").textContent = pipeline.summary || (running ? "本轮执行中" : "等待下一轮编排");
+  }
+  if ($("portfolio-pipeline-sub")) {
+    const pipelineFlags = [
+      `信号 ${pipeline.signal || "idle"}`,
+      `组合 ${pipeline.portfolio || "idle"}`,
+      `风控 ${pipeline.risk || "idle"}`,
+      `执行 ${pipeline.execution || "idle"}`,
+    ];
+    if (pipeline.targetCount) pipelineFlags.push(`${pipeline.targetCount} 币`);
+    if (executionJournal.lastSource) pipelineFlags.push(`账本 ${executionJournal.lastSource}`);
+    $("portfolio-pipeline-sub").textContent = pipelineFlags.join(" · ");
+  }
+  if ($("portfolio-risk-main")) {
+    $("portfolio-risk-main").textContent = riskReport.stopReason || (riskReport.status === "ok" ? "护栏正常" : "等待风控检查");
+  }
+  if ($("portfolio-risk-sub")) {
+    const topChecks = riskChecks.slice(0, 2).map((item) => {
+      const marker = item?.passed ? "通过" : "拦截";
+      return `${marker} · ${item?.detail || item?.name || "未命名检查"}`;
+    });
+    const fallbackRisk = [
+      `活跃 ${riskReport.activeMarkets || 0} 市场`,
+      `观察 ${riskReport.watchedSymbols || watchlist.length || 0} 币`,
+    ];
+    if (isBasisArb) {
+      fallbackRisk.push(`watchlist 可做 ${analysis.candidateCount || 0} 币`);
+      fallbackRisk.push(`市场候选 ${analysis.marketCandidateCount || 0} 币`);
+      fallbackRisk.push(`对冲中 ${arbRuntime.hedged || 0} 币对`);
+      if (analysis.reverseBasisCount) fallbackRisk.push(`反向 ${analysis.reverseBasisCount} 币`);
+      if (arbRuntime.exitQueue) fallbackRisk.push(`待回补 ${arbRuntime.exitQueue} 币对`);
+      if (arbRuntime.rollback) fallbackRisk.push(`回滚 ${arbRuntime.rollback} 币对`);
+    } else if (isDipSwing) {
+      fallbackRisk.push(`回撤 ${analysis.pullbackPct || "--"}%`);
+      fallbackRisk.push(`反弹 ${analysis.reboundPct || "--"}%`);
+      if (analysis.liquidationBufferPct) fallbackRisk.push(`强平缓冲 ${analysis.liquidationBufferPct}%`);
+    }
+    const journalBits = Number(executionJournal.totalOrders || 0)
+      ? [`账本 ${executionJournal.totalOrders || 0} 单`, `成交 ${executionJournal.filledOrders || 0}`, `异常 ${(Number(executionJournal.canceledOrders || 0) + Number(executionJournal.rejectedOrders || 0))}`]
+      : [];
+    $("portfolio-risk-sub").textContent = [
+      ...(topChecks.length ? topChecks : fallbackRisk),
+      ...journalBits,
+    ].join(" · ");
+  }
   if ($("rail-strategy-apply")) {
     $("rail-strategy-apply").textContent = statusTitle;
   }
@@ -3969,6 +5012,10 @@ async function loadMinerConfig() {
 
 function renderAutomationState(state) {
   dashboardState.automation = state || {};
+  if (state?.executionJournal) {
+    dashboardState.orderJournal = state.executionJournal;
+    dashboardState.orderJournalSymbols = Array.isArray(state.executionJournal.symbols) ? state.executionJournal.symbols : [];
+  }
   renderResearchState(state?.research || {});
   renderAnalysisState(state?.analysis || {});
   const running = Boolean(state?.running);
@@ -4094,6 +5141,10 @@ async function testConfig() {
 
 async function saveAutomationConfig({ silent = false } = {}) {
   const payload = collectAutomationConfig();
+  const overrideError = getWatchlistOverrideParseError(payload.watchlistOverrides);
+  if (overrideError) {
+    throw new Error(overrideError);
+  }
   const data = await request("/api/automation/config", {
     method: "POST",
     body: JSON.stringify(payload),
@@ -4605,6 +5656,34 @@ async function boot() {
   $("spotInstId").addEventListener("input", updateQuickState);
   $("swapInstId").addEventListener("input", updateQuickState);
   $("autoWatchlistSymbols").addEventListener("input", updateQuickState);
+  $("autoWatchlistSymbols").addEventListener("input", () => {
+    renderWatchlistOverrideEditor($("autoWatchlistOverrides").value);
+    renderStrategyPortfolio();
+  });
+  if ($("watchlistOverrideEditor")) {
+    $("watchlistOverrideEditor").addEventListener("input", (event) => {
+      if (!event.target.closest("[data-override-field]")) return;
+      syncWatchlistOverridesValueFromEditor();
+      renderStrategyPortfolio();
+    });
+    $("watchlistOverrideEditor").addEventListener("change", (event) => {
+      if (!event.target.closest("[data-override-field]")) return;
+      syncWatchlistOverridesValueFromEditor();
+      renderDeskGuards();
+      renderDeskOverview();
+      scheduleAutoAnalysis({ force: true });
+    });
+  }
+  if ($("watchlistOverrideReset")) {
+    $("watchlistOverrideReset").addEventListener("click", () => {
+      $("autoWatchlistOverrides").value = "";
+      renderWatchlistOverrideEditor("");
+      renderDeskGuards();
+      renderDeskOverview();
+      renderStrategyPortfolio();
+      scheduleAutoAnalysis({ force: true });
+    });
+  }
   if ($("orderSpotInstMirror")) {
     $("orderSpotInstMirror").addEventListener("input", () => {
       $("spotInstId").value = $("orderSpotInstMirror").value.trim().toUpperCase();
@@ -4638,6 +5717,7 @@ async function boot() {
     scheduleAutoAnalysis({ force: true });
   });
   $("autoWatchlistSymbols").addEventListener("change", () => {
+    renderWatchlistOverrideEditor($("autoWatchlistOverrides").value);
     scheduleAutoAnalysis({ force: true });
   });
   $("marketBar").addEventListener("change", restartLiveFeedSoon);
@@ -4669,6 +5749,7 @@ async function boot() {
     "autoCooldownSeconds",
     "autoMaxOrdersPerDay",
     "autoSpotEnabled",
+    "autoWatchlistOverrides",
     "autoSpotQuoteBudget",
     "autoSpotMaxExposure",
     "autoSwapEnabled",
@@ -4893,6 +5974,19 @@ async function boot() {
   $("rail-start-automation").addEventListener("click", async () => {
     try {
       await startAutomation();
+    } catch (err) {
+      setAutomationMessage(err.message, "err");
+      await refreshAutomationState().catch(() => {});
+    }
+  });
+
+  $("rail-strategy-toggle")?.addEventListener("click", async () => {
+    try {
+      if (dashboardState.automation?.running) {
+        await stopAutomation();
+      } else {
+        await startAutomation();
+      }
     } catch (err) {
       setAutomationMessage(err.message, "err");
       await refreshAutomationState().catch(() => {});
