@@ -1,0 +1,10 @@
+[Unit]
+Description=Check GitHub updates for OKX Remote Node every 2 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+Unit=okx-remote-auto-update.service
+
+[Install]
+WantedBy=timers.target
