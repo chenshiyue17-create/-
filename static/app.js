@@ -159,6 +159,34 @@ const STRATEGY_PRESETS = {
       enforceNetMode: true,
     },
   },
+  dip_swing: {
+    label: "低买高卖",
+    description: "逐仓低杠杆回撤买入，固定 8% 止盈，强平缓冲不足时优先主动离场。",
+    config: {
+      strategyPreset: "dip_swing",
+      bar: "15m",
+      fastEma: 12,
+      slowEma: 48,
+      pollSeconds: 8,
+      cooldownSeconds: 45,
+      maxOrdersPerDay: 12,
+      spotEnabled: false,
+      spotQuoteBudget: "0",
+      spotMaxExposure: "0",
+      swapEnabled: true,
+      swapContracts: "1",
+      swapTdMode: "isolated",
+      swapStrategyMode: "long_only",
+      swapLeverage: "2",
+      stopLossPct: "2.5",
+      takeProfitPct: "8",
+      maxDailyLossPct: "1.5",
+      autostart: false,
+      allowLiveTrading: false,
+      allowLiveAutostart: false,
+      enforceNetMode: true,
+    },
+  },
 };
 
 const MINER_MODE_META = {
@@ -695,6 +723,8 @@ function buildStrategyFormSummary(config = {}) {
   const overrideCount = Object.keys(parseWatchlistOverridesValue(normalized.watchlistOverrides, watchlist)).length;
   const presetDetail = normalized.strategyPreset === "basis_arb"
     ? `入场 ${normalized.arbEntrySpreadPct}% / 回补 ${normalized.arbExitSpreadPct}% / 资金费 ${normalized.arbMinFundingRatePct}%`
+    : normalized.strategyPreset === "dip_swing"
+      ? `15m 低吸 · 逐仓 ${normalized.swapLeverage}x · TP ${normalized.takeProfitPct}%`
     : `${normalized.bar} · EMA ${normalized.fastEma}/${normalized.slowEma}`;
   return `${preset.label} · ${presetDetail} · ${watchlist.join(" / ")} · ${watchlist.length} 币组合${overrideCount ? ` · ${overrideCount} 币独立覆盖` : ""}`;
 }
@@ -717,12 +747,19 @@ function buildDraftPortfolioEntries(config = collectAutomationConfig()) {
     const perSwapContracts = Number(target.swapContracts || 0);
     const overrideFields = Object.keys(target.watchlistOverride || {});
     const isBasisArb = target.strategyPreset === "basis_arb";
+    const isDipSwing = target.strategyPreset === "dip_swing";
     const summaryDetail = isBasisArb
       ? [
           `入场 ${target.arbEntrySpreadPct}% / 回补 ${target.arbExitSpreadPct}%`,
           `资金费 ${target.arbMinFundingRatePct}% / 最长 ${target.arbMaxHoldMinutes} 分钟`,
           overrideFields.length ? `独立覆盖 ${overrideFields.length} 项` : "沿用组合参数",
         ].join(" · ")
+      : isDipSwing
+        ? [
+            `${target.bar} · 回撤低吸`,
+            `逐仓 ${target.swapLeverage}x · SL ${target.stopLossPct}% / TP ${target.takeProfitPct}%`,
+            overrideFields.length ? `独立覆盖 ${overrideFields.length} 项` : "沿用组合参数",
+          ].join(" · ")
       : [
           `${target.bar} · EMA ${target.fastEma}/${target.slowEma}`,
           `SL ${target.stopLossPct}% / TP ${target.takeProfitPct}%`,
@@ -1791,6 +1828,7 @@ function renderDeskGuards() {
 function renderAnalysisState(analysis) {
   const data = analysis || {};
   const isBasisArb = data.selectedStrategyName?.includes("高频套利");
+  const isDipSwing = data.selectedStrategyName?.includes("低买高卖");
   const marketTopCandidates = Array.isArray(data.marketTopCandidates) ? data.marketTopCandidates : [];
   $("analysis-decision").textContent =
     data.decisionLabel
@@ -1811,6 +1849,13 @@ function renderAnalysisState(analysis) {
             `反向 ${data.reverseBasisCount || 0}`,
             data.marketFundingBlockedCount ? `资金费阻断 ${data.marketFundingBlockedCount}` : "",
           ].filter(Boolean).join(" · ")
+          : isDipSwing
+            ? [
+              data.marketRegime,
+              `回撤 ${data.pullbackPct || "--"}%`,
+              `反弹 ${data.reboundPct || "--"}%`,
+              data.liquidationBufferPct ? `强平缓冲 ${data.liquidationBufferPct}%` : "",
+            ].filter(Boolean).join(" · ")
           : `${data.marketRegime} · 现货 ${data.spotTrend || "--"} · 永续 ${data.swapTrend || "--"}`
       )
       : "等待波动、价差、资金费和趋势分析";
@@ -1826,6 +1871,13 @@ function renderAnalysisState(analysis) {
             `资金费 ${data.fundingRatePct || "--"}%`,
             data.marketScanCount ? `已扫 ${data.marketScanCount} 币` : "",
           ].filter(Boolean).join(" · ")
+          : isDipSwing
+            ? [
+              data.lastAnalyzedAt,
+              `资金费 ${data.fundingRatePct || "--"}%`,
+              data.basisPct ? `基差 ${data.basisPct}%` : "",
+              data.liquidationPrice ? `强平价 ${data.liquidationPrice}` : "",
+            ].filter(Boolean).join(" · ")
           : `${data.lastAnalyzedAt} · 波动 ${data.volatilityPct || "--"}% · 价差 ${data.spreadPct || "--"}% · 资金费 ${data.fundingRatePct || "--"}%`
       )
       : "等待最新分析时间";
@@ -4707,7 +4759,9 @@ function renderPortfolioWatchlist(entries = []) {
       : "未启用";
     const strategyPill = entry.allocation?.strategyPreset === "basis_arb"
       ? "高频套利"
-      : formatStrategyMode(entry.allocation?.swapStrategyMode || $("autoSwapStrategyMode")?.value || "trend_follow");
+      : entry.allocation?.strategyPreset === "dip_swing"
+        ? "低买高卖"
+        : formatStrategyMode(entry.allocation?.swapStrategyMode || $("autoSwapStrategyMode")?.value || "trend_follow");
     return `
       <article class="portfolio-coin-card tone-${toneClass}">
         <div class="portfolio-coin-head">
@@ -4779,6 +4833,7 @@ function renderStrategyPortfolio() {
   const activeConfig = dirty ? draft : (saved || draft);
   const activeSummary = buildStrategyFormSummary(activeConfig);
   const isBasisArb = activeConfig?.strategyPreset === "basis_arb";
+  const isDipSwing = activeConfig?.strategyPreset === "dip_swing";
   let badge = "待同步";
   let statusTitle = "等待应用策略";
   let detail = "从研究榜单应用或保存配置后，这里会明确告诉你当前组合是否已经生效。";
@@ -4811,6 +4866,8 @@ function renderStrategyPortfolio() {
     ? (
       isBasisArb
         ? `${analysis.selectedStrategyName || "高频套利"} · 可做 ${analysis.candidateCount || 0} · 市场 ${analysis.marketCandidateCount || 0} · 对冲 ${arbRuntime.hedged || 0} · 回补 ${arbRuntime.exitQueue || 0}${analysis.reverseBasisCount ? ` · 反向 ${analysis.reverseBasisCount}` : ""}${arbRuntime.rollback ? ` · 回滚 ${arbRuntime.rollback}` : ""}`
+        : isDipSwing
+          ? `${analysis.selectedStrategyName || "低买高卖"} · ${analysis.decisionLabel || "观察中"} · 回撤 ${analysis.pullbackPct || "--"}% · 反弹 ${analysis.reboundPct || "--"}%${analysis.liquidationBufferPct ? ` · 缓冲 ${analysis.liquidationBufferPct}%` : ""}`
         : `${analysis.selectedStrategyName || "当前策略"} · ${analysis.decisionLabel || "组合执行中"}`
     )
     : `${watchlist.length} 个币各自独立决策、独立风控、独立仓位摘要`;
@@ -4847,6 +4904,10 @@ function renderStrategyPortfolio() {
       if (analysis.reverseBasisCount) fallbackRisk.push(`反向 ${analysis.reverseBasisCount} 币`);
       if (arbRuntime.exitQueue) fallbackRisk.push(`待回补 ${arbRuntime.exitQueue} 币对`);
       if (arbRuntime.rollback) fallbackRisk.push(`回滚 ${arbRuntime.rollback} 币对`);
+    } else if (isDipSwing) {
+      fallbackRisk.push(`回撤 ${analysis.pullbackPct || "--"}%`);
+      fallbackRisk.push(`反弹 ${analysis.reboundPct || "--"}%`);
+      if (analysis.liquidationBufferPct) fallbackRisk.push(`强平缓冲 ${analysis.liquidationBufferPct}%`);
     }
     const journalBits = Number(executionJournal.totalOrders || 0)
       ? [`账本 ${executionJournal.totalOrders || 0} 单`, `成交 ${executionJournal.filledOrders || 0}`, `异常 ${(Number(executionJournal.canceledOrders || 0) + Number(executionJournal.rejectedOrders || 0))}`]

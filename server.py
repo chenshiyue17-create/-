@@ -103,6 +103,10 @@ BASIS_ARB_PREFERRED_SYMBOLS = (
 BASIS_ARB_SCAN_LOCK = threading.RLock()
 BASIS_ARB_MARKET_UNIVERSE_CACHE: dict[str, Any] = {"ts": 0.0, "symbols": []}
 BASIS_ARB_MARKET_SCAN_CACHE: dict[str, Any] = {"ts": 0.0, "key": "", "rows": []}
+DIP_SWING_PULLBACK_PCT = Decimal("1.8")
+DIP_SWING_REBOUND_PCT = Decimal("0.25")
+DIP_SWING_MIN_LIQ_BUFFER_PCT = Decimal("12")
+DIP_SWING_MAX_LEVERAGE = Decimal("3")
 
 
 def _extract_a_records_from_doh(payload: dict[str, Any]) -> list[str]:
@@ -1084,6 +1088,8 @@ def default_market_state() -> dict[str, Any]:
         "lastOrderId": "",
         "lastMessage": "",
         "lastTradeAt": "",
+        "liquidationPrice": "",
+        "liquidationBufferPct": "",
         "arbStage": "",
         "prepared": False,
     }
@@ -1352,6 +1358,17 @@ def validate_single_automation_target(config: dict[str, Any]) -> str:
             return "高频套利的回补价差不能小于 0"
         if exit_spread >= entry_spread:
             return "高频套利的回补价差必须小于入场价差"
+    if str(config.get("strategyPreset") or "") == "dip_swing":
+        if not config.get("swapEnabled"):
+            return "低买高卖必须启用永续"
+        if str(config.get("swapStrategyMode") or "") != "long_only":
+            return "低买高卖只支持 long_only"
+        if str(config.get("swapTdMode") or "") != "isolated":
+            return "低买高卖必须使用 isolated 逐仓"
+        if safe_decimal(config.get("swapLeverage"), "1") > DIP_SWING_MAX_LEVERAGE:
+            return f"低买高卖杠杆不能高于 {decimal_to_str(DIP_SWING_MAX_LEVERAGE)}x"
+        if safe_decimal(config.get("takeProfitPct"), "0") < Decimal("8"):
+            return "低买高卖的目标止盈建议至少 8%"
     return ""
 
 
@@ -1442,6 +1459,12 @@ def build_market_risk_label(target: dict[str, Any], market_kind: str) -> str:
             f"入场 ≥ {format_decimal(entry, 3)}% · "
             f"回补 ≤ {format_decimal(exit_spread, 3)}% · "
             f"资金费 ≥ {format_decimal(min_funding, 3)}%"
+        )
+    if str(target.get("strategyPreset") or "") == "dip_swing":
+        return (
+            f"回撤 ≥ {format_decimal(DIP_SWING_PULLBACK_PCT, 1)}% · "
+            f"TP {format_decimal(safe_decimal(target.get('takeProfitPct'), '8'), 1)}% · "
+            f"缓冲 ≥ {format_decimal(DIP_SWING_MIN_LIQ_BUFFER_PCT, 0)}%"
         )
     if market_kind == "spot":
         budget = safe_decimal(target.get("spotQuoteBudget"), "0")
@@ -3265,7 +3288,7 @@ def validate_automation_config(config: dict[str, Any]) -> tuple[bool, str, dict[
     primary_symbol = watchlist_symbols[0]
     normalized["spotInstId"] = f"{primary_symbol}-USDT"
     normalized["swapInstId"] = f"{primary_symbol}-USDT-SWAP"
-    if normalized.get("strategyPreset") not in ("dual_engine", "btc_lotto", "basis_arb"):
+    if normalized.get("strategyPreset") not in ("dual_engine", "btc_lotto", "basis_arb", "dip_swing"):
         return False, "策略模式不支持", normalized
     if len(watchlist_symbols) > 8:
         return False, "多币 watchlist 最多支持 8 个标的", normalized
@@ -3285,6 +3308,7 @@ def strategy_label(preset: str) -> str:
         "dual_engine": "标准双引擎",
         "btc_lotto": "BTC 乐透机",
         "basis_arb": "高频套利",
+        "dip_swing": "低买高卖",
     }.get(preset, "标准双引擎")
 
 
@@ -3302,6 +3326,8 @@ def strategy_symbol_label(config: dict[str, Any]) -> str:
 def strategy_scope_label(config: dict[str, Any]) -> str:
     if str(config.get("strategyPreset") or "") == "basis_arb":
         return "现货 + 永续对冲"
+    if str(config.get("strategyPreset") or "") == "dip_swing":
+        return "逐仓永续低吸"
     scopes: list[str] = []
     if config.get("spotEnabled"):
         scopes.append("现货")
@@ -3313,6 +3339,8 @@ def strategy_scope_label(config: dict[str, Any]) -> str:
 def strategy_mode_label(config: dict[str, Any]) -> str:
     if str(config.get("strategyPreset") or "") == "basis_arb":
         return "基差回归套利"
+    if str(config.get("strategyPreset") or "") == "dip_swing":
+        return "回撤买入 / 反弹止盈"
     if not config.get("swapEnabled"):
         return "现货执行"
     mode = str(config.get("swapStrategyMode", "trend_follow"))
@@ -3326,6 +3354,8 @@ def strategy_mode_label(config: dict[str, Any]) -> str:
 def strategy_mode_badge(config: dict[str, Any]) -> str:
     if str(config.get("strategyPreset") or "") == "basis_arb":
         return "套利"
+    if str(config.get("strategyPreset") or "") == "dip_swing":
+        return "低吸"
     if not config.get("swapEnabled"):
         return "现货"
     mode = str(config.get("swapStrategyMode", "trend_follow"))
@@ -3344,6 +3374,8 @@ def strategy_short_name(config: dict[str, Any], rank: int | None = None) -> str:
         preset = "乐透"
     elif preset_value == "basis_arb":
         preset = "套利"
+    elif preset_value == "dip_swing":
+        preset = "低吸"
     else:
         preset = "双引擎"
     leverage = f"{int(safe_decimal(config.get('swapLeverage'), '1'))}x" if config.get("swapEnabled") else ""
@@ -3367,6 +3399,18 @@ def strategy_detail_line(config: dict[str, Any], origin_label: str = "") -> str:
                 f"{watchlist_count} 币并行 · 当前币约 {decimal_to_str(safe_decimal(selected_target.get('spotQuoteBudget'), '0'))}U / "
                 f"{decimal_to_str(safe_decimal(selected_target.get('swapContracts'), '0'))} 张"
             )
+        if origin_label:
+            parts.append(origin_label)
+        return " · ".join(part for part in parts if part)
+    if str(config.get("strategyPreset") or "") == "dip_swing":
+        parts = [
+            "回撤买入 + 反弹止盈",
+            f"只做多 · {config.get('swapTdMode', 'isolated')} {config.get('swapLeverage', '2')}x",
+            f"目标止盈 {config.get('takeProfitPct', '8')}%",
+            f"止损 {config.get('stopLossPct', '2.5')}%",
+            f"回撤阈值 {format_decimal(DIP_SWING_PULLBACK_PCT, 1)}%",
+            f"强平缓冲 ≥ {format_decimal(DIP_SWING_MIN_LIQ_BUFFER_PCT, 0)}%",
+        ]
         if origin_label:
             parts.append(origin_label)
         return " · ".join(part for part in parts if part)
@@ -3455,6 +3499,65 @@ def build_signal(candles: list[dict[str, Any]], fast: int, slow: int) -> dict[st
         "slowValue": decimal_to_str(curr_slow),
         "lastClose": decimal_to_str(closes[-1]),
     }
+
+
+def build_pullback_signal(
+    candles: list[dict[str, Any]],
+    fast: int,
+    slow: int,
+    *,
+    pullback_threshold_pct: Decimal = DIP_SWING_PULLBACK_PCT,
+    rebound_threshold_pct: Decimal = DIP_SWING_REBOUND_PCT,
+) -> dict[str, Any]:
+    closes = [row["close"] for row in candles]
+    if len(closes) < slow + 2:
+        raise OkxApiError("K 线样本不足，无法计算低吸信号")
+    fast_values = ema(closes, fast)
+    slow_values = ema(closes, slow)
+    curr_fast = fast_values[-1]
+    curr_slow = slow_values[-1]
+    last_close = closes[-1]
+    prev_close = closes[-2]
+    sample = candles[-max(slow, 12):]
+    recent_high = max((row["high"] for row in sample), default=last_close)
+    recent_low = min((row["low"] for row in sample), default=last_close)
+    pullback_pct = pct_gap(recent_high, last_close)
+    rebound_pct = pct_gap(last_close, recent_low)
+    if curr_fast > curr_slow:
+        trend = "up"
+    elif curr_fast < curr_slow:
+        trend = "down"
+    else:
+        trend = "flat"
+    bounce_ready = last_close >= prev_close and rebound_pct >= rebound_threshold_pct
+    if trend == "up" and pullback_pct >= pullback_threshold_pct and bounce_ready:
+        signal = "pullback_buy"
+    elif trend == "down":
+        signal = "trend_break"
+    else:
+        signal = "hold"
+    return {
+        "signal": signal,
+        "trend": trend,
+        "fastValue": decimal_to_str(curr_fast),
+        "slowValue": decimal_to_str(curr_slow),
+        "lastClose": decimal_to_str(last_close),
+        "recentHigh": decimal_to_str(recent_high),
+        "recentLow": decimal_to_str(recent_low),
+        "pullbackPct": decimal_to_str(pullback_pct),
+        "reboundPct": decimal_to_str(rebound_pct),
+    }
+
+
+def liquidation_buffer_pct(last_price: Decimal, liq_price: Decimal, position_side: str) -> Decimal:
+    if liq_price <= 0 or last_price <= 0:
+        return Decimal("0")
+    side = str(position_side or "").strip().lower()
+    if side == "long":
+        return ((last_price - liq_price) / last_price) * Decimal("100")
+    if side == "short":
+        return ((liq_price - last_price) / last_price) * Decimal("100")
+    return Decimal("0")
 
 
 def normalize_research_options(payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -5472,12 +5575,192 @@ def build_basis_arb_analysis(
     }
 
 
+def build_dip_swing_analysis(
+    automation: dict[str, Any],
+    client: OkxClient,
+) -> dict[str, Any]:
+    selected_target = resolve_selected_execution_target(automation)
+    inst_id = str(selected_target.get("swapInstId") or automation.get("swapInstId") or "")
+    if not inst_id:
+        raise OkxApiError("低买高卖策略缺少永续交易对")
+    jobs: dict[str, Any] = {
+        "swapTicker": lambda: extract_first_row(client.get_ticker(inst_id)),
+        "markPrice": lambda: extract_first_row(client.get_mark_price("SWAP", inst_id)),
+        "fundingRate": lambda: extract_first_row(client.get_funding_rate(inst_id)),
+        "openInterest": lambda: extract_first_row(client.get_open_interest("SWAP", inst_id)),
+        "swapCandles": lambda: get_closed_candles(
+            client,
+            inst_id,
+            selected_target["bar"],
+            max(int(selected_target.get("slowEma", 21)) + 30, 80),
+        ),
+        "positions": lambda: client.get_positions(inst_id).get("data", []) if getattr(client, "api_key", "") else [],
+    }
+    fetched: dict[str, Any] = {}
+    errors: list[str] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs)) as executor:
+        future_map = {executor.submit(fn): key for key, fn in jobs.items()}
+        for future in concurrent.futures.as_completed(future_map):
+            key = future_map[future]
+            try:
+                fetched[key] = future.result()
+            except Exception as exc:
+                errors.append(f"{key}: {exc}")
+    if errors:
+        raise OkxApiError(f"联网分析失败: {'; '.join(errors)}")
+
+    candles = fetched["swapCandles"]
+    signal = build_pullback_signal(candles, int(selected_target["fastEma"]), int(selected_target["slowEma"]))
+    last_price = safe_decimal(signal.get("lastClose"), "0")
+    mark_price = safe_decimal(fetched["markPrice"].get("markPx"), "0")
+    funding_rate_pct = safe_decimal(fetched["fundingRate"].get("fundingRate"), "0") * Decimal("100")
+    basis_pct = pct_gap(last_price, mark_price)
+    pullback_pct = safe_decimal(signal.get("pullbackPct"), "0")
+    rebound_pct = safe_decimal(signal.get("reboundPct"), "0")
+    leverage = safe_decimal(selected_target.get("swapLeverage"), "1")
+    positions = fetched["positions"] or []
+    open_position = next((row for row in positions if safe_decimal(row.get("pos"), "0") != 0), {})
+    pos_value = safe_decimal(open_position.get("pos"), "0")
+    position_side = "flat"
+    if pos_value > 0:
+        position_side = "long"
+    elif pos_value < 0:
+        position_side = "short"
+    liq_price = safe_decimal(open_position.get("liqPx"), "0")
+    liq_buffer = liquidation_buffer_pct(last_price, liq_price, position_side)
+    open_interest = (
+        fetched["openInterest"].get("oiUsd")
+        or fetched["openInterest"].get("oi")
+        or fetched["openInterest"].get("oiCcy")
+        or "--"
+    )
+
+    blockers: list[str] = []
+    warnings: list[str] = []
+    if str(selected_target.get("swapTdMode") or "") != "isolated":
+        blockers.append("低买高卖策略要求逐仓，避免把整账户拖进强平")
+    if leverage > DIP_SWING_MAX_LEVERAGE:
+        blockers.append(f"当前杠杆 {decimal_to_str(leverage)}x 过高，已限制到 ≤ {decimal_to_str(DIP_SWING_MAX_LEVERAGE)}x")
+    if position_side == "long" and liq_buffer > 0 and liq_buffer <= DIP_SWING_MIN_LIQ_BUFFER_PCT:
+        blockers.append(f"当前强平缓冲只剩 {compact_metric(liq_buffer, '0.1')}%，不满足安全缓冲")
+    if funding_rate_pct >= Decimal("0.03"):
+        warnings.append("当前多头资金费偏热，抬高持仓成本")
+    if basis_pct >= Decimal("0.20"):
+        warnings.append("永续高于标记价较多，追高风险升高")
+    if signal["trend"] != "up":
+        warnings.append("当前趋势未转强，不做低吸开多")
+    elif pullback_pct < DIP_SWING_PULLBACK_PCT:
+        warnings.append(
+            f"当前回撤 {compact_metric(pullback_pct, '0.1')}%，还没到低吸区 {format_decimal(DIP_SWING_PULLBACK_PCT, 1)}%"
+        )
+    elif signal["signal"] != "pullback_buy":
+        warnings.append(
+            f"回撤够了，但反弹确认只有 {compact_metric(rebound_pct, '0.1')}%，继续等确认"
+        )
+    if position_side == "short":
+        blockers.append("检测到空单残留，先清掉再切换到低买高卖")
+
+    allow_new_entries = (
+        not blockers
+        and position_side == "flat"
+        and signal["trend"] == "up"
+        and signal["signal"] == "pullback_buy"
+    )
+    if blockers:
+        decision = "skip"
+        decision_label = "先收缩风险"
+    elif allow_new_entries:
+        decision = "execute"
+        decision_label = "允许低吸开多"
+    elif signal["trend"] != "up":
+        decision = "observe"
+        decision_label = "趋势未转强"
+    else:
+        decision = "observe"
+        decision_label = "等待回撤买点"
+
+    symbol = strategy_symbol_label(selected_target)
+    summary_bits = [
+        f"{symbol} 低买高卖",
+        f"回撤 {compact_metric(pullback_pct, '0.1')}%",
+        f"反弹 {compact_metric(rebound_pct, '0.1')}%",
+        f"资金费 {compact_metric(funding_rate_pct, '0.001')}%",
+        f"目标止盈 {selected_target.get('takeProfitPct', '8')}%",
+    ]
+    if position_side == "long" and liq_buffer > 0:
+        summary_bits.append(f"强平缓冲 {compact_metric(liq_buffer, '0.1')}%")
+    if blockers:
+        summary_bits.append(blockers[0])
+    elif allow_new_entries:
+        summary_bits.append("回撤和反弹确认都到位，允许逐仓开多")
+    elif signal["trend"] != "up":
+        summary_bits.append("趋势还没重新抬头，继续等")
+    else:
+        summary_bits.append("继续等更深回撤或更明确的反弹确认")
+
+    return {
+        "statusText": "已联网分析",
+        "decision": decision,
+        "decisionLabel": decision_label,
+        "summary": " · ".join(summary_bits),
+        "selectedStrategyName": f"{symbol} 低买高卖",
+        "selectedStrategyDetail": strategy_detail_line(selected_target),
+        "selectedReturnPct": "",
+        "selectedDrawdownPct": "",
+        "selectedWinRatePct": "",
+        "selectedScore": "",
+        "allowNewEntries": allow_new_entries,
+        "optimizerRefreshed": False,
+        "lastAnalyzedAt": now_local_iso(),
+        "marketRegime": "回撤低吸",
+        "spotTrend": "",
+        "swapTrend": f"{signal['trend']} / {signal['signal']}",
+        "volatilityPct": compact_metric(recent_range_pct(candles), "0.01"),
+        "spreadPct": "",
+        "basisPct": compact_metric(basis_pct, "0.01"),
+        "fundingRatePct": compact_metric(funding_rate_pct, "0.001"),
+        "openInterest": str(open_interest),
+        "warnings": warnings,
+        "blockers": blockers,
+        "selectedConfig": deep_merge({}, selected_target),
+        "pullbackPct": compact_metric(pullback_pct, "0.1"),
+        "reboundPct": compact_metric(rebound_pct, "0.1"),
+        "liquidationPrice": decimal_to_str(liq_price) if liq_price > 0 else "",
+        "liquidationBufferPct": compact_metric(liq_buffer, "0.1") if liq_buffer > 0 else "",
+        "research": {
+            "running": False,
+            "statusText": "低买高卖模式",
+            "mode": "dip_swing",
+            "lastRunAt": now_local_iso(),
+            "historyLimit": len(candles),
+            "sampleCount": len(candles),
+            "summary": {
+                "pullbackPct": compact_metric(pullback_pct, "0.1"),
+                "reboundPct": compact_metric(rebound_pct, "0.1"),
+                "fundingRatePct": compact_metric(funding_rate_pct, "0.001"),
+            },
+            "bestConfig": deep_merge({}, selected_target),
+            "leaderboard": [],
+            "generationSummaries": [],
+            "pipeline": {
+                "mode": "dip_swing",
+                "status": decision,
+            },
+            "markets": {},
+            "notes": [],
+            "equityCurve": [],
+        },
+    }
+
+
 def build_execution_analysis(
     automation: dict[str, Any],
     client: OkxClient,
 ) -> dict[str, Any]:
     if str(automation.get("strategyPreset") or "") == "basis_arb":
         return build_basis_arb_analysis(automation, client)
+    if str(automation.get("strategyPreset") or "") == "dip_swing":
+        return build_dip_swing_analysis(automation, client)
     research = research_optimize(automation, runtime_research_options(automation), client)
     best_entry = (research.get("leaderboard") or [{}])[0]
     best_config = deep_merge({}, research.get("bestConfig") or automation)
@@ -7898,6 +8181,174 @@ class AutomationEngine:
             if sell_size >= min_size:
                 self._place_spot_order(client, inst_id, "sell", sell_size, "死叉离场", market_key=market_key)
 
+    def _run_dip_swing_swap_cycle(
+        self,
+        client: OkxClient,
+        automation: dict[str, Any],
+        allow_new_entries: bool,
+        analysis_label: str,
+        *,
+        market_key: str = "swap",
+    ) -> None:
+        inst_id = automation["swapInstId"]
+        meta = get_instrument_meta(client, "SWAP", inst_id)
+        candles = get_closed_candles(
+            client,
+            inst_id,
+            automation["bar"],
+            max(int(automation["slowEma"]) + 30, 80),
+        )
+        signal = build_pullback_signal(candles, int(automation["fastEma"]), int(automation["slowEma"]))
+        positions = client.get_positions(inst_id).get("data", [])
+        open_position = next((row for row in positions if safe_decimal(row.get("pos"), "0") != 0), {})
+        pos_value = safe_decimal(open_position.get("pos"), "0")
+        abs_pos = abs(pos_value)
+        entry_price = safe_decimal(open_position.get("avgPx"), "0")
+        last_price = safe_decimal(signal["lastClose"])
+        liq_price = safe_decimal(open_position.get("liqPx"), "0")
+        liq_buffer = liquidation_buffer_pct(last_price, liq_price, "long" if pos_value > 0 else "short" if pos_value < 0 else "flat")
+        lot_size = safe_decimal(meta.get("lotSz"), "1")
+        position_side = "flat"
+        if pos_value > 0:
+            position_side = "long"
+        elif pos_value < 0:
+            position_side = "short"
+        floating_pnl = safe_decimal(open_position.get("upl"), "0")
+        floating_pnl_pct = Decimal("0")
+        if entry_price > 0 and last_price > 0 and position_side == "long":
+            floating_pnl_pct = ((last_price - entry_price) / entry_price) * Decimal("100")
+
+        status_text = (
+            f"回撤 {compact_metric(signal.get('pullbackPct'), '0.1')}% / "
+            f"反弹 {compact_metric(signal.get('reboundPct'), '0.1')}%"
+        )
+        if liq_buffer > 0:
+            status_text += f" / 强平缓冲 {compact_metric(liq_buffer, '0.1')}%"
+        self._set_market(
+            market_key,
+            {
+                "enabled": True,
+                "instId": inst_id,
+                "signal": signal["signal"],
+                "trend": signal["trend"],
+                "lastPrice": signal["lastClose"],
+                "positionSide": position_side,
+                "positionSize": decimal_to_str(abs_pos),
+                "positionNotional": decimal_to_str(abs_pos * last_price),
+                "entryPrice": decimal_to_str(entry_price) if entry_price > 0 else "",
+                "floatingPnl": decimal_to_str(floating_pnl),
+                "floatingPnlPct": decimal_to_str(floating_pnl_pct),
+                "pnlSource": "逐仓永续未实现盈亏",
+                "riskBudget": decimal_to_str(safe_decimal(automation.get("swapContracts"), "0")),
+                "riskCap": decimal_to_str(safe_decimal(automation.get("swapLeverage"), "0")),
+                "riskMode": str(automation.get("swapTdMode") or "isolated"),
+                "riskLabel": build_market_risk_label(automation, "swap"),
+                "liquidationPrice": decimal_to_str(liq_price) if liq_price > 0 else "",
+                "liquidationBufferPct": decimal_to_str(liq_buffer) if liq_buffer > 0 else "",
+                "lastMessage": f"低吸监控 · {status_text}",
+            },
+        )
+
+        if position_side == "short":
+            close_size = round_down(abs_pos, lot_size)
+            if close_size > 0:
+                self._place_swap_order(
+                    client,
+                    inst_id,
+                    "buy",
+                    close_size,
+                    automation["swapTdMode"],
+                    "切换低买高卖，先平空单",
+                    reduce_only=True,
+                    market_key=market_key,
+                )
+            return
+
+        stop_loss = safe_decimal(automation.get("stopLossPct"), "0")
+        take_profit = safe_decimal(automation.get("takeProfitPct"), "0")
+        if position_side == "long" and entry_price > 0:
+            if liq_buffer > 0 and liq_buffer <= DIP_SWING_MIN_LIQ_BUFFER_PCT:
+                self._place_swap_order(
+                    client,
+                    inst_id,
+                    "sell",
+                    round_down(abs_pos, lot_size),
+                    automation["swapTdMode"],
+                    "强平缓冲不足，主动退场",
+                    reduce_only=True,
+                    market_key=market_key,
+                )
+                return
+            if stop_loss > 0 and last_price <= entry_price * (Decimal("1") - stop_loss / Decimal("100")):
+                self._place_swap_order(
+                    client,
+                    inst_id,
+                    "sell",
+                    round_down(abs_pos, lot_size),
+                    automation["swapTdMode"],
+                    "低吸多单止损",
+                    reduce_only=True,
+                    market_key=market_key,
+                )
+                return
+            if take_profit > 0 and last_price >= entry_price * (Decimal("1") + take_profit / Decimal("100")):
+                self._place_swap_order(
+                    client,
+                    inst_id,
+                    "sell",
+                    round_down(abs_pos, lot_size),
+                    automation["swapTdMode"],
+                    "低吸多单止盈",
+                    reduce_only=True,
+                    market_key=market_key,
+                )
+                return
+            cooldown_ready, reason = self._cooldown_ready(market_key, int(automation["cooldownSeconds"]))
+            if signal["trend"] != "up":
+                if cooldown_ready:
+                    self._place_swap_order(
+                        client,
+                        inst_id,
+                        "sell",
+                        round_down(abs_pos, lot_size),
+                        automation["swapTdMode"],
+                        "趋势转弱，主动平多",
+                        reduce_only=True,
+                        market_key=market_key,
+                    )
+                else:
+                    self._set_market(market_key, {"lastMessage": f"趋势转弱，但{reason}"})
+                return
+            self._set_market(market_key, {"lastMessage": f"低吸持仓中 · {status_text} · 目标 {automation.get('takeProfitPct', '8')}%"})
+            return
+
+        trade_contracts = round_down(safe_decimal(automation.get("swapContracts"), "0"), lot_size)
+        if trade_contracts <= 0:
+            self._set_market(market_key, {"lastMessage": "永续张数为 0，已停止发单"})
+            return
+        if signal["signal"] != "pullback_buy":
+            if signal["trend"] != "up":
+                self._set_market(market_key, {"lastMessage": f"趋势未转强 · {status_text}"})
+            else:
+                self._set_market(market_key, {"lastMessage": f"等待更好的回撤买点 · {status_text}"})
+            return
+        if not allow_new_entries:
+            self._set_market(market_key, {"lastMessage": f"低吸买点出现，但当前联网决策层为“{analysis_label}”，本轮不新开仓"})
+            return
+        cooldown_ready, reason = self._cooldown_ready(market_key, int(automation["cooldownSeconds"]))
+        if not cooldown_ready:
+            self._set_market(market_key, {"lastMessage": f"低吸买点出现，但{reason}"})
+            return
+        self._place_swap_order(
+            client,
+            inst_id,
+            "buy",
+            trade_contracts,
+            automation["swapTdMode"],
+            "低吸开多",
+            market_key=market_key,
+        )
+
     def _run_swap_cycle(
         self,
         client: OkxClient,
@@ -7907,6 +8358,15 @@ class AutomationEngine:
         *,
         market_key: str = "swap",
     ) -> None:
+        if str(automation.get("strategyPreset") or "") == "dip_swing":
+            self._run_dip_swing_swap_cycle(
+                client,
+                automation,
+                allow_new_entries,
+                analysis_label,
+                market_key=market_key,
+            )
+            return
         inst_id = automation["swapInstId"]
         meta = get_instrument_meta(client, "SWAP", inst_id)
         candles = get_closed_candles(
