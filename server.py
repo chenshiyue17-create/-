@@ -1381,6 +1381,19 @@ def build_execution_targets(config: dict[str, Any]) -> list[dict[str, Any]]:
     return targets
 
 
+def resolve_selected_execution_target(config: dict[str, Any]) -> dict[str, Any]:
+    spot_inst_id = str(config.get("spotInstId") or "")
+    swap_inst_id = str(config.get("swapInstId") or "")
+    targets = build_execution_targets(config)
+    for target in targets:
+        if (
+            str(target.get("spotInstId") or "") == spot_inst_id
+            and str(target.get("swapInstId") or "") == swap_inst_id
+        ):
+            return target
+    return deep_merge(config, {})
+
+
 def strategy_mode_text(mode: str) -> str:
     normalized = str(mode or "").strip()
     if normalized == "short_only":
@@ -3235,6 +3248,8 @@ def strategy_short_name(config: dict[str, Any], rank: int | None = None) -> str:
 
 def strategy_detail_line(config: dict[str, Any], origin_label: str = "") -> str:
     if str(config.get("strategyPreset") or "") == "basis_arb":
+        selected_target = resolve_selected_execution_target(config)
+        watchlist_count = len(normalize_watchlist_symbols(config.get("watchlistSymbols"), config))
         parts = [
             "现货买入 + 永续对冲",
             f"入场价差 ≥ {config.get('arbEntrySpreadPct', '0.18')}%",
@@ -3242,6 +3257,11 @@ def strategy_detail_line(config: dict[str, Any], origin_label: str = "") -> str:
             f"最低资金费 {config.get('arbMinFundingRatePct', '0.005')}%",
             f"最长持有 {config.get('arbMaxHoldMinutes', 180)} 分钟",
         ]
+        if watchlist_count > 1:
+            parts.append(
+                f"{watchlist_count} 币并行 · 当前币约 {decimal_to_str(safe_decimal(selected_target.get('spotQuoteBudget'), '0'))}U / "
+                f"{decimal_to_str(safe_decimal(selected_target.get('swapContracts'), '0'))} 张"
+            )
         if origin_label:
             parts.append(origin_label)
         return " · ".join(part for part in parts if part)
@@ -4861,6 +4881,10 @@ def build_basis_arb_analysis(
     automation: dict[str, Any],
     client: OkxClient,
 ) -> dict[str, Any]:
+    selected_target = resolve_selected_execution_target(automation)
+    watchlist_count = len(normalize_watchlist_symbols(automation.get("watchlistSymbols"), automation))
+    allocated_spot_budget = safe_decimal(selected_target.get("spotQuoteBudget"), "0")
+    allocated_swap_contracts = safe_decimal(selected_target.get("swapContracts"), "0")
     jobs: dict[str, Any] = {
         "spotTicker": lambda: extract_first_row(client.get_ticker(automation["spotInstId"])),
         "swapTicker": lambda: extract_first_row(client.get_ticker(automation["swapInstId"])),
@@ -4927,6 +4951,15 @@ def build_basis_arb_analysis(
         warnings.append("最近波动偏大，套利腿可能被趋势拉扯")
     if basis_pct <= Decimal("-0.10"):
         warnings.append("永续最新价低于标记价，套利窗口不稳定")
+    if watchlist_count > 1:
+        warnings.append(
+            f"当前 {watchlist_count} 币并行，当前币分到约 {decimal_to_str(allocated_spot_budget)}U 现货预算 / "
+            f"{decimal_to_str(allocated_swap_contracts)} 张永续"
+        )
+        if allocated_swap_contracts < Decimal("1"):
+            warnings.append(
+                f"当前币永续只分到 {decimal_to_str(allocated_swap_contracts)} 张，触发时可能因最小张数或步长被挡住"
+            )
 
     allow_new_entries = not blockers and entry_spread_pct >= entry_threshold
     if allow_new_entries:
@@ -4985,6 +5018,9 @@ def build_basis_arb_analysis(
         "exitSpreadThresholdPct": compact_metric(exit_threshold, "0.001"),
         "fundingThresholdPct": compact_metric(min_funding, "0.001"),
         "fundingAligned": funding_aligned,
+        "watchlistCount": watchlist_count,
+        "allocatedSpotBudget": decimal_to_str(allocated_spot_budget),
+        "allocatedSwapContracts": decimal_to_str(allocated_swap_contracts),
         "openInterest": str(
             fetched["openInterest"].get("oiUsd")
             or fetched["openInterest"].get("oi")
@@ -7086,8 +7122,12 @@ class AutomationEngine:
             self._set_market(swap_key, {"arbStage": "blocked_budget", "lastMessage": "套利预算过小，现货腿无法开仓"})
             return
         if trade_contracts <= 0:
-            self._set_market(spot_key, {"arbStage": "blocked_hedge", "lastMessage": "永续张数为 0，无法建立套利对冲"})
-            self._set_market(swap_key, {"arbStage": "blocked_hedge", "lastMessage": "永续张数为 0，无法建立套利对冲"})
+            hedge_message = (
+                f"当前币只分到 {decimal_to_str(safe_decimal(automation.get('swapContracts'), '0'))} 张，"
+                f"按步长 {decimal_to_str(swap_lot_size)} 取整后为 0，无法建立套利对冲"
+            )
+            self._set_market(spot_key, {"arbStage": "blocked_hedge", "lastMessage": hedge_message})
+            self._set_market(swap_key, {"arbStage": "blocked_hedge", "lastMessage": hedge_message})
             return
 
         self._place_spot_order(
