@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>10U战神</title>
-    <link rel="stylesheet" href="/styles.css?v=20260408-livefix" />
+    <link rel="stylesheet" href="/styles.css?v=20260409-portfolio" />
   </head>
   <body data-view="focus">
     <canvas id="tunnel-bg" aria-hidden="true"></canvas>
@@ -25,10 +25,68 @@
         <nav class="nav">
           <button class="nav-link active" type="button" data-view="focus">聚焦工作台</button>
           <button class="nav-link" type="button" data-view="research">策略研究</button>
-          <button class="nav-link" type="button" data-view="trade">交易执行</button>
+          <button class="nav-link" type="button" data-view="trade">交易配置</button>
+          <button class="nav-link" type="button" data-view="orders">订单终端</button>
           <button class="nav-link" type="button" data-view="market">行情监控</button>
           <button class="nav-link" type="button" data-view="miner">矿机看板</button>
         </nav>
+        <section class="rail-strategy-card">
+          <div class="rail-strategy-head">
+            <div>
+              <div class="eyebrow">Strategy Control</div>
+              <strong id="rail-strategy-state">策略待机</strong>
+            </div>
+            <span class="pill" id="rail-strategy-pill">待同步</span>
+          </div>
+          <div class="rail-strategy-summary">
+            <div>
+              <span>当前策略</span>
+              <strong id="rail-strategy-meta">等待策略配置</strong>
+            </div>
+            <div>
+              <span>并行标的</span>
+              <strong id="rail-strategy-watchlist">等待 watchlist</strong>
+            </div>
+            <div>
+              <span>执行护栏</span>
+              <strong id="rail-strategy-guard">等待环境检查</strong>
+            </div>
+          </div>
+          <div class="rail-strategy-live">
+            <div>
+              <span>应用状态</span>
+              <strong id="rail-strategy-apply">等待应用</strong>
+            </div>
+            <div>
+              <span>组合收益</span>
+              <strong id="rail-strategy-pnl">--</strong>
+            </div>
+          </div>
+          <div class="rail-toggle-list">
+            <label class="rail-toggle-row" for="railAutoAutostart">
+              <span>自动启动</span>
+              <input id="railAutoAutostart" type="checkbox" />
+            </label>
+            <label class="rail-toggle-row" for="railAutoAllowLiveManualOrders">
+              <span>手动实盘</span>
+              <input id="railAutoAllowLiveManualOrders" type="checkbox" />
+            </label>
+            <label class="rail-toggle-row" for="railAutoAllowLiveTrading">
+              <span>自动实盘</span>
+              <input id="railAutoAllowLiveTrading" type="checkbox" />
+            </label>
+            <label class="rail-toggle-row" for="railAutoAllowLiveAutostart">
+              <span>实盘自启</span>
+              <input id="railAutoAllowLiveAutostart" type="checkbox" />
+            </label>
+          </div>
+          <div class="rail-action-grid">
+            <button id="rail-save-automation" class="btn btn-secondary" type="button">保存</button>
+            <button id="rail-run-automation-once" class="btn btn-ghost" type="button">跑一轮</button>
+            <button id="rail-start-automation" class="btn btn-primary" type="button">启动</button>
+            <button id="rail-stop-automation" class="btn btn-ghost danger" type="button">停止</button>
+          </div>
+        </section>
         <div class="rail-highlights">
           <div class="rail-stat">
             <span>总余额</span>
@@ -271,6 +329,8 @@
                   <button class="chip" type="button" data-pair-preset="btc">BTC</button>
                   <button class="chip" type="button" data-pair-preset="eth">ETH</button>
                   <button class="chip" type="button" data-pair-preset="sol">SOL</button>
+                  <button class="chip" type="button" data-pair-preset="doge">DOGE</button>
+                  <button class="chip" type="button" data-pair-preset="xrp">XRP</button>
                 </div>
               </div>
             </div>
@@ -278,6 +338,7 @@
               <div>
                 <span>当前环境</span>
                 <strong id="active-env-label">正在同步环境</strong>
+                <small id="active-env-state" class="quick-state-hint">等待读取</small>
               </div>
               <div>
                 <span>当前组合</span>
@@ -494,10 +555,37 @@
               <span>今日订单数</span>
               <strong id="bot-order-count">0</strong>
             </div>
-            <div class="bot-meta">
-              <span>日内回撤</span>
-              <strong id="bot-drawdown">0%</strong>
+          <div class="bot-meta">
+            <span>日内回撤</span>
+            <strong id="bot-drawdown">0%</strong>
+          </div>
+          </div>
+          <div class="portfolio-overview-surface">
+            <div class="portfolio-overview-head">
+              <div>
+                <div class="eyebrow">Portfolio Engine</div>
+                <strong>每个币独立决策、独立风控、独立仓位摘要</strong>
+              </div>
+              <span class="pill" id="strategy-application-badge">等待应用</span>
             </div>
+            <div class="portfolio-summary-grid">
+              <div class="portfolio-summary-card">
+                <span>应用状态</span>
+                <strong id="strategy-application-status">等待应用策略</strong>
+                <small id="strategy-application-detail">从研究榜单应用或保存配置后，这里会明确告诉你当前组合是否已生效。</small>
+              </div>
+              <div class="portfolio-summary-card">
+                <span>组合收益</span>
+                <strong id="portfolio-pnl-main">--</strong>
+                <small id="portfolio-pnl-sub">等待策略启动后统计会话收益</small>
+              </div>
+              <div class="portfolio-summary-card">
+                <span>当前组合</span>
+                <strong id="portfolio-context-main">等待 watchlist</strong>
+                <small id="portfolio-context-sub">每个币独立执行，统一受组合护栏约束。</small>
+              </div>
+            </div>
+            <div id="portfolio-watchlist" class="portfolio-watchlist-grid empty">等待组合交易状态</div>
           </div>
           <div class="focus-inline-note">
             聚焦模式只保留研究入口和运行状态。切到“策略研究”再看完整参数、状态明细和日志。
@@ -531,6 +619,10 @@
             <label>
               <span>每日最大订单数</span>
               <input id="autoMaxOrdersPerDay" type="number" min="1" value="20" />
+            </label>
+            <label>
+              <span>多币 watchlist</span>
+              <input id="autoWatchlistSymbols" placeholder="BTC,ETH,SOL" />
             </label>
             <label class="checkbox-row">
               <span>启用现货策略</span>
@@ -909,10 +1001,59 @@
           </div>
         </section>
 
-        <section class="panel panel-orders" id="orders" data-view-group="trade">
+        <section class="panel panel-orders" id="orders" data-view-group="orders">
           <div class="section-title">
-            <div class="eyebrow">下单</div>
-            <h2>现货与合约两张票据分开控</h2>
+            <div class="eyebrow">Orders Terminal</div>
+            <h2>下单、订单流、收益判断全部放在同一页</h2>
+          </div>
+          <div class="order-context-surface">
+            <div class="order-context-copy">
+              <div class="eyebrow">当前下单上下文</div>
+              <h3>先锁环境，再切币，再下单</h3>
+              <p>订单页只保留你真正会频繁操作的内容：当前环境、当前标的、多币快速切换、下单票据和订单详情。</p>
+            </div>
+            <div class="order-context-grid">
+              <div class="order-context-card">
+                <span>当前环境</span>
+                <strong id="order-env-label">等待环境</strong>
+                <small id="order-env-sub">先确认是模拟盘还是实盘</small>
+              </div>
+              <div class="order-context-card">
+                <span>现货下单标的</span>
+                <strong id="order-spot-label">BTC-USDT</strong>
+                <small>对应现货票据</small>
+              </div>
+              <div class="order-context-card">
+                <span>永续下单标的</span>
+                <strong id="order-swap-label">BTC-USDT-SWAP</strong>
+                <small>对应永续票据</small>
+              </div>
+              <div class="order-context-card">
+                <span>并行 watchlist</span>
+                <strong id="order-watchlist-label">BTC</strong>
+                <small>策略轮询与下单参考</small>
+              </div>
+            </div>
+            <div class="quick-group order-coin-group">
+              <span class="quick-label">更多币种快速切换</span>
+              <div class="chip-group" id="order-pair-quick-group">
+                <button class="chip" type="button" data-pair-preset="btc">BTC</button>
+                <button class="chip" type="button" data-pair-preset="eth">ETH</button>
+                <button class="chip" type="button" data-pair-preset="sol">SOL</button>
+                <button class="chip" type="button" data-pair-preset="doge">DOGE</button>
+                <button class="chip" type="button" data-pair-preset="xrp">XRP</button>
+              </div>
+            </div>
+            <div class="order-context-inputs">
+              <label>
+                <span>订单页现货 InstId</span>
+                <input id="orderSpotInstMirror" type="text" placeholder="BTC-USDT" />
+              </label>
+              <label>
+                <span>订单页永续 InstId</span>
+                <input id="orderSwapInstMirror" type="text" placeholder="BTC-USDT-SWAP" />
+              </label>
+            </div>
           </div>
           <div class="ticket-grid">
             <form class="ticket" id="spot-order-form">
@@ -970,6 +1111,11 @@
                 <strong id="order-summary-source">-</strong>
               </div>
             </div>
+            <div id="orderGlobalSummary" class="order-global-summary empty">订单终端会在这里显示组合总收益、已实现、持仓浮动和现价估算。</div>
+            <div id="orderSymbolOverview" class="order-symbol-overview empty">更多币种订单进来后，这里会按币显示独立订单流和收益汇总。</div>
+            <div id="orderTerminalFocus" class="order-terminal-focus empty">聚焦某个币后，这里会显示当前订单流、收益拆分和下单上下文。</div>
+            <div id="orderTimelineBoard" class="order-timeline-board empty">多币订单进来后，这里会显示每个币的收益曲线和组合收益拆分时间线。</div>
+            <div id="orderTerminalToolbar" class="order-terminal-toolbar empty">订单终端会在这里显示当前聚焦币和状态过滤器。</div>
             <div class="orders-terminal">
               <div id="recentOrders" class="orders-feed empty">暂无订单数据</div>
               <aside id="orderDetail" class="order-detail empty">
@@ -984,6 +1130,6 @@
       </main>
     </div>
 
-    <script src="/app.js?v=20260408-livefix"></script>
+    <script src="/app.js?v=20260409-portfolio"></script>
   </body>
-  </html>
+</html>
