@@ -169,7 +169,7 @@ const STRATEGY_PRESETS = {
       slowEma: 48,
       pollSeconds: 8,
       cooldownSeconds: 45,
-      maxOrdersPerDay: 12,
+      maxOrdersPerDay: 0,
       spotEnabled: false,
       spotQuoteBudget: "0",
       spotMaxExposure: "0",

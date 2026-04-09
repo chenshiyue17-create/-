@@ -1325,8 +1325,8 @@ def validate_single_automation_target(config: dict[str, Any]) -> str:
         return "轮询秒数需在 5 到 300 之间"
     if cooldown < 0 or cooldown > 3600:
         return "冷却秒数需在 0 到 3600 之间"
-    if max_orders < 1 or max_orders > 500:
-        return "每日最大订单数需在 1 到 500 之间"
+    if max_orders < 0 or max_orders > 500:
+        return "每日最大订单数需在 0 到 500 之间；0 代表不限制"
     if config.get("swapStrategyMode") not in ("long_only", "short_only", "trend_follow"):
         return "永续策略模式不支持"
     if config.get("swapTdMode") not in ("cross", "isolated"):
@@ -7569,12 +7569,12 @@ class AutomationEngine:
             if not passed and not stop_reason:
                 stop_reason = "自动量化已停止：超过日内最大回撤"
 
-        passed_order_limit = order_count_today < max_orders_per_day
+        passed_order_limit = max_orders_per_day <= 0 or order_count_today < max_orders_per_day
         checks.append(
             {
                 "name": "max_orders_per_day",
                 "passed": passed_order_limit,
-                "detail": f"当日下单 {order_count_today} / 上限 {max_orders_per_day}",
+                "detail": f"当日下单 {order_count_today} / 上限 {'不限制' if max_orders_per_day <= 0 else max_orders_per_day}",
             }
         )
         if not passed_order_limit and not stop_reason:
