@@ -50,6 +50,7 @@ MAC_LOTTO_LOG_PATH = DATA_DIR / "mac-lotto.log"
 HOST = os.environ.get("OKX_LOCAL_APP_HOST", "127.0.0.1")
 PORT = int(os.environ.get("OKX_LOCAL_APP_PORT", "8765"))
 MAX_LOG_ENTRIES = 120
+SPOT_SELL_PROTECTION_PCT = Decimal("2.0")
 SECURE_FILE_MAGIC = "okx-local-app-secure-v1"
 KEYCHAIN_SERVICE = "com.cc.okxlocalapp.local-file-key"
 KEYCHAIN_ACCOUNT = "default"
@@ -951,6 +952,20 @@ def decimal_to_str(value: Decimal | str | int | float) -> str:
     return rendered or "0"
 
 
+def format_decimal(value: Decimal | str | int | float, places: int = 2) -> str:
+    number = safe_decimal(value)
+    if places <= 0:
+        quantized = number.quantize(Decimal("1"))
+    else:
+        quantized = number.quantize(Decimal("1").scaleb(-places))
+    rendered = format(quantized, "f")
+    if rendered in ("", "-0"):
+        return "0"
+    if "." in rendered:
+        rendered = rendered.rstrip("0").rstrip(".")
+    return rendered or "0"
+
+
 def round_down(value: Decimal, step: Decimal) -> Decimal:
     if step <= 0:
         return value
@@ -985,6 +1000,7 @@ def default_automation_config() -> dict[str, Any]:
         "spotInstId": "BTC-USDT",
         "swapInstId": "BTC-USDT-SWAP",
         "watchlistSymbols": "BTC",
+        "watchlistOverrides": {},
         "bar": "5m",
         "fastEma": 9,
         "slowEma": 21,
@@ -1002,6 +1018,11 @@ def default_automation_config() -> dict[str, Any]:
         "stopLossPct": "1.2",
         "takeProfitPct": "2.4",
         "maxDailyLossPct": "3.0",
+        "arbEntrySpreadPct": "0.18",
+        "arbExitSpreadPct": "0.05",
+        "arbMinFundingRatePct": "0.005",
+        "arbMaxHoldMinutes": 180,
+        "arbRequireFundingAlignment": True,
         "autostart": False,
         "allowLiveManualOrders": False,
         "allowLiveTrading": False,
@@ -1033,6 +1054,7 @@ def default_market_state() -> dict[str, Any]:
         "lastOrderId": "",
         "lastMessage": "",
         "lastTradeAt": "",
+        "arbStage": "",
         "prepared": False,
     }
 
@@ -1060,6 +1082,29 @@ def default_automation_state() -> dict[str, Any]:
             "title": "等待应用策略",
             "detail": "",
             "appliedAt": "",
+        },
+        "lastPipeline": {
+            "signal": "idle",
+            "portfolio": "idle",
+            "risk": "idle",
+            "execution": "idle",
+            "targetCount": 0,
+            "allowNewEntries": False,
+            "equity": "0",
+            "completedAt": "",
+            "summary": "",
+        },
+        "lastRiskReport": {
+            "status": "idle",
+            "stopReason": "",
+            "drawdownPct": "0",
+            "maxDailyLossPct": "0",
+            "orderCountToday": 0,
+            "maxOrdersPerDay": 0,
+            "activeMarkets": 0,
+            "watchedSymbols": 0,
+            "checks": [],
+            "updatedAt": "",
         },
         "logs": [],
         "analysis": {
@@ -1138,34 +1183,205 @@ def normalize_watchlist_symbols(raw: Any, config: dict[str, Any] | None = None) 
     return (normalized or ["BTC"])[:8]
 
 
+WATCHLIST_OVERRIDE_DECIMAL_FIELDS = {
+    "spotQuoteBudget",
+    "spotMaxExposure",
+    "swapContracts",
+    "swapLeverage",
+    "stopLossPct",
+    "takeProfitPct",
+    "maxDailyLossPct",
+    "arbEntrySpreadPct",
+    "arbExitSpreadPct",
+    "arbMinFundingRatePct",
+}
+WATCHLIST_OVERRIDE_INT_FIELDS = {
+    "fastEma",
+    "slowEma",
+    "pollSeconds",
+    "cooldownSeconds",
+    "maxOrdersPerDay",
+    "arbMaxHoldMinutes",
+}
+WATCHLIST_OVERRIDE_BOOL_FIELDS = {"spotEnabled", "swapEnabled", "arbRequireFundingAlignment"}
+WATCHLIST_OVERRIDE_ENUM_FIELDS = {
+    "bar": {"1m", "5m", "15m", "1H"},
+    "swapTdMode": {"cross", "isolated"},
+    "swapStrategyMode": {"long_only", "short_only", "trend_follow"},
+}
+WATCHLIST_OVERRIDE_ALLOWED_FIELDS = (
+    WATCHLIST_OVERRIDE_DECIMAL_FIELDS
+    | WATCHLIST_OVERRIDE_INT_FIELDS
+    | WATCHLIST_OVERRIDE_BOOL_FIELDS
+    | set(WATCHLIST_OVERRIDE_ENUM_FIELDS.keys())
+)
+
+
+def normalize_symbol_token(raw: Any) -> str:
+    value = str(raw or "").strip().upper()
+    if "-" in value:
+        value = value.split("-")[0]
+    return re.sub(r"[^A-Z0-9]", "", value)
+
+
+def parse_watchlist_overrides(raw: Any) -> tuple[dict[str, dict[str, Any]], str]:
+    if raw in (None, "", {}, []):
+        return {}, ""
+    parsed = raw
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return {}, ""
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError as exc:
+            return {}, f"按币覆盖配置不是合法 JSON: {exc.msg}"
+    if not isinstance(parsed, dict):
+        return {}, "按币覆盖配置必须是对象，例如 {\"BTC\": {\"fastEma\": 12}}"
+
+    normalized: dict[str, dict[str, Any]] = {}
+    for symbol_key, override in parsed.items():
+        symbol = normalize_symbol_token(symbol_key)
+        if not symbol:
+            continue
+        if not isinstance(override, dict):
+            return {}, f"{symbol} 的按币覆盖必须是对象"
+        normalized_override: dict[str, Any] = {}
+        for field, value in override.items():
+            if field not in WATCHLIST_OVERRIDE_ALLOWED_FIELDS:
+                return {}, f"{symbol} 的按币覆盖字段不支持: {field}"
+            if field in WATCHLIST_OVERRIDE_DECIMAL_FIELDS:
+                normalized_override[field] = decimal_to_str(safe_decimal(value, "0"))
+            elif field in WATCHLIST_OVERRIDE_INT_FIELDS:
+                try:
+                    normalized_override[field] = int(value)
+                except (TypeError, ValueError):
+                    return {}, f"{symbol} 的按币覆盖字段 {field} 必须是整数"
+            elif field in WATCHLIST_OVERRIDE_BOOL_FIELDS:
+                normalized_override[field] = bool(value)
+            else:
+                normalized_value = str(value or "").strip()
+                allowed = WATCHLIST_OVERRIDE_ENUM_FIELDS.get(field)
+                if allowed and normalized_value not in allowed:
+                    return {}, f"{symbol} 的按币覆盖字段 {field} 不支持值 {normalized_value}"
+                normalized_override[field] = normalized_value
+        if normalized_override:
+            normalized[symbol] = normalized_override
+    return normalized, ""
+
+
+def validate_single_automation_target(config: dict[str, Any]) -> str:
+    if str(config.get("bar") or "") not in {"1m", "5m", "15m", "1H"}:
+        return "K 线周期仅支持 1m、5m、15m、1H"
+    fast = int(config.get("fastEma", 0))
+    slow = int(config.get("slowEma", 0))
+    poll = int(config.get("pollSeconds", 0))
+    cooldown = int(config.get("cooldownSeconds", 0))
+    max_orders = int(config.get("maxOrdersPerDay", 0))
+    if fast < 2 or slow <= fast:
+        return "EMA 参数不合法，必须满足 slow > fast >= 2"
+    if poll < 5 or poll > 300:
+        return "轮询秒数需在 5 到 300 之间"
+    if cooldown < 0 or cooldown > 3600:
+        return "冷却秒数需在 0 到 3600 之间"
+    if max_orders < 1 or max_orders > 500:
+        return "每日最大订单数需在 1 到 500 之间"
+    if config.get("swapStrategyMode") not in ("long_only", "short_only", "trend_follow"):
+        return "永续策略模式不支持"
+    if config.get("swapTdMode") not in ("cross", "isolated"):
+        return "永续保证金模式仅支持 cross 或 isolated"
+    for field in (
+        "spotQuoteBudget",
+        "spotMaxExposure",
+        "swapContracts",
+        "swapLeverage",
+        "stopLossPct",
+        "takeProfitPct",
+        "maxDailyLossPct",
+        "arbEntrySpreadPct",
+        "arbExitSpreadPct",
+        "arbMinFundingRatePct",
+    ):
+        if safe_decimal(config.get(field), "0") < 0:
+            return f"{field} 不能小于 0"
+    arb_max_hold = int(config.get("arbMaxHoldMinutes", 0) or 0)
+    if arb_max_hold < 0 or arb_max_hold > 7 * 24 * 60:
+        return "套利最长持有分钟需在 0 到 10080 之间"
+    if str(config.get("strategyPreset") or "") == "basis_arb":
+        if not config.get("spotEnabled") or not config.get("swapEnabled"):
+            return "高频套利必须同时启用现货和永续"
+        if safe_decimal(config.get("spotQuoteBudget"), "0") <= 0:
+            return "高频套利的现货预算必须大于 0"
+        if safe_decimal(config.get("swapContracts"), "0") <= 0:
+            return "高频套利的永续张数必须大于 0"
+        entry_spread = safe_decimal(config.get("arbEntrySpreadPct"), "0")
+        exit_spread = safe_decimal(config.get("arbExitSpreadPct"), "0")
+        if entry_spread <= 0:
+            return "高频套利的入场价差必须大于 0"
+        if exit_spread < 0:
+            return "高频套利的回补价差不能小于 0"
+        if exit_spread >= entry_spread:
+            return "高频套利的回补价差必须小于入场价差"
+    return ""
+
+
+def allocate_watchlist_numeric_field(
+    symbols: list[str],
+    overrides: dict[str, dict[str, Any]],
+    field: str,
+    total: Decimal,
+) -> dict[str, Decimal]:
+    explicit: dict[str, Decimal] = {}
+    for symbol in symbols:
+        if field in (overrides.get(symbol) or {}):
+            explicit[symbol] = safe_decimal(overrides[symbol].get(field), "0")
+    remaining_symbols = [symbol for symbol in symbols if symbol not in explicit]
+    remaining_total = total - sum(explicit.values(), Decimal("0"))
+    if remaining_total < 0:
+        remaining_total = Decimal("0")
+    per_symbol = remaining_total / Decimal(len(remaining_symbols)) if remaining_symbols else Decimal("0")
+    allocations: dict[str, Decimal] = {}
+    for symbol in symbols:
+        allocations[symbol] = explicit.get(symbol, per_symbol)
+    return allocations
+
+
 def build_execution_targets(config: dict[str, Any]) -> list[dict[str, Any]]:
     symbols = normalize_watchlist_symbols(config.get("watchlistSymbols"), config)
     target_count = max(1, len(symbols))
+    overrides = copy.deepcopy(config.get("watchlistOverrides") or {})
     spot_budget = safe_decimal(config.get("spotQuoteBudget"), "0")
     spot_exposure = safe_decimal(config.get("spotMaxExposure"), "0")
     swap_contracts = safe_decimal(config.get("swapContracts"), "0")
+    spot_budget_allocations = allocate_watchlist_numeric_field(symbols, overrides, "spotQuoteBudget", spot_budget)
+    spot_exposure_allocations = allocate_watchlist_numeric_field(symbols, overrides, "spotMaxExposure", spot_exposure)
+    swap_contract_allocations = allocate_watchlist_numeric_field(symbols, overrides, "swapContracts", swap_contracts)
     targets: list[dict[str, Any]] = []
 
     for index, symbol in enumerate(symbols):
         pair_config = deep_merge(config, {})
         pair_config["watchlistSymbols"] = ",".join(symbols)
+        pair_config["watchlistOverrides"] = copy.deepcopy(overrides)
         pair_config["watchlistSymbol"] = symbol
         pair_config["watchlistIndex"] = index
         pair_config["watchlistCount"] = target_count
         pair_config["spotInstId"] = f"{symbol}-USDT"
         pair_config["swapInstId"] = f"{symbol}-USDT-SWAP"
-        if target_count > 1:
-            if pair_config.get("spotEnabled"):
-                pair_config["spotQuoteBudget"] = decimal_to_str(spot_budget / Decimal(target_count))
-                pair_config["spotMaxExposure"] = decimal_to_str(spot_exposure / Decimal(target_count))
-            if pair_config.get("swapEnabled"):
-                pair_config["swapContracts"] = decimal_to_str(swap_contracts / Decimal(target_count))
+        if pair_config.get("spotEnabled"):
+            pair_config["spotQuoteBudget"] = decimal_to_str(spot_budget_allocations.get(symbol, Decimal("0")))
+            pair_config["spotMaxExposure"] = decimal_to_str(spot_exposure_allocations.get(symbol, Decimal("0")))
+        if pair_config.get("swapEnabled"):
+            pair_config["swapContracts"] = decimal_to_str(swap_contract_allocations.get(symbol, Decimal("0")))
+        symbol_override = copy.deepcopy(overrides.get(symbol) or {})
+        if symbol_override:
+            pair_config = deep_merge(pair_config, symbol_override)
+        pair_config["watchlistOverride"] = symbol_override
         targets.append(pair_config)
 
     return targets
 
 
-def strategy_mode_label(mode: str) -> str:
+def strategy_mode_text(mode: str) -> str:
     normalized = str(mode or "").strip()
     if normalized == "short_only":
         return "只做空"
@@ -1175,6 +1391,15 @@ def strategy_mode_label(mode: str) -> str:
 
 
 def build_market_risk_label(target: dict[str, Any], market_kind: str) -> str:
+    if str(target.get("strategyPreset") or "") == "basis_arb":
+        entry = safe_decimal(target.get("arbEntrySpreadPct"), "0")
+        exit_spread = safe_decimal(target.get("arbExitSpreadPct"), "0")
+        min_funding = safe_decimal(target.get("arbMinFundingRatePct"), "0")
+        return (
+            f"入场 ≥ {format_decimal(entry, 3)}% · "
+            f"回补 ≤ {format_decimal(exit_spread, 3)}% · "
+            f"资金费 ≥ {format_decimal(min_funding, 3)}%"
+        )
     if market_kind == "spot":
         budget = safe_decimal(target.get("spotQuoteBudget"), "0")
         cap = safe_decimal(target.get("spotMaxExposure"), "0")
@@ -1185,12 +1410,39 @@ def build_market_risk_label(target: dict[str, Any], market_kind: str) -> str:
     return f"{format_decimal(contracts, 2)} 张 · {format_decimal(leverage, 0)}x · {td_mode}"
 
 
+def basis_arb_stage_text(stage: str) -> str:
+    normalized = str(stage or "").strip().lower()
+    if normalized == "window_open":
+        return "套利窗口打开"
+    if normalized == "entry_wait":
+        return "套利窗口已出现，等待冷却"
+    if normalized == "funding_blocked":
+        return "资金费未对齐"
+    if normalized == "blocked_budget":
+        return "套利预算不足"
+    if normalized == "blocked_hedge":
+        return "永续对冲腿未配置"
+    if normalized == "hedged":
+        return "双腿已对冲，等待回补"
+    if normalized == "exit_wait":
+        return "满足回补条件，等待冷却"
+    if normalized == "exiting":
+        return "正在回补套利双腿"
+    if normalized == "rollback":
+        return "对冲失败，正在回滚"
+    if normalized == "broken_pair":
+        return "套利双腿不完整"
+    return "等待套利窗口"
+
+
 def build_watchlist_entry(
     symbol: str,
     target: dict[str, Any],
     spot_market: dict[str, Any],
     swap_market: dict[str, Any],
 ) -> dict[str, Any]:
+    symbol_override = copy.deepcopy(target.get("watchlistOverride") or {})
+    override_keys = sorted(symbol_override.keys())
     spot_notional = safe_decimal(spot_market.get("positionNotional"), "0")
     swap_notional = safe_decimal(swap_market.get("positionNotional"), "0")
     spot_pnl = safe_decimal(spot_market.get("floatingPnl"), "0")
@@ -1207,14 +1459,27 @@ def build_watchlist_entry(
     if str(swap_market.get("positionSide") or "flat") != "flat":
         active_legs.append("永续")
 
-    if active_legs:
+    is_basis_arb = str(target.get("strategyPreset") or "") == "basis_arb"
+    arb_stage = str(spot_market.get("arbStage") or swap_market.get("arbStage") or "").strip().lower()
+    if is_basis_arb:
+        status = basis_arb_stage_text(arb_stage)
+    elif active_legs:
         status = f"{' + '.join(active_legs)} 持仓中"
+    elif (
+        spot_market.get("signal") in {"arb_entry", "arb_hedged", "arb_active"}
+        or swap_market.get("signal") in {"arb_entry", "arb_hedged", "arb_active"}
+    ):
+        status = "套利窗口打开"
     elif spot_market.get("signal") in {"bull_cross", "bear_cross"} or swap_market.get("signal") in {"bull_cross", "bear_cross"}:
         status = "出现执行信号"
     else:
         status = "观察中"
 
     detail_bits = []
+    if override_keys:
+        detail_bits.append(
+            f"独立覆盖 {len(override_keys)} 项 · {target.get('bar', '5m')} EMA {target.get('fastEma', '-')}/{target.get('slowEma', '-')}"
+        )
     if str(spot_market.get("lastMessage") or "").strip():
         detail_bits.append(f"现货 {spot_market.get('lastMessage')}")
     if str(swap_market.get("lastMessage") or "").strip():
@@ -1225,13 +1490,16 @@ def build_watchlist_entry(
         "spot": copy.deepcopy(spot_market),
         "swap": copy.deepcopy(swap_market),
         "allocation": {
+            "strategyPreset": str(target.get("strategyPreset") or "dual_engine"),
             "spotBudget": decimal_to_str(safe_decimal(target.get("spotQuoteBudget"), "0")),
             "spotMaxExposure": decimal_to_str(safe_decimal(target.get("spotMaxExposure"), "0")),
             "swapContracts": decimal_to_str(safe_decimal(target.get("swapContracts"), "0")),
             "swapLeverage": decimal_to_str(safe_decimal(target.get("swapLeverage"), "0")),
             "swapTdMode": str(target.get("swapTdMode") or "cross"),
             "swapStrategyMode": str(target.get("swapStrategyMode") or "trend_follow"),
+            "overrideKeys": override_keys,
         },
+        "overrideActive": bool(override_keys),
         "summary": {
             "status": status,
             "detail": " · ".join(detail_bits[:2]),
@@ -1239,13 +1507,45 @@ def build_watchlist_entry(
             "exposureTotal": decimal_to_str(exposure_total),
             "floatingPnl": decimal_to_str(pnl_total),
             "floatingPnlPct": decimal_to_str(pnl_pct),
+            "arbStage": arb_stage,
+            "arbStageText": basis_arb_stage_text(arb_stage) if is_basis_arb else "",
             "riskLabel": (
                 f"现货 {build_market_risk_label(target, 'spot')} · "
                 f"永续 {build_market_risk_label(target, 'swap')} · "
-                f"{strategy_mode_label(str(target.get('swapStrategyMode') or 'trend_follow'))}"
+                f"{strategy_mode_text(str(target.get('swapStrategyMode') or 'trend_follow'))}"
             ),
         },
     }
+
+
+def summarize_basis_arb_watchlist(entries: list[dict[str, Any]]) -> dict[str, int]:
+    counts = {
+        "watching": 0,
+        "windowOpen": 0,
+        "hedged": 0,
+        "exitQueue": 0,
+        "rollback": 0,
+        "brokenPair": 0,
+        "blocked": 0,
+    }
+    for entry in entries:
+        summary = entry.get("summary") or {}
+        stage = str(summary.get("arbStage") or "").strip().lower()
+        if stage in {"window_open", "entry_wait"}:
+            counts["windowOpen"] += 1
+        elif stage == "hedged":
+            counts["hedged"] += 1
+        elif stage in {"exit_wait", "exiting"}:
+            counts["exitQueue"] += 1
+        elif stage == "rollback":
+            counts["rollback"] += 1
+        elif stage == "broken_pair":
+            counts["brokenPair"] += 1
+        elif stage.startswith("blocked") or stage == "funding_blocked":
+            counts["blocked"] += 1
+        else:
+            counts["watching"] += 1
+    return counts
 
 
 def default_miner_config() -> dict[str, Any]:
@@ -1270,6 +1570,20 @@ def default_miner_config() -> dict[str, Any]:
 def default_local_order_state() -> dict[str, Any]:
     return {
         "orders": [],
+        "lastReconciledAt": "",
+        "lastSource": "",
+        "summary": {
+            "totalOrders": 0,
+            "filledOrders": 0,
+            "workingOrders": 0,
+            "canceledOrders": 0,
+            "rejectedOrders": 0,
+            "filledRatioPct": "0",
+            "realizedPnl": "0",
+            "totalFees": "0",
+            "lastCancelReason": "",
+        },
+        "symbols": [],
     }
 
 
@@ -1605,13 +1919,210 @@ class OkxApiError(RuntimeError):
     pass
 
 
-def persist_local_orders(orders: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def normalize_execution_order(order: dict[str, Any]) -> dict[str, Any]:
+    row = copy.deepcopy(order or {})
+    for key in (
+        "ordId",
+        "clOrdId",
+        "instId",
+        "instType",
+        "tdMode",
+        "side",
+        "ordType",
+        "state",
+        "avgPx",
+        "fillPx",
+        "px",
+        "fee",
+        "pnl",
+        "cancelSource",
+        "cancelSourceReason",
+        "uTime",
+        "cTime",
+        "fillTime",
+        "tag",
+    ):
+        if key in row and row.get(key) is not None:
+            row[key] = str(row.get(key))
+    if "reduceOnly" in row:
+        value = row.get("reduceOnly")
+        if isinstance(value, str):
+            row["reduceOnly"] = value.lower() == "true"
+        else:
+            row["reduceOnly"] = bool(value)
+    return row
+
+
+def classify_execution_order_state(order: dict[str, Any]) -> str:
+    state = str(order.get("state") or "").strip().lower()
+    if state == "filled":
+        return "filled"
+    if state in {"live", "partially_filled", "partially-filled", "pending"}:
+        return "working"
+    if state in {"canceled", "cancelled", "mmp_canceled"}:
+        return "canceled"
+    if state in {"rejected", "failed", "order_failed"}:
+        return "rejected"
+    return "other"
+
+
+def execution_tag_family(order: dict[str, Any]) -> str:
+    action = str(order.get("strategyAction") or "").strip().lower()
+    if action in {"entry", "hedge", "exit", "cover", "rollback"}:
+        if action == "cover":
+            return "exit"
+        return action
+    tag = str(order.get("tag") or order.get("strategyTag") or "").strip().lower()
+    if not tag.startswith("arb_"):
+        return ""
+    if "entry" in tag:
+        return "entry"
+    if "hedge" in tag:
+        return "hedge"
+    if "cover" in tag or "exit" in tag:
+        return "exit"
+    if "rollback" in tag or tag.endswith("_rb"):
+        return "rollback"
+    return "arb"
+
+
+def build_execution_journal_summary(orders: list[dict[str, Any]]) -> dict[str, Any]:
+    normalized_orders = [normalize_execution_order(item) for item in orders]
+    total_orders = len(normalized_orders)
+    filled_orders = 0
+    working_orders = 0
+    canceled_orders = 0
+    rejected_orders = 0
+    realized_pnl = Decimal("0")
+    total_fees = Decimal("0")
+    last_cancel_reason = ""
+    arb_order_count = 0
+    arb_entry_orders = 0
+    arb_hedge_orders = 0
+    arb_exit_orders = 0
+    arb_rollback_orders = 0
+    arb_realized_pnl = Decimal("0")
+    arb_total_fees = Decimal("0")
+    symbol_rows: dict[str, dict[str, Any]] = {}
+
+    for order in normalized_orders:
+        kind = classify_execution_order_state(order)
+        tag_family = execution_tag_family(order)
+        if kind == "filled":
+            filled_orders += 1
+        elif kind == "working":
+            working_orders += 1
+        elif kind == "canceled":
+            canceled_orders += 1
+            if not last_cancel_reason:
+                last_cancel_reason = str(order.get("cancelSourceReason") or order.get("outcome") or "").strip()
+        elif kind == "rejected":
+            rejected_orders += 1
+            if not last_cancel_reason:
+                last_cancel_reason = str(order.get("cancelSourceReason") or order.get("outcome") or "").strip()
+
+        realized_pnl += safe_decimal(order.get("pnl"), "0")
+        total_fees += safe_decimal(order.get("fee"), "0")
+        if tag_family:
+            arb_order_count += 1
+            arb_realized_pnl += safe_decimal(order.get("pnl"), "0")
+            arb_total_fees += safe_decimal(order.get("fee"), "0")
+            if tag_family == "entry":
+                arb_entry_orders += 1
+            elif tag_family == "hedge":
+                arb_hedge_orders += 1
+            elif tag_family == "exit":
+                arb_exit_orders += 1
+            elif tag_family == "rollback":
+                arb_rollback_orders += 1
+
+        symbol = str(order.get("instId") or "UNKNOWN").strip() or "UNKNOWN"
+        target = symbol_rows.setdefault(
+            symbol,
+            {
+                "symbol": symbol,
+                "orderCount": 0,
+                "filledOrders": 0,
+                "workingOrders": 0,
+                "canceledOrders": 0,
+                "rejectedOrders": 0,
+                "realizedPnl": "0",
+                "totalFees": "0",
+                "lastState": "",
+                "lastTime": "0",
+                "arbOrderCount": 0,
+                "arbEntryOrders": 0,
+                "arbHedgeOrders": 0,
+                "arbExitOrders": 0,
+                "arbRollbackOrders": 0,
+                "arbRealizedPnl": "0",
+                "arbTotalFees": "0",
+            },
+        )
+        target["orderCount"] = int(target["orderCount"]) + 1
+        if kind == "filled":
+            target["filledOrders"] = int(target["filledOrders"]) + 1
+        elif kind == "working":
+            target["workingOrders"] = int(target["workingOrders"]) + 1
+        elif kind == "canceled":
+            target["canceledOrders"] = int(target["canceledOrders"]) + 1
+        elif kind == "rejected":
+            target["rejectedOrders"] = int(target["rejectedOrders"]) + 1
+        target["realizedPnl"] = decimal_to_str(safe_decimal(target.get("realizedPnl"), "0") + safe_decimal(order.get("pnl"), "0"))
+        target["totalFees"] = decimal_to_str(safe_decimal(target.get("totalFees"), "0") + safe_decimal(order.get("fee"), "0"))
+        if tag_family:
+            target["arbOrderCount"] = int(target.get("arbOrderCount") or 0) + 1
+            target["arbRealizedPnl"] = decimal_to_str(safe_decimal(target.get("arbRealizedPnl"), "0") + safe_decimal(order.get("pnl"), "0"))
+            target["arbTotalFees"] = decimal_to_str(safe_decimal(target.get("arbTotalFees"), "0") + safe_decimal(order.get("fee"), "0"))
+            if tag_family == "entry":
+                target["arbEntryOrders"] = int(target.get("arbEntryOrders") or 0) + 1
+            elif tag_family == "hedge":
+                target["arbHedgeOrders"] = int(target.get("arbHedgeOrders") or 0) + 1
+            elif tag_family == "rollback":
+                target["arbRollbackOrders"] = int(target.get("arbRollbackOrders") or 0) + 1
+            elif tag_family in {"exit", "cover"}:
+                target["arbExitOrders"] = int(target.get("arbExitOrders") or 0) + 1
+        last_time = str(order.get("uTime") or order.get("cTime") or "0")
+        if int(last_time or 0) >= int(target.get("lastTime") or 0):
+            target["lastState"] = str(order.get("state") or "")
+            target["lastTime"] = last_time
+
+    filled_ratio = Decimal("0")
+    terminal_orders = filled_orders + canceled_orders + rejected_orders
+    if terminal_orders > 0:
+        filled_ratio = (Decimal(filled_orders) / Decimal(terminal_orders)) * Decimal("100")
+
+    symbols = list(symbol_rows.values())
+    symbols.sort(key=lambda row: int(row.get("lastTime") or 0), reverse=True)
+    return {
+        "totalOrders": total_orders,
+        "filledOrders": filled_orders,
+        "workingOrders": working_orders,
+        "canceledOrders": canceled_orders,
+        "rejectedOrders": rejected_orders,
+        "filledRatioPct": decimal_to_str(filled_ratio),
+        "realizedPnl": decimal_to_str(realized_pnl),
+        "totalFees": decimal_to_str(total_fees),
+        "lastCancelReason": last_cancel_reason,
+        "arbOrderCount": arb_order_count,
+        "arbEntryOrders": arb_entry_orders,
+        "arbHedgeOrders": arb_hedge_orders,
+        "arbExitOrders": arb_exit_orders,
+        "arbRollbackOrders": arb_rollback_orders,
+        "arbRealizedPnl": decimal_to_str(arb_realized_pnl),
+        "arbTotalFees": decimal_to_str(arb_total_fees),
+        "arbNetPnl": decimal_to_str(arb_realized_pnl + arb_total_fees),
+        "symbols": symbols,
+    }
+
+
+def persist_local_orders(orders: list[dict[str, Any]], *, source: str = "") -> list[dict[str, Any]]:
     if not orders:
         return get_local_recent_orders(limit=80)
 
     def mutate(state: dict[str, Any]) -> None:
         existing = list(state.get("orders") or [])
-        merged = list(orders) + existing
+        merged = [normalize_execution_order(item) for item in list(orders) + existing]
         deduped: list[dict[str, Any]] = []
         seen = set()
         for item in merged:
@@ -1627,6 +2138,14 @@ def persist_local_orders(orders: list[dict[str, Any]]) -> list[dict[str, Any]]:
             reverse=True,
         )
         state["orders"] = deduped
+        state["lastReconciledAt"] = now_local_iso()
+        if source:
+            state["lastSource"] = source
+        summary = build_execution_journal_summary(deduped)
+        state["summary"] = {
+            key: value for key, value in summary.items() if key != "symbols"
+        }
+        state["symbols"] = summary.get("symbols") or []
 
     current = LOCAL_ORDER_STORE.update(mutate)
     return list(current.get("orders") or [])
@@ -1643,6 +2162,27 @@ def get_stored_local_orders(inst_type: str = "", limit: int = 20) -> list[dict[s
         reverse=True,
     )
     return items[:limit]
+
+
+def get_execution_journal_snapshot(inst_type: str = "", limit: int = 20) -> dict[str, Any]:
+    state = LOCAL_ORDER_STORE.current()
+    if inst_type:
+        orders = get_stored_local_orders(inst_type, limit=limit)
+        summary = build_execution_journal_summary(orders)
+        return {
+            "orders": orders,
+            "summary": {key: value for key, value in summary.items() if key != "symbols"},
+            "symbols": summary.get("symbols") or [],
+            "lastReconciledAt": str(state.get("lastReconciledAt") or ""),
+            "lastSource": str(state.get("lastSource") or ""),
+        }
+    return {
+        "orders": list((state.get("orders") or [])[:limit]),
+        "summary": copy.deepcopy(state.get("summary") or {}),
+        "symbols": list(state.get("symbols") or []),
+        "lastReconciledAt": str(state.get("lastReconciledAt") or ""),
+        "lastSource": str(state.get("lastSource") or ""),
+    }
 
 
 def derive_orders_from_automation_state(state: dict[str, Any] | None = None) -> list[dict[str, Any]]:
@@ -1712,6 +2252,7 @@ def merge_order_feeds(*feeds: list[dict[str, Any]], limit: int = 20) -> list[dic
     seen = set()
     for feed in feeds:
         for item in feed:
+            item = normalize_execution_order(item)
             key = item.get("ordId") or item.get("clOrdId")
             if not key or key in seen:
                 continue
@@ -1772,7 +2313,7 @@ def reconcile_automation_state_from_markets() -> None:
         return
 
     if derived and not get_stored_local_orders(limit=1):
-        persist_local_orders(derived)
+        persist_local_orders(derived, source="paper_state_recovered")
 
     def mutate(state: dict[str, Any]) -> None:
         if latest_stamp and not state.get("lastActionAt"):
@@ -2532,7 +3073,7 @@ class OkxPrivateOrderStream:
         if not orders:
             return
         with self.state_lock:
-            merged = list(orders) + self.orders
+            merged = [normalize_execution_order(item) for item in list(orders) + self.orders]
             deduped: list[dict[str, Any]] = []
             seen = set()
             for item in merged:
@@ -2547,7 +3088,7 @@ class OkxPrivateOrderStream:
             self.last_event_at = now_local_iso()
             self.connected = True
             self.last_error = ""
-        persist_local_orders(deduped[:40])
+        persist_local_orders(deduped[:40], source="private_ws")
 
 
 def validate_config(config: dict[str, Any]) -> tuple[bool, str]:
@@ -2593,41 +3134,29 @@ def validate_automation_config(config: dict[str, Any]) -> tuple[bool, str, dict[
     normalized = deep_merge(default_automation_config(), config)
     watchlist_symbols = normalize_watchlist_symbols(normalized.get("watchlistSymbols"), normalized)
     normalized["watchlistSymbols"] = ",".join(watchlist_symbols)
+    watchlist_overrides, overrides_error = parse_watchlist_overrides(normalized.get("watchlistOverrides"))
+    if overrides_error:
+        return False, overrides_error, normalized
+    normalized["watchlistOverrides"] = {
+        symbol: copy.deepcopy(override)
+        for symbol, override in watchlist_overrides.items()
+        if symbol in watchlist_symbols
+    }
     primary_symbol = watchlist_symbols[0]
     normalized["spotInstId"] = f"{primary_symbol}-USDT"
     normalized["swapInstId"] = f"{primary_symbol}-USDT-SWAP"
-    if normalized.get("strategyPreset") not in ("dual_engine", "btc_lotto"):
+    if normalized.get("strategyPreset") not in ("dual_engine", "btc_lotto", "basis_arb"):
         return False, "策略模式不支持", normalized
-    fast = int(normalized.get("fastEma", 0))
-    slow = int(normalized.get("slowEma", 0))
-    poll = int(normalized.get("pollSeconds", 0))
-    cooldown = int(normalized.get("cooldownSeconds", 0))
-    max_orders = int(normalized.get("maxOrdersPerDay", 0))
-    if fast < 2 or slow <= fast:
-        return False, "EMA 参数不合法，必须满足 slow > fast >= 2", normalized
-    if poll < 5 or poll > 300:
-        return False, "轮询秒数需在 5 到 300 之间", normalized
-    if cooldown < 0 or cooldown > 3600:
-        return False, "冷却秒数需在 0 到 3600 之间", normalized
-    if max_orders < 1 or max_orders > 500:
-        return False, "每日最大订单数需在 1 到 500 之间", normalized
-    if normalized.get("swapStrategyMode") not in ("long_only", "short_only", "trend_follow"):
-        return False, "永续策略模式不支持", normalized
-    if normalized.get("swapTdMode") not in ("cross", "isolated"):
-        return False, "永续保证金模式仅支持 cross 或 isolated", normalized
     if len(watchlist_symbols) > 8:
         return False, "多币 watchlist 最多支持 8 个标的", normalized
-    for field in (
-        "spotQuoteBudget",
-        "spotMaxExposure",
-        "swapContracts",
-        "swapLeverage",
-        "stopLossPct",
-        "takeProfitPct",
-        "maxDailyLossPct",
-    ):
-        if safe_decimal(normalized.get(field), "0") < 0:
-            return False, f"{field} 不能小于 0", normalized
+    base_error = validate_single_automation_target(normalized)
+    if base_error:
+        return False, base_error, normalized
+    for symbol, override in normalized["watchlistOverrides"].items():
+        target_config = deep_merge(normalized, override)
+        override_error = validate_single_automation_target(target_config)
+        if override_error:
+            return False, f"{symbol} 覆盖配置无效：{override_error}", normalized
     return True, "", normalized
 
 
@@ -2635,6 +3164,7 @@ def strategy_label(preset: str) -> str:
     return {
         "dual_engine": "标准双引擎",
         "btc_lotto": "BTC 乐透机",
+        "basis_arb": "高频套利",
     }.get(preset, "标准双引擎")
 
 
@@ -2650,6 +3180,8 @@ def strategy_symbol_label(config: dict[str, Any]) -> str:
 
 
 def strategy_scope_label(config: dict[str, Any]) -> str:
+    if str(config.get("strategyPreset") or "") == "basis_arb":
+        return "现货 + 永续对冲"
     scopes: list[str] = []
     if config.get("spotEnabled"):
         scopes.append("现货")
@@ -2659,6 +3191,8 @@ def strategy_scope_label(config: dict[str, Any]) -> str:
 
 
 def strategy_mode_label(config: dict[str, Any]) -> str:
+    if str(config.get("strategyPreset") or "") == "basis_arb":
+        return "基差回归套利"
     if not config.get("swapEnabled"):
         return "现货执行"
     mode = str(config.get("swapStrategyMode", "trend_follow"))
@@ -2670,6 +3204,8 @@ def strategy_mode_label(config: dict[str, Any]) -> str:
 
 
 def strategy_mode_badge(config: dict[str, Any]) -> str:
+    if str(config.get("strategyPreset") or "") == "basis_arb":
+        return "套利"
     if not config.get("swapEnabled"):
         return "现货"
     mode = str(config.get("swapStrategyMode", "trend_follow"))
@@ -2683,13 +3219,30 @@ def strategy_mode_badge(config: dict[str, Any]) -> str:
 def strategy_short_name(config: dict[str, Any], rank: int | None = None) -> str:
     prefix = f"S{rank:02d} " if rank else ""
     symbol = strategy_symbol_label(config)
-    preset = "乐透" if str(config.get("strategyPreset", "")) == "btc_lotto" else "双引擎"
+    preset_value = str(config.get("strategyPreset", "") or "")
+    if preset_value == "btc_lotto":
+        preset = "乐透"
+    elif preset_value == "basis_arb":
+        preset = "套利"
+    else:
+        preset = "双引擎"
     leverage = f"{int(safe_decimal(config.get('swapLeverage'), '1'))}x" if config.get("swapEnabled") else ""
     tail = " ".join(part for part in (strategy_mode_badge(config), leverage) if part)
     return f"{prefix}{symbol} {preset} {config.get('bar', '5m')} EMA{config['fastEma']}/{config['slowEma']}{(' ' + tail) if tail else ''}"
 
 
 def strategy_detail_line(config: dict[str, Any], origin_label: str = "") -> str:
+    if str(config.get("strategyPreset") or "") == "basis_arb":
+        parts = [
+            "现货买入 + 永续对冲",
+            f"入场价差 ≥ {config.get('arbEntrySpreadPct', '0.18')}%",
+            f"回补价差 ≤ {config.get('arbExitSpreadPct', '0.05')}%",
+            f"最低资金费 {config.get('arbMinFundingRatePct', '0.005')}%",
+            f"最长持有 {config.get('arbMaxHoldMinutes', 180)} 分钟",
+        ]
+        if origin_label:
+            parts.append(origin_label)
+        return " · ".join(part for part in parts if part)
     parts = [strategy_scope_label(config)]
     if config.get("swapEnabled"):
         parts.append(f"{strategy_mode_label(config)} · {int(safe_decimal(config.get('swapLeverage'), '1'))}x")
@@ -4288,10 +4841,183 @@ def extract_first_row(response: dict[str, Any]) -> dict[str, Any]:
     return rows[0] if rows else {}
 
 
+def ticker_bid_price(row: dict[str, Any]) -> Decimal:
+    return safe_decimal(row.get("bidPx") or row.get("bidPrice") or row.get("last"), "0")
+
+
+def ticker_ask_price(row: dict[str, Any]) -> Decimal:
+    return safe_decimal(row.get("askPx") or row.get("askPrice") or row.get("last"), "0")
+
+
+def pct_gap(numerator: Decimal, denominator: Decimal) -> Decimal:
+    if denominator <= 0:
+        return Decimal("0")
+    return ((numerator - denominator) / denominator) * Decimal("100")
+
+
+def build_basis_arb_analysis(
+    automation: dict[str, Any],
+    client: OkxClient,
+) -> dict[str, Any]:
+    jobs: dict[str, Any] = {
+        "spotTicker": lambda: extract_first_row(client.get_ticker(automation["spotInstId"])),
+        "swapTicker": lambda: extract_first_row(client.get_ticker(automation["swapInstId"])),
+        "markPrice": lambda: extract_first_row(client.get_mark_price("SWAP", automation["swapInstId"])),
+        "fundingRate": lambda: extract_first_row(client.get_funding_rate(automation["swapInstId"])),
+        "openInterest": lambda: extract_first_row(client.get_open_interest("SWAP", automation["swapInstId"])),
+        "spotCandles": lambda: get_closed_candles(
+            client,
+            automation["spotInstId"],
+            automation["bar"],
+            max(int(automation.get("slowEma", 21)) + 20, 60),
+        ),
+        "swapCandles": lambda: get_closed_candles(
+            client,
+            automation["swapInstId"],
+            automation["bar"],
+            max(int(automation.get("slowEma", 21)) + 20, 60),
+        ),
+    }
+
+    fetched: dict[str, Any] = {}
+    errors: list[str] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs)) as executor:
+        future_map = {executor.submit(fn): key for key, fn in jobs.items()}
+        for future in concurrent.futures.as_completed(future_map):
+            key = future_map[future]
+            try:
+                fetched[key] = future.result()
+            except Exception as exc:
+                errors.append(f"{key}: {exc}")
+
+    if errors:
+        raise OkxApiError(f"联网分析失败: {'; '.join(errors)}")
+
+    spot_ticker = fetched["spotTicker"]
+    swap_ticker = fetched["swapTicker"]
+    mark_price = safe_decimal(fetched["markPrice"].get("markPx"), "0")
+    funding_rate_pct = safe_decimal(fetched["fundingRate"].get("fundingRate"), "0") * Decimal("100")
+    spot_bid = ticker_bid_price(spot_ticker)
+    spot_ask = ticker_ask_price(spot_ticker)
+    swap_bid = ticker_bid_price(swap_ticker)
+    swap_ask = ticker_ask_price(swap_ticker)
+    spot_last = safe_decimal(spot_ticker.get("last"), "0")
+    swap_last = safe_decimal(swap_ticker.get("last"), "0")
+    entry_spread_pct = pct_gap(swap_bid, spot_ask)
+    close_spread_pct = pct_gap(swap_ask, spot_bid)
+    mid_spread_pct = pct_gap(swap_last, spot_last)
+    basis_pct = pct_gap(swap_last, mark_price)
+    volatility_pct = max(recent_range_pct(fetched["spotCandles"]), recent_range_pct(fetched["swapCandles"]))
+    entry_threshold = safe_decimal(automation.get("arbEntrySpreadPct"), "0")
+    exit_threshold = safe_decimal(automation.get("arbExitSpreadPct"), "0")
+    min_funding = safe_decimal(automation.get("arbMinFundingRatePct"), "0")
+    require_funding_alignment = bool(automation.get("arbRequireFundingAlignment"))
+    funding_aligned = funding_rate_pct >= min_funding if require_funding_alignment else True
+
+    blockers: list[str] = []
+    warnings: list[str] = []
+    if entry_spread_pct <= 0:
+        warnings.append("永续盘口未形成可执行溢价")
+    if require_funding_alignment and not funding_aligned:
+        blockers.append("当前资金费不足以支撑现货多 / 永续空套利")
+    if volatility_pct >= Decimal("4.5"):
+        warnings.append("最近波动偏大，套利腿可能被趋势拉扯")
+    if basis_pct <= Decimal("-0.10"):
+        warnings.append("永续最新价低于标记价，套利窗口不稳定")
+
+    allow_new_entries = not blockers and entry_spread_pct >= entry_threshold
+    if allow_new_entries:
+        decision = "execute"
+        decision_label = "套利窗口打开"
+    elif blockers:
+        decision = "skip"
+        decision_label = "暂停套利"
+    else:
+        decision = "observe"
+        decision_label = "等待价差扩大"
+
+    symbol = strategy_symbol_label(automation)
+    summary_bits = [
+        f"{symbol} 高频套利",
+        f"入场 {decimal_to_str(entry_spread_pct.quantize(Decimal('0.001')))}%",
+        f"回补 {decimal_to_str(close_spread_pct.quantize(Decimal('0.001')))}%",
+        f"资金费 {decimal_to_str(funding_rate_pct.quantize(Decimal('0.001')))}%",
+    ]
+    if allow_new_entries:
+        summary_bits.append("允许开现货多 + 永续空对冲腿")
+    elif blockers:
+        summary_bits.append(blockers[0])
+    else:
+        summary_bits.append("继续等待入场价差扩大")
+
+    return {
+        "statusText": "已联网分析",
+        "decision": decision,
+        "decisionLabel": decision_label,
+        "summary": " · ".join(summary_bits),
+        "selectedStrategyName": f"{symbol} 高频套利",
+        "selectedStrategyDetail": strategy_detail_line(automation),
+        "selectedReturnPct": "",
+        "selectedDrawdownPct": "",
+        "selectedWinRatePct": "",
+        "selectedScore": "",
+        "allowNewEntries": allow_new_entries,
+        "optimizerRefreshed": False,
+        "lastAnalyzedAt": now_local_iso(),
+        "marketRegime": "价差回归套利",
+        "spotTrend": f"买入参考 {decimal_to_str(spot_ask)}",
+        "swapTrend": f"对冲参考 {decimal_to_str(swap_bid)}",
+        "volatilityPct": compact_metric(volatility_pct, "0.01"),
+        "spreadPct": compact_metric(mid_spread_pct, "0.001"),
+        "basisPct": compact_metric(basis_pct, "0.001"),
+        "fundingRatePct": compact_metric(funding_rate_pct, "0.001"),
+        "entrySpreadPct": compact_metric(entry_spread_pct, "0.001"),
+        "closeSpreadPct": compact_metric(close_spread_pct, "0.001"),
+        "entrySpreadThresholdPct": compact_metric(entry_threshold, "0.001"),
+        "exitSpreadThresholdPct": compact_metric(exit_threshold, "0.001"),
+        "fundingThresholdPct": compact_metric(min_funding, "0.001"),
+        "fundingAligned": funding_aligned,
+        "openInterest": str(
+            fetched["openInterest"].get("oiUsd")
+            or fetched["openInterest"].get("oi")
+            or fetched["openInterest"].get("oiCcy")
+            or "--"
+        ),
+        "warnings": warnings,
+        "blockers": blockers,
+        "selectedConfig": deep_merge({}, automation),
+        "research": {
+            "running": False,
+            "statusText": "套利分析模式",
+            "mode": "basis_arb",
+            "lastRunAt": now_local_iso(),
+            "historyLimit": max(int(automation.get("slowEma", 21)) + 20, 60),
+            "sampleCount": len(fetched["spotCandles"]),
+            "summary": {
+                "entrySpreadPct": compact_metric(entry_spread_pct, "0.001"),
+                "closeSpreadPct": compact_metric(close_spread_pct, "0.001"),
+                "fundingRatePct": compact_metric(funding_rate_pct, "0.001"),
+            },
+            "bestConfig": deep_merge({}, automation),
+            "leaderboard": [],
+            "generationSummaries": [],
+            "pipeline": {
+                "mode": "basis_arb",
+                "status": decision,
+            },
+            "markets": {},
+            "notes": [],
+            "equityCurve": [],
+        },
+    }
+
+
 def build_execution_analysis(
     automation: dict[str, Any],
     client: OkxClient,
 ) -> dict[str, Any]:
+    if str(automation.get("strategyPreset") or "") == "basis_arb":
+        return build_basis_arb_analysis(automation, client)
     research = research_optimize(automation, runtime_research_options(automation), client)
     best_entry = (research.get("leaderboard") or [{}])[0]
     best_config = deep_merge({}, research.get("bestConfig") or automation)
@@ -4847,7 +5573,10 @@ def build_miner_progress(
         headline = "在线 / 新作业"
         detail = "job 已刷新，继续刷 nonce。"
     elif running and status == "waiting-for-job":
-        if pool_diag.get("status") == "dns_hijack":
+        if pool_diag.get("bypassActive"):
+            headline = "在线 / DNS 已绕过"
+            detail = f"本机 DNS 异常，但矿工已改走 {pool_diag.get('workerPoolHost') or pool_diag.get('connectHost') or '公网矿池'} 直连。"
+        elif pool_diag.get("status") == "dns_hijack":
             headline = "未在挖 / DNS 异常"
             detail = str(pool_diag.get("detail") or "本机 DNS 解析异常，当前没连到真实矿池。")
         elif pool_diag.get("status") == "stratum_silent":
@@ -5075,6 +5804,7 @@ def miner_overview(config: dict[str, Any], public_client: OkxClient | None = Non
         str(config.get("poolHost", "")).strip(),
         int(config.get("poolPort", 0) or 0),
     )
+    effective_pool_diag = mac_lotto.get("guardDiagnosis") if isinstance(mac_lotto.get("guardDiagnosis"), dict) else pool_diag
     return {
         "config": config,
         "sources": miner_sources(),
@@ -5082,8 +5812,8 @@ def miner_overview(config: dict[str, Any], public_client: OkxClient | None = Non
         "serialPorts": serial_ports(),
         "network": network,
         "pool": pool,
-        "progress": build_miner_progress(config, network, pool, mac_lotto, pool_diag),
-        "poolDiagnosis": pool_diag,
+        "progress": build_miner_progress(config, network, pool, mac_lotto, effective_pool_diag),
+        "poolDiagnosis": effective_pool_diag,
         "devices": devices,
         "macLotto": mac_lotto,
         "lastRefreshAt": now_local_iso(),
@@ -5099,8 +5829,9 @@ def miner_focus_overview(config: dict[str, Any]) -> dict[str, Any]:
     pool_diag = cached.get("poolDiagnosis") if isinstance(cached.get("poolDiagnosis"), dict) else {}
     options = cached.get("options") if isinstance(cached.get("options"), list) else []
     serial_ports_cached = cached.get("serialPorts") if isinstance(cached.get("serialPorts"), list) else []
+    effective_pool_diag = mac_lotto.get("guardDiagnosis") if isinstance(mac_lotto.get("guardDiagnosis"), dict) else pool_diag
     if not progress:
-        progress = build_miner_progress(config, network, pool, mac_lotto, pool_diag)
+        progress = build_miner_progress(config, network, pool, mac_lotto, effective_pool_diag)
     return {
         "config": config,
         "options": options,
@@ -5108,7 +5839,7 @@ def miner_focus_overview(config: dict[str, Any]) -> dict[str, Any]:
         "network": network,
         "pool": pool,
         "progress": progress,
-        "poolDiagnosis": pool_diag,
+        "poolDiagnosis": effective_pool_diag,
         "devices": [],
         "macLotto": mac_lotto,
         "lastRefreshAt": cached.get("lastRefreshAt") or now_local_iso(),
@@ -5234,17 +5965,39 @@ class MacLottoManager:
     def _worker_limit(self) -> int:
         return max(1, min((os.cpu_count() or 1) * 2, 32))
 
+    def _worker_connect_host(self, diagnosis: dict[str, Any]) -> tuple[str, bool]:
+        status = str(diagnosis.get("status") or "")
+        connect_host = str(diagnosis.get("connectHost") or "").strip()
+        bypass_ready = (
+            status == "dns_hijack"
+            and bool(connect_host)
+            and connect_host != str(diagnosis.get("host") or "")
+            and not ip_is_bogon(connect_host)
+        )
+        return (connect_host if bypass_ready else "", bypass_ready)
+
     def _guard_mode(self, config: dict[str, Any]) -> dict[str, Any]:
         pool_host = str(config.get("poolHost", "")).strip()
         pool_port = int(config.get("poolPort", 0) or 0)
         if not pool_host or pool_port <= 0:
-            return {"active": False, "reason": "", "diagnosis": {}}
+            return {"active": False, "reason": "", "diagnosis": {}, "workerPoolHost": "", "bypassActive": False}
         diagnosis = diagnose_pool_endpoint(pool_host, pool_port)
-        active = diagnosis.get("status") in {"dns_hijack", "stratum_silent", "connect_failed"}
+        diagnosis["host"] = pool_host
+        worker_pool_host, bypass_active = self._worker_connect_host(diagnosis)
+        if bypass_active:
+            diagnosis["bypassActive"] = True
+            diagnosis["workerPoolHost"] = worker_pool_host
+            reason = f"检测到本机 DNS 劫持，矿工将直连 {worker_pool_host}:{pool_port}。"
+            active = False
+        else:
+            active = diagnosis.get("status") in {"dns_hijack", "stratum_silent", "connect_failed"}
+            reason = str(diagnosis.get("detail") or "")
         return {
             "active": active,
-            "reason": str(diagnosis.get("detail") or ""),
+            "reason": reason,
             "diagnosis": diagnosis,
+            "workerPoolHost": worker_pool_host or pool_host,
+            "bypassActive": bypass_active,
         }
 
     def _normalized_worker_count(self, config: dict[str, Any]) -> tuple[int, int]:
@@ -5277,9 +6030,11 @@ class MacLottoManager:
 
     def _signature(self, config: dict[str, Any]) -> tuple[Any, ...]:
         requested, effective = self._normalized_worker_count(config)
+        guard = self._guard_mode(config)
         return (
             str(config.get("wallet", "")).strip(),
             str(config.get("poolHost", "")).strip(),
+            str(guard.get("workerPoolHost") or config.get("poolHost", "")).strip(),
             int(config.get("poolPort", 0) or 0),
             str(config.get("poolPassword", "") or "x"),
             bool(config.get("cpuRandomNonce")),
@@ -5370,6 +6125,8 @@ class MacLottoManager:
             pool_port = int(config.get("poolPort", 3333) or 3333)
             pool_password = str(config.get("poolPassword", "x") or "x")
             force_random_nonce = effective > 1 or bool(config.get("cpuRandomNonce"))
+            guard = self._guard_mode(config)
+            worker_pool_host = str(guard.get("workerPoolHost") or pool_host).strip() or pool_host
 
             for spec in specs:
                 dump_worker_status(
@@ -5379,16 +6136,17 @@ class MacLottoManager:
                         "status": "starting",
                         "startedAt": start_stamp,
                         "address": wallet,
-                        "pool_host": pool_host,
+                        "pool_host": worker_pool_host,
                         "pool_port": pool_port,
                         "workerId": spec["id"],
+                        "configured_pool_host": pool_host,
                     },
                 )
                 env = dict(os.environ)
                 env.update(
                     {
                         "SOLOMINER_ADDRESS": wallet,
-                        "SOLOMINER_POOL_HOST": pool_host,
+                        "SOLOMINER_POOL_HOST": worker_pool_host,
                         "SOLOMINER_POOL_PORT": str(pool_port),
                         "SOLOMINER_POOL_PASSWORD": pool_password,
                         "SOLOMINER_STATUS_PATH": str(spec["status_path"]),
@@ -5528,6 +6286,7 @@ class MacLottoManager:
                 "pid": next((worker["pid"] for worker in workers if worker["pid"]), 0),
                 "wallet": str(config.get("wallet", "")).strip(),
                 "poolHost": str(config.get("poolHost", "")).strip(),
+                "workerPoolHost": str(guard.get("workerPoolHost") or config.get("poolHost", "")).strip(),
                 "poolPort": int(config.get("poolPort", 0) or 0),
                 "mode": "mac_lotto",
                 "status": status,
@@ -5706,6 +6465,54 @@ class AutomationEngine:
             )
             self._set_market(f"swap:{target['swapInstId']}", {"prepared": True, "instId": target["swapInstId"]})
 
+    def _spot_reference_price(self, client: OkxClient, inst_id: str, side: str) -> Decimal:
+        row = extract_first_row(client.get_ticker(inst_id))
+        bid_px = safe_decimal(row.get("bidPx") or row.get("bidPrice"), "0")
+        ask_px = safe_decimal(row.get("askPx") or row.get("askPrice"), "0")
+        last_px = safe_decimal(row.get("last"), "0")
+        if side == "sell":
+            return bid_px if bid_px > 0 else (last_px if last_px > 0 else ask_px)
+        return ask_px if ask_px > 0 else (last_px if last_px > 0 else bid_px)
+
+    def _build_protected_spot_sell_order(
+        self,
+        client: OkxClient,
+        inst_id: str,
+        size: Decimal,
+    ) -> tuple[dict[str, Any], str]:
+        meta = get_instrument_meta(client, "SPOT", inst_id)
+        tick_size = max(safe_decimal(meta.get("tickSz"), "0.00000001"), Decimal("0.00000001"))
+        lot_size = max(safe_decimal(meta.get("lotSz") or meta.get("minSz"), "0.00000001"), Decimal("0.00000001"))
+        min_size = max(safe_decimal(meta.get("minSz") or meta.get("lotSz"), "0.00000001"), Decimal("0.00000001"))
+        rounded_size = round_down(size, lot_size)
+        if rounded_size <= 0 or rounded_size < min_size:
+            raise OkxApiError(f"现货卖出数量过小，无法在 {inst_id} 发单")
+
+        reference_px = self._spot_reference_price(client, inst_id, "sell")
+        if reference_px <= 0:
+            raise OkxApiError(f"未拿到 {inst_id} 的可用卖一/现价，无法构造保护价卖单")
+
+        protected_px = round_down(
+            reference_px * (Decimal("1") - (SPOT_SELL_PROTECTION_PCT / Decimal("100"))),
+            tick_size,
+        )
+        if protected_px <= 0:
+            protected_px = round_down(reference_px, tick_size)
+        if protected_px <= 0:
+            raise OkxApiError(f"未拿到 {inst_id} 的有效保护价，无法发单")
+
+        payload: dict[str, Any] = {
+            "instId": inst_id,
+            "tdMode": "cash",
+            "side": "sell",
+            "ordType": "ioc",
+            "px": decimal_to_str(protected_px),
+            "sz": decimal_to_str(rounded_size),
+            "clOrdId": build_cl_ord_id("s"),
+        }
+        label = f"保护价 IOC · {decimal_to_str(protected_px)}"
+        return payload, label
+
     def start(self, *, autostart: bool = False) -> None:
         with self.lock:
             if self.thread and self.thread.is_alive():
@@ -5809,9 +6616,7 @@ class AutomationEngine:
             if self.stop_event.wait(wait_seconds):
                 return
 
-    def _run_cycle(self, client: OkxClient, automation: dict[str, Any]) -> None:
-        cycle_started = time.perf_counter()
-        cycle_stamp = now_local_iso()
+    def _run_signal_stage(self, client: OkxClient, automation: dict[str, Any]) -> dict[str, Any]:
         analysis_bundle = build_execution_analysis(automation, client)
         analysis = {
             key: value
@@ -5826,6 +6631,15 @@ class AutomationEngine:
             "info",
             f"联网分析完成：{analysis.get('selectedStrategyName', '未选策略')} · {analysis.get('decisionLabel', '待分析')}",
         )
+        return {
+            "analysisBundle": analysis_bundle,
+            "analysis": analysis,
+            "research": research,
+            "effectiveAutomation": effective_automation,
+            "allowNewEntries": allow_new_entries,
+        }
+
+    def _run_portfolio_stage(self, client: OkxClient, effective_automation: dict[str, Any]) -> dict[str, Any]:
         account_snapshot = fetch_account_snapshot(client, include_positions=False)
         balance_snapshot = {
             "summary": account_snapshot.get("summary", {}),
@@ -5836,70 +6650,555 @@ class AutomationEngine:
             or account_snapshot["summary"].get("totalEq"),
             "0",
         )
-        state = self._touch_session(total_eq)
-        max_daily_loss = safe_decimal(effective_automation.get("maxDailyLossPct"), "0")
-        if max_daily_loss > 0 and safe_decimal(state.get("dailyDrawdownPct"), "0") <= -max_daily_loss:
-            self.stop("自动量化已停止：超过日内最大回撤")
-            return
-        if int(state.get("orderCountToday", 0)) >= int(effective_automation.get("maxOrdersPerDay", 20)):
-            self.stop("自动量化已停止：达到今日最大下单次数")
-            return
+        session_state = self._touch_session(total_eq)
+        targets = build_execution_targets(effective_automation)
+        return {
+            "accountSnapshot": account_snapshot,
+            "balanceSnapshot": balance_snapshot,
+            "totalEq": total_eq,
+            "sessionState": session_state,
+            "targets": targets,
+        }
 
+    def _run_risk_stage(self, effective_automation: dict[str, Any], session_state: dict[str, Any]) -> str:
+        active_markets = 0
+        watched_symbols = 0
+        snapshot = self.snapshot()
+        watchlist = snapshot.get("watchlist") or []
+        watched_symbols = len(watchlist)
+        for entry in watchlist:
+            summary = entry.get("summary") or {}
+            if summary.get("activeLegs"):
+                active_markets += len(summary.get("activeLegs") or [])
+
+        max_daily_loss = safe_decimal(effective_automation.get("maxDailyLossPct"), "0")
+        drawdown_pct = safe_decimal(session_state.get("dailyDrawdownPct"), "0")
+        max_orders_per_day = int(effective_automation.get("maxOrdersPerDay", 20))
+        order_count_today = int(session_state.get("orderCountToday", 0))
+        stop_reason = ""
+        checks: list[dict[str, Any]] = []
+
+        if max_daily_loss > 0:
+            passed = drawdown_pct > -max_daily_loss
+            checks.append(
+                {
+                    "name": "max_daily_loss",
+                    "passed": passed,
+                    "detail": (
+                        f"日内回撤 {format_decimal(drawdown_pct, 3)}% / 上限 {format_decimal(max_daily_loss, 3)}%"
+                    ),
+                }
+            )
+            if not passed and not stop_reason:
+                stop_reason = "自动量化已停止：超过日内最大回撤"
+
+        passed_order_limit = order_count_today < max_orders_per_day
+        checks.append(
+            {
+                "name": "max_orders_per_day",
+                "passed": passed_order_limit,
+                "detail": f"当日下单 {order_count_today} / 上限 {max_orders_per_day}",
+            }
+        )
+        if not passed_order_limit and not stop_reason:
+            stop_reason = "自动量化已停止：达到今日最大下单次数"
+
+        report = {
+            "status": "blocked" if stop_reason else "ok",
+            "stopReason": stop_reason,
+            "drawdownPct": decimal_to_str(drawdown_pct),
+            "maxDailyLossPct": decimal_to_str(max_daily_loss),
+            "orderCountToday": order_count_today,
+            "maxOrdersPerDay": max_orders_per_day,
+            "activeMarkets": active_markets,
+            "watchedSymbols": watched_symbols,
+            "checks": checks,
+            "updatedAt": now_local_iso(),
+        }
+        self._update_state(lambda state: state.update({"lastRiskReport": report}))
+        return stop_reason
+
+    def _run_execution_stage(
+        self,
+        client: OkxClient,
+        effective_automation: dict[str, Any],
+        balance_snapshot: dict[str, Any],
+        allow_new_entries: bool,
+        analysis_label: str,
+        targets: list[dict[str, Any]],
+    ) -> dict[str, Any]:
         watchlist_entries: list[dict[str, Any]] = []
-        for target in build_execution_targets(effective_automation):
+        enabled_spot = 0
+        enabled_swap = 0
+        active_symbols = 0
+        arb_runtime = {
+            "watching": 0,
+            "windowOpen": 0,
+            "hedged": 0,
+            "exitQueue": 0,
+            "rollback": 0,
+            "brokenPair": 0,
+            "blocked": 0,
+        }
+        for target in targets:
             spot_key = f"spot:{target['spotInstId']}"
             swap_key = f"swap:{target['swapInstId']}"
-            if target.get("spotEnabled"):
-                self._run_spot_cycle(
+            if str(target.get("strategyPreset") or "") == "basis_arb":
+                enabled_spot += 1
+                enabled_swap += 1
+                self._run_basis_arb_cycle(
                     client,
                     target,
                     balance_snapshot,
+                    analysis_label,
                     allow_new_entries,
-                    analysis.get("decisionLabel", "观察为主"),
-                    market_key=spot_key,
+                    spot_key=spot_key,
+                    swap_key=swap_key,
                 )
             else:
-                self._set_market(
-                    spot_key,
-                    {
-                        "enabled": False,
-                        "instId": target.get("spotInstId", ""),
-                        "lastMessage": "现货策略未启用",
-                    },
-                )
+                if target.get("spotEnabled"):
+                    enabled_spot += 1
+                    self._run_spot_cycle(
+                        client,
+                        target,
+                        balance_snapshot,
+                        allow_new_entries,
+                        analysis_label,
+                        market_key=spot_key,
+                    )
+                else:
+                    self._set_market(
+                        spot_key,
+                        {
+                            "enabled": False,
+                            "instId": target.get("spotInstId", ""),
+                            "lastMessage": "现货策略未启用",
+                        },
+                    )
 
-            if target.get("swapEnabled"):
-                self._run_swap_cycle(
-                    client,
-                    target,
-                    allow_new_entries,
-                    analysis.get("decisionLabel", "观察为主"),
-                    market_key=swap_key,
-                )
-            else:
-                self._set_market(
-                    swap_key,
-                    {
-                        "enabled": False,
-                        "instId": target.get("swapInstId", ""),
-                        "lastMessage": "永续策略未启用",
-                    },
-                )
+                if target.get("swapEnabled"):
+                    enabled_swap += 1
+                    self._run_swap_cycle(
+                        client,
+                        target,
+                        allow_new_entries,
+                        analysis_label,
+                        market_key=swap_key,
+                    )
+                else:
+                    self._set_market(
+                        swap_key,
+                        {
+                            "enabled": False,
+                            "instId": target.get("swapInstId", ""),
+                            "lastMessage": "永续策略未启用",
+                        },
+                    )
 
             current_state = self.snapshot()
             spot_market = copy.deepcopy(current_state.get("markets", {}).get(spot_key) or default_market_state())
             swap_market = copy.deepcopy(current_state.get("markets", {}).get(swap_key) or default_market_state())
-            watchlist_entries.append(
-                build_watchlist_entry(
-                    str(target.get("watchlistSymbol") or ""),
-                    target,
-                    spot_market,
-                    swap_market,
-                )
+            entry = build_watchlist_entry(
+                str(target.get("watchlistSymbol") or ""),
+                target,
+                spot_market,
+                swap_market,
             )
+            if entry.get("summary", {}).get("activeLegs"):
+                active_symbols += 1
+            watchlist_entries.append(entry)
 
+        if str(effective_automation.get("strategyPreset") or "") == "basis_arb":
+            arb_runtime = summarize_basis_arb_watchlist(watchlist_entries)
         self._set_watchlist(watchlist_entries)
+        return {
+            "watchlistEntries": watchlist_entries,
+            "executionSummary": {
+                "targetCount": len(targets),
+                "enabledSpot": enabled_spot,
+                "enabledSwap": enabled_swap,
+                "activeSymbols": active_symbols,
+                "arbRuntime": arb_runtime,
+            },
+        }
 
+    def _clear_basis_arb_state(self, spot_key: str, swap_key: str) -> None:
+        clear_patch = {
+            "arbBias": "",
+            "arbSpotSize": "0",
+            "arbSwapSize": "0",
+            "arbOpenedAt": "",
+            "arbEntrySpreadPct": "",
+            "arbEntrySpotPx": "",
+            "arbEntrySwapPx": "",
+            "arbStage": "",
+        }
+        self._set_market(spot_key, clear_patch)
+        self._set_market(swap_key, clear_patch)
+
+    def _run_basis_arb_cycle(
+        self,
+        client: OkxClient,
+        automation: dict[str, Any],
+        balance_snapshot: dict[str, Any],
+        analysis_label: str,
+        allow_new_entries: bool,
+        *,
+        spot_key: str,
+        swap_key: str,
+    ) -> None:
+        spot_inst_id = automation["spotInstId"]
+        swap_inst_id = automation["swapInstId"]
+        spot_meta = get_instrument_meta(client, "SPOT", spot_inst_id)
+        swap_meta = get_instrument_meta(client, "SWAP", swap_inst_id)
+        spot_ticker = extract_first_row(client.get_ticker(spot_inst_id))
+        swap_ticker = extract_first_row(client.get_ticker(swap_inst_id))
+        funding_row = extract_first_row(client.get_funding_rate(swap_inst_id))
+        spot_bid = ticker_bid_price(spot_ticker)
+        spot_ask = ticker_ask_price(spot_ticker)
+        swap_bid = ticker_bid_price(swap_ticker)
+        swap_ask = ticker_ask_price(swap_ticker)
+        spot_last = safe_decimal(spot_ticker.get("last"), "0")
+        swap_last = safe_decimal(swap_ticker.get("last"), "0")
+        funding_rate_pct = safe_decimal(funding_row.get("fundingRate"), "0") * Decimal("100")
+        entry_spread_pct = pct_gap(swap_bid, spot_ask)
+        close_spread_pct = pct_gap(swap_ask, spot_bid)
+        entry_threshold = safe_decimal(automation.get("arbEntrySpreadPct"), "0")
+        exit_threshold = safe_decimal(automation.get("arbExitSpreadPct"), "0")
+        min_funding = safe_decimal(automation.get("arbMinFundingRatePct"), "0")
+        max_hold_minutes = int(automation.get("arbMaxHoldMinutes", 180) or 180)
+        require_funding_alignment = bool(automation.get("arbRequireFundingAlignment"))
+        funding_aligned = funding_rate_pct >= min_funding if require_funding_alignment else True
+
+        base_ccy = spot_inst_id.split("-")[0]
+        balance_row = find_balance_detail(balance_snapshot, base_ccy)
+        available_base = safe_decimal(
+            balance_row.get("availBal") or balance_row.get("cashBal") or balance_row.get("eq"),
+            "0",
+        )
+        spot_min_size = safe_decimal(spot_meta.get("minSz") or spot_meta.get("lotSz"), "0.00000001")
+        spot_lot_size = safe_decimal(spot_meta.get("lotSz") or spot_meta.get("minSz"), "0.00000001")
+        swap_lot_size = safe_decimal(swap_meta.get("lotSz"), "1")
+        positions = client.get_positions(swap_inst_id).get("data", [])
+        open_position = next((row for row in positions if safe_decimal(row.get("pos"), "0") != 0), {})
+        pos_value = safe_decimal(open_position.get("pos"), "0")
+        abs_pos = abs(pos_value)
+        position_side = "flat"
+        if pos_value > 0:
+            position_side = "long"
+        elif pos_value < 0:
+            position_side = "short"
+
+        current_state = self.snapshot()
+        spot_state = current_state.get("markets", {}).get(spot_key) or {}
+        swap_state = current_state.get("markets", {}).get(swap_key) or {}
+        tracked_bias = str(spot_state.get("arbBias") or swap_state.get("arbBias") or "").strip()
+        tracked_spot_size = safe_decimal(spot_state.get("arbSpotSize") or swap_state.get("arbSpotSize"), "0")
+        tracked_swap_size = safe_decimal(swap_state.get("arbSwapSize") or spot_state.get("arbSwapSize"), "0")
+        tracked_opened_at = str(spot_state.get("arbOpenedAt") or swap_state.get("arbOpenedAt") or "")
+        tracked_spot_live = round_down(min(available_base, tracked_spot_size), spot_lot_size)
+        tracked_swap_live = round_down(min(abs_pos, tracked_swap_size), swap_lot_size)
+        pair_active = (
+            tracked_bias == "long_spot_short_swap"
+            and tracked_spot_live >= spot_min_size
+            and position_side == "short"
+            and tracked_swap_live > 0
+        )
+
+        hold_minutes = 0
+        opened_at = parse_iso(tracked_opened_at)
+        if opened_at:
+            hold_minutes = max(int((datetime.now() - opened_at).total_seconds() // 60), 0)
+        arb_stage = "watching"
+        if tracked_bias and not pair_active:
+            arb_stage = "broken_pair"
+        elif pair_active:
+            arb_stage = "hedged"
+        elif entry_spread_pct >= entry_threshold and funding_aligned:
+            arb_stage = "window_open"
+        elif entry_spread_pct >= entry_threshold and not funding_aligned:
+            arb_stage = "funding_blocked"
+
+        shared_label = (
+            f"套利入场 {decimal_to_str(entry_spread_pct.quantize(Decimal('0.001')))}% / "
+            f"回补 {decimal_to_str(close_spread_pct.quantize(Decimal('0.001')))}% / "
+            f"资金费 {decimal_to_str(funding_rate_pct.quantize(Decimal('0.001')))}%"
+        )
+        spot_entry_px = safe_decimal(spot_state.get("arbEntrySpotPx"), "0")
+        swap_entry_px = safe_decimal(swap_state.get("arbEntrySwapPx"), "0")
+        spot_pnl = (spot_last - spot_entry_px) * tracked_spot_live if tracked_spot_live > 0 and spot_entry_px > 0 else Decimal("0")
+        spot_pnl_pct = pct_gap(spot_last, spot_entry_px) if tracked_spot_live > 0 and spot_entry_px > 0 else Decimal("0")
+        self._set_market(
+            spot_key,
+            {
+                "enabled": True,
+                "instId": spot_inst_id,
+                "signal": "arb_active" if pair_active else ("arb_entry" if entry_spread_pct >= entry_threshold else "hold"),
+                "trend": "basis_arb",
+                "lastPrice": decimal_to_str(spot_last),
+                "positionSide": "long" if tracked_spot_live >= spot_min_size else "flat",
+                "positionSize": decimal_to_str(tracked_spot_live),
+                "positionNotional": decimal_to_str(tracked_spot_live * spot_last),
+                "entryPrice": decimal_to_str(spot_entry_px) if spot_entry_px > 0 else "",
+                "floatingPnl": decimal_to_str(spot_pnl),
+                "floatingPnlPct": decimal_to_str(spot_pnl_pct),
+                "pnlSource": "套利现货腿按最新价估算",
+                "riskBudget": decimal_to_str(safe_decimal(automation.get("spotQuoteBudget"), "0")),
+                "riskCap": decimal_to_str(safe_decimal(automation.get("spotMaxExposure"), "0")),
+                "riskMode": "basis_arb",
+                "riskLabel": build_market_risk_label(automation, "spot"),
+                "lastMessage": shared_label,
+                "arbBias": tracked_bias,
+                "arbSpotSize": decimal_to_str(tracked_spot_size),
+                "arbSwapSize": decimal_to_str(tracked_swap_size),
+                "arbOpenedAt": tracked_opened_at,
+                "arbEntrySpreadPct": str(spot_state.get("arbEntrySpreadPct") or ""),
+                "arbEntrySpotPx": str(spot_state.get("arbEntrySpotPx") or ""),
+                "arbEntrySwapPx": str(spot_state.get("arbEntrySwapPx") or ""),
+                "arbStage": arb_stage,
+            },
+        )
+        self._set_market(
+            swap_key,
+            {
+                "enabled": True,
+                "instId": swap_inst_id,
+                "signal": "arb_hedged" if pair_active else ("arb_entry" if entry_spread_pct >= entry_threshold else "hold"),
+                "trend": "basis_arb",
+                "lastPrice": decimal_to_str(swap_last),
+                "positionSide": position_side,
+                "positionSize": decimal_to_str(tracked_swap_live if pair_active else abs_pos),
+                "positionNotional": decimal_to_str((tracked_swap_live if pair_active else abs_pos) * swap_last),
+                "entryPrice": decimal_to_str(swap_entry_px) if swap_entry_px > 0 else (decimal_to_str(safe_decimal(open_position.get("avgPx"), "0")) if open_position else ""),
+                "floatingPnl": decimal_to_str(safe_decimal(open_position.get("upl"), "0")),
+                "floatingPnlPct": decimal_to_str(Decimal("0")),
+                "pnlSource": "套利永续腿未实现盈亏",
+                "riskBudget": decimal_to_str(safe_decimal(automation.get("swapContracts"), "0")),
+                "riskCap": decimal_to_str(safe_decimal(automation.get("swapLeverage"), "0")),
+                "riskMode": "basis_arb",
+                "riskLabel": build_market_risk_label(automation, "swap"),
+                "lastMessage": shared_label,
+                "arbBias": tracked_bias,
+                "arbSpotSize": decimal_to_str(tracked_spot_size),
+                "arbSwapSize": decimal_to_str(tracked_swap_size),
+                "arbOpenedAt": tracked_opened_at,
+                "arbEntrySpreadPct": str(swap_state.get("arbEntrySpreadPct") or ""),
+                "arbEntrySpotPx": str(swap_state.get("arbEntrySpotPx") or ""),
+                "arbEntrySwapPx": str(swap_state.get("arbEntrySwapPx") or ""),
+                "arbStage": arb_stage,
+            },
+        )
+
+        if tracked_bias and not pair_active:
+            if tracked_spot_live <= 0 and tracked_swap_live <= 0 and position_side == "flat":
+                self._clear_basis_arb_state(spot_key, swap_key)
+            else:
+                self._set_market(spot_key, {"arbStage": "broken_pair", "lastMessage": "检测到套利双腿不完整，暂不继续自动接管"})
+                self._set_market(swap_key, {"arbStage": "broken_pair", "lastMessage": "检测到套利双腿不完整，暂不继续自动接管"})
+            return
+
+        cooldown_ready, cooldown_reason = self._cooldown_ready(spot_key, int(automation.get("cooldownSeconds", 0)))
+        if pair_active:
+            should_exit = close_spread_pct <= exit_threshold
+            exit_reason = ""
+            if should_exit:
+                exit_reason = "价差回补，准备平掉套利双腿"
+            elif require_funding_alignment and not funding_aligned:
+                should_exit = True
+                exit_reason = "资金费不再支持套利，准备退场"
+            elif max_hold_minutes > 0 and hold_minutes >= max_hold_minutes:
+                should_exit = True
+                exit_reason = f"已持有 {hold_minutes} 分钟，达到最长持有时长"
+            if not should_exit:
+                self._set_market(spot_key, {"arbStage": "hedged", "lastMessage": f"套利持有中 · {shared_label} · 已持有 {hold_minutes} 分钟"})
+                self._set_market(swap_key, {"arbStage": "hedged", "lastMessage": f"套利持有中 · {shared_label} · 已持有 {hold_minutes} 分钟"})
+                return
+            if not cooldown_ready:
+                self._set_market(spot_key, {"arbStage": "exit_wait", "lastMessage": f"{exit_reason}，但{cooldown_reason}"})
+                self._set_market(swap_key, {"arbStage": "exit_wait", "lastMessage": f"{exit_reason}，但{cooldown_reason}"})
+                return
+            close_swap_size = round_down(tracked_swap_live, swap_lot_size)
+            close_spot_size = round_down(tracked_spot_live, spot_lot_size)
+            if close_swap_size > 0:
+                self._place_swap_order(
+                    client,
+                    swap_inst_id,
+                    "buy",
+                    close_swap_size,
+                    automation["swapTdMode"],
+                    "套利回补永续空腿",
+                    reduce_only=True,
+                    market_key=swap_key,
+                    strategy_tag="arb_cover",
+                    strategy_action="cover",
+                    strategy_leg="swap",
+                )
+            if close_spot_size >= spot_min_size:
+                self._place_spot_order(
+                    client,
+                    spot_inst_id,
+                    "sell",
+                    close_spot_size,
+                    "套利卖出现货腿",
+                    market_key=spot_key,
+                    strategy_tag="arb_exit",
+                    strategy_action="exit",
+                    strategy_leg="spot",
+                )
+            self._clear_basis_arb_state(spot_key, swap_key)
+            self._set_market(spot_key, {"arbStage": "exiting", "lastMessage": exit_reason})
+            self._set_market(swap_key, {"arbStage": "exiting", "lastMessage": exit_reason})
+            return
+
+        if not cooldown_ready:
+            self._set_market(spot_key, {"arbStage": "entry_wait", "lastMessage": f"套利窗口出现，但{cooldown_reason}"})
+            self._set_market(swap_key, {"arbStage": "entry_wait", "lastMessage": f"套利窗口出现，但{cooldown_reason}"})
+            return
+        if entry_spread_pct < entry_threshold:
+            self._set_market(spot_key, {"arbStage": "watching", "lastMessage": f"{shared_label} · 价差还没到入场阈值 {decimal_to_str(entry_threshold)}%"})
+            self._set_market(swap_key, {"arbStage": "watching", "lastMessage": f"{shared_label} · 价差还没到入场阈值 {decimal_to_str(entry_threshold)}%"})
+            return
+        if require_funding_alignment and not funding_aligned:
+            self._set_market(spot_key, {"arbStage": "funding_blocked", "lastMessage": f"{shared_label} · 资金费低于阈值 {decimal_to_str(min_funding)}%"})
+            self._set_market(swap_key, {"arbStage": "funding_blocked", "lastMessage": f"{shared_label} · 资金费低于阈值 {decimal_to_str(min_funding)}%"})
+            return
+
+        quote_budget = safe_decimal(automation.get("spotQuoteBudget"), "0")
+        trade_contracts = round_down(safe_decimal(automation.get("swapContracts"), "0"), swap_lot_size)
+        estimated_spot_size = round_down((quote_budget / spot_ask) if spot_ask > 0 else Decimal("0"), spot_lot_size)
+        if quote_budget <= 0 or estimated_spot_size < spot_min_size:
+            self._set_market(spot_key, {"arbStage": "blocked_budget", "lastMessage": "套利预算过小，现货腿无法开仓"})
+            self._set_market(swap_key, {"arbStage": "blocked_budget", "lastMessage": "套利预算过小，现货腿无法开仓"})
+            return
+        if trade_contracts <= 0:
+            self._set_market(spot_key, {"arbStage": "blocked_hedge", "lastMessage": "永续张数为 0，无法建立套利对冲"})
+            self._set_market(swap_key, {"arbStage": "blocked_hedge", "lastMessage": "永续张数为 0，无法建立套利对冲"})
+            return
+
+        self._place_spot_order(
+            client,
+            spot_inst_id,
+            "buy",
+            quote_budget,
+            "套利买入现货腿",
+            market_key=spot_key,
+            strategy_tag="arb_entry",
+            strategy_action="entry",
+            strategy_leg="spot",
+        )
+        try:
+            self._place_swap_order(
+                client,
+                swap_inst_id,
+                "sell",
+                trade_contracts,
+                automation["swapTdMode"],
+                "套利卖出永续对冲腿",
+                market_key=swap_key,
+                strategy_tag="arb_hedge",
+                strategy_action="hedge",
+                strategy_leg="swap",
+            )
+        except Exception:
+            try:
+                self._place_spot_order(
+                    client,
+                    spot_inst_id,
+                    "sell",
+                    estimated_spot_size,
+                    "套利对冲失败，回滚现货腿",
+                    market_key=spot_key,
+                    strategy_tag="arb_rb",
+                    strategy_action="rollback",
+                    strategy_leg="spot",
+                )
+                self._set_market(spot_key, {"arbStage": "rollback", "lastMessage": "套利对冲失败，已发起现货回滚"})
+                self._set_market(swap_key, {"arbStage": "rollback", "lastMessage": "套利对冲失败，已发起现货回滚"})
+            except Exception as rollback_exc:
+                self._log("error", f"套利对冲腿失败且现货回滚也失败：{rollback_exc}")
+            raise
+
+        arb_patch = {
+            "arbBias": "long_spot_short_swap",
+            "arbSpotSize": decimal_to_str(estimated_spot_size),
+            "arbSwapSize": decimal_to_str(trade_contracts),
+            "arbOpenedAt": now_local_iso(),
+            "arbEntrySpreadPct": decimal_to_str(entry_spread_pct),
+            "arbEntrySpotPx": decimal_to_str(spot_ask),
+            "arbEntrySwapPx": decimal_to_str(swap_bid),
+            "arbStage": "hedged",
+        }
+        self._set_market(spot_key, {**arb_patch, "entryPrice": decimal_to_str(spot_ask), "lastMessage": "套利双腿已建立，等待价差回补"})
+        self._set_market(swap_key, {**arb_patch, "entryPrice": decimal_to_str(swap_bid), "lastMessage": "套利双腿已建立，等待价差回补"})
+
+    def _complete_cycle_stage(
+        self,
+        *,
+        cycle_started: float,
+        cycle_stamp: str,
+        analysis: dict[str, Any],
+        effective_automation: dict[str, Any],
+        allow_new_entries: bool,
+        watchlist_entries: list[dict[str, Any]],
+        total_eq: Decimal,
+        execution_summary: dict[str, Any],
+    ) -> None:
+        is_basis_arb = str(effective_automation.get("strategyPreset") or "") == "basis_arb"
+        arb_runtime = execution_summary.get("arbRuntime") or {}
+        hedged_pairs = int(arb_runtime.get("hedged") or 0)
+        window_open = int(arb_runtime.get("windowOpen") or 0)
+        exit_queue = int(arb_runtime.get("exitQueue") or 0)
+        rollback_pairs = int(arb_runtime.get("rollback") or 0)
+        blocked_pairs = int(arb_runtime.get("blocked") or 0)
+        broken_pairs = int(arb_runtime.get("brokenPair") or 0)
+        if is_basis_arb:
+            pipeline_summary = (
+                f"套利窗口 {window_open} 币 · "
+                f"对冲中 {hedged_pairs} 币对 · "
+                f"待回补 {exit_queue} 币对"
+            )
+            if rollback_pairs:
+                pipeline_summary += f" · 回滚 {rollback_pairs}"
+            if blocked_pairs:
+                pipeline_summary += f" · 阻塞 {blocked_pairs}"
+            if broken_pairs:
+                pipeline_summary += f" · 断腿 {broken_pairs}"
+            mode_text = (
+                f"{analysis.get('selectedStrategyName', strategy_label(effective_automation.get('strategyPreset', 'basis_arb')))}"
+                f" · {len(watchlist_entries)} 币观察"
+                f" · 窗口 {window_open}"
+                f" · 对冲 {hedged_pairs}"
+                f" · 回补 {exit_queue}"
+            )
+            if rollback_pairs:
+                mode_text += f" · 回滚 {rollback_pairs}"
+            last_strategy_detail = (
+                f"入场 {effective_automation.get('arbEntrySpreadPct', '0')}% · "
+                f"回补 {effective_automation.get('arbExitSpreadPct', '0')}% · "
+                f"资金费 {effective_automation.get('arbMinFundingRatePct', '0')}% · "
+                f"{len(watchlist_entries) or 1} 币组合"
+            )
+        else:
+            pipeline_summary = (
+                f"信号 {analysis.get('decisionLabel', '待分析')} · "
+                f"{len(watchlist_entries)} 币观察 · "
+                f"{int(execution_summary.get('activeSymbols') or 0)} 币持仓"
+            )
+            mode_text = (
+                f"{analysis.get('selectedStrategyName', strategy_label(effective_automation.get('strategyPreset', 'dual_engine')))}"
+                + (
+                    f" · {len(watchlist_entries)} 币并行"
+                    if len(watchlist_entries) > 1
+                    else ""
+                )
+                + " · "
+                + analysis.get("decisionLabel", "待分析")
+            )
+            last_strategy_detail = (
+                f"{effective_automation.get('bar', '5m')} · EMA "
+                f"{effective_automation.get('fastEma', '-')}/{effective_automation.get('slowEma', '-')}"
+                f" · {len(watchlist_entries) or 1} 币组合"
+            )
         self._update_state(
             lambda current: current.update(
                 {
@@ -5907,29 +7206,81 @@ class AutomationEngine:
                     "lastCycleDurationMs": int((time.perf_counter() - cycle_started) * 1000),
                     "statusText": "运行中" if allow_new_entries else analysis.get("decisionLabel", "观察中"),
                     "lastError": "",
-                    "modeText": (
-                        f"{analysis.get('selectedStrategyName', strategy_label(effective_automation.get('strategyPreset', 'dual_engine')))}"
-                        + (
-                            f" · {len(watchlist_entries)} 币并行"
-                            if len(watchlist_entries) > 1
-                            else ""
-                        )
-                        + " · "
-                        + analysis.get("decisionLabel", "待分析")
-                    ),
+                    "modeText": mode_text,
                     "lastAppliedStrategy": {
                         "stage": "running" if allow_new_entries else "synced",
                         "title": analysis.get("selectedStrategyName")
                         or strategy_label(effective_automation.get("strategyPreset", "dual_engine")),
-                        "detail": (
-                            f"{effective_automation.get('bar', '5m')} · EMA "
-                            f"{effective_automation.get('fastEma', '-')}/{effective_automation.get('slowEma', '-')}"
-                            f" · {len(watchlist_entries) or 1} 币组合"
-                        ),
+                        "detail": last_strategy_detail,
                         "appliedAt": cycle_stamp,
+                    },
+                    "lastPipeline": {
+                        "signal": "ok",
+                        "portfolio": "ok",
+                        "risk": "ok",
+                        "execution": "ok",
+                        "targetCount": len(watchlist_entries),
+                        "allowNewEntries": allow_new_entries,
+                        "equity": decimal_to_str(total_eq),
+                        "completedAt": cycle_stamp,
+                        "summary": pipeline_summary,
+                        "executionSummary": execution_summary,
                     },
                 }
             )
+        )
+
+    def _run_cycle(self, client: OkxClient, automation: dict[str, Any]) -> None:
+        cycle_started = time.perf_counter()
+        cycle_stamp = now_local_iso()
+        signal_stage = self._run_signal_stage(client, automation)
+        analysis = signal_stage["analysis"]
+        effective_automation = signal_stage["effectiveAutomation"]
+        allow_new_entries = bool(signal_stage["allowNewEntries"])
+
+        portfolio_stage = self._run_portfolio_stage(client, effective_automation)
+        risk_stop_reason = self._run_risk_stage(
+            effective_automation,
+            portfolio_stage["sessionState"],
+        )
+        if risk_stop_reason:
+            self._update_state(
+                lambda current: current.update(
+                    {
+                        "lastPipeline": {
+                            "signal": "ok",
+                            "portfolio": "ok",
+                            "risk": "blocked",
+                            "execution": "skipped",
+                            "targetCount": len(portfolio_stage["targets"]),
+                            "allowNewEntries": allow_new_entries,
+                            "equity": decimal_to_str(portfolio_stage["totalEq"]),
+                            "completedAt": cycle_stamp,
+                            "summary": risk_stop_reason,
+                        }
+                    }
+                )
+            )
+            self.stop(risk_stop_reason)
+            return
+
+        execution_stage = self._run_execution_stage(
+            client,
+            effective_automation,
+            portfolio_stage["balanceSnapshot"],
+            allow_new_entries,
+            analysis.get("decisionLabel", "观察为主"),
+            portfolio_stage["targets"],
+        )
+        self._complete_cycle_stage(
+            cycle_started=cycle_started,
+            cycle_stamp=cycle_stamp,
+            analysis=analysis,
+            effective_automation=effective_automation,
+            allow_new_entries=allow_new_entries,
+            watchlist_entries=execution_stage["watchlistEntries"],
+            total_eq=portfolio_stage["totalEq"],
+            execution_summary=execution_stage["executionSummary"],
         )
 
     def _run_spot_cycle(
@@ -6365,26 +7716,62 @@ class AutomationEngine:
                             market_key=market_key,
                         )
 
-    def _place_spot_order(self, client: OkxClient, inst_id: str, side: str, size: Decimal, reason: str, *, market_key: str = "spot") -> None:
-        payload: dict[str, Any] = {
-            "instId": inst_id,
-            "tdMode": "cash",
-            "side": side,
-            "ordType": "market",
-            "clOrdId": build_cl_ord_id("s"),
-        }
+    def _place_spot_order(
+        self,
+        client: OkxClient,
+        inst_id: str,
+        side: str,
+        size: Decimal,
+        reason: str,
+        *,
+        market_key: str = "spot",
+        strategy_tag: str = "",
+        strategy_action: str = "",
+        strategy_leg: str = "",
+    ) -> dict[str, Any]:
+        execution_mode = "市价"
         if side == "buy":
-            payload["sz"] = decimal_to_str(size)
-            payload["tgtCcy"] = "quote_ccy"
+            payload: dict[str, Any] = {
+                "instId": inst_id,
+                "tdMode": "cash",
+                "side": side,
+                "ordType": "market",
+                "clOrdId": build_cl_ord_id("s"),
+                "sz": decimal_to_str(size),
+                "tgtCcy": "quote_ccy",
+            }
         else:
-            payload["sz"] = decimal_to_str(size)
+            try:
+                payload, execution_mode = self._build_protected_spot_sell_order(client, inst_id, size)
+            except Exception as exc:
+                payload = {
+                    "instId": inst_id,
+                    "tdMode": "cash",
+                    "side": side,
+                    "ordType": "market",
+                    "clOrdId": build_cl_ord_id("s"),
+                    "sz": decimal_to_str(size),
+                }
+                execution_mode = "市价回退"
+                self._log("warn", f"{reason} · 现货 {inst_id} 未能构造保护价 IOC，回退市价: {exc}")
+        if strategy_tag:
+            payload["tag"] = strategy_tag
         result = client.place_order(payload)
-        order = (result.get("data") or [{}])[0]
+        order = deep_merge(payload, (result.get("data") or [{}])[0])
+        if strategy_tag:
+            order["tag"] = str(order.get("tag") or strategy_tag)
+            order["strategyTag"] = strategy_tag
+        if strategy_action:
+            order["strategyAction"] = strategy_action
+        if strategy_leg:
+            order["strategyLeg"] = strategy_leg
+        order["strategyReason"] = reason
         if order.get("ordId") or order.get("clOrdId"):
             PRIVATE_ORDER_STREAM._ingest_orders([order])
         order_id = order.get("ordId", "")
         self._increment_order_count(market_key, order_id, reason)
-        self._log("info", f"{reason} · 现货 {inst_id} 已发单")
+        self._log("info", f"{reason} · 现货 {inst_id} 已发单 · {execution_mode}")
+        return order
 
     def _place_swap_order(
         self,
@@ -6397,7 +7784,10 @@ class AutomationEngine:
         *,
         reduce_only: bool = False,
         market_key: str = "swap",
-    ) -> None:
+        strategy_tag: str = "",
+        strategy_action: str = "",
+        strategy_leg: str = "",
+    ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "instId": inst_id,
             "tdMode": td_mode,
@@ -6408,13 +7798,24 @@ class AutomationEngine:
         }
         if reduce_only:
             payload["reduceOnly"] = True
+        if strategy_tag:
+            payload["tag"] = strategy_tag
         result = client.place_order(payload)
-        order = (result.get("data") or [{}])[0]
+        order = deep_merge(payload, (result.get("data") or [{}])[0])
+        if strategy_tag:
+            order["tag"] = str(order.get("tag") or strategy_tag)
+            order["strategyTag"] = strategy_tag
+        if strategy_action:
+            order["strategyAction"] = strategy_action
+        if strategy_leg:
+            order["strategyLeg"] = strategy_leg
+        order["strategyReason"] = reason
         if order.get("ordId") or order.get("clOrdId"):
             PRIVATE_ORDER_STREAM._ingest_orders([order])
         order_id = order.get("ordId", "")
         self._increment_order_count(market_key, order_id, reason)
         self._log("info", f"{reason} · 永续 {inst_id} 已发单")
+        return order
 
 
 CONFIG = ConfigStore(CONFIG_PATH)
@@ -6662,13 +8063,16 @@ class AppHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/automation/state":
-            json_response(self, {"ok": True, "state": AUTOMATION_ENGINE.snapshot()})
+            state = AUTOMATION_ENGINE.snapshot()
+            state["executionJournal"] = get_execution_journal_snapshot(limit=20)
+            json_response(self, {"ok": True, "state": state})
             return
 
         if path == "/api/focus-snapshot":
             payload: dict[str, Any] = {
                 "ok": True,
                 "automationState": AUTOMATION_ENGINE.snapshot(),
+                "executionJournal": get_execution_journal_snapshot(limit=20),
                 "timestamp": int(time.time()),
             }
 
@@ -6771,7 +8175,8 @@ class AppHandler(BaseHTTPRequestHandler):
                 error_response(self, message, status=400)
                 return
             inst_type = (query.get("instType") or [""])[0]
-            cached_orders = get_local_recent_orders(inst_type, limit=20)
+            cached_journal = get_execution_journal_snapshot(inst_type, limit=20)
+            cached_orders = cached_journal.get("orders") or []
             stream_orders = PRIVATE_ORDER_STREAM.get_recent_orders(inst_type, limit=20)
             merged_live_orders = merge_order_feeds(stream_orders, cached_orders, limit=20)
             has_private_credentials = bool(
@@ -6786,6 +8191,10 @@ class AppHandler(BaseHTTPRequestHandler):
                         "ok": True,
                         "orders": merged_live_orders,
                         "source": "private_ws" if stream_orders else "local_cache",
+                        "journal": cached_journal.get("summary") or {},
+                        "symbols": cached_journal.get("symbols") or [],
+                        "lastReconciledAt": cached_journal.get("lastReconciledAt") or "",
+                        "lastSource": cached_journal.get("lastSource") or "",
                         "stream": PRIVATE_ORDER_STREAM.snapshot(),
                     },
                 )
@@ -6796,12 +8205,18 @@ class AppHandler(BaseHTTPRequestHandler):
                 if inst_type:
                     result = client.get_recent_orders(inst_type)
                     merged_orders = merge_order_feeds(result.get("data", []), stream_orders, cached_orders, limit=20)
+                    persist_local_orders(merged_orders, source="rest_multi" if (stream_orders or cached_orders) else "rest")
+                    journal = get_execution_journal_snapshot(inst_type, limit=20)
                     json_response(
                         self,
                         {
                             "ok": True,
-                            "orders": merged_orders,
+                            "orders": journal.get("orders") or merged_orders,
                             "source": "rest_multi" if (stream_orders or cached_orders) else "rest",
+                            "journal": journal.get("summary") or {},
+                            "symbols": journal.get("symbols") or [],
+                            "lastReconciledAt": journal.get("lastReconciledAt") or "",
+                            "lastSource": journal.get("lastSource") or "",
                             "stream": PRIVATE_ORDER_STREAM.snapshot(),
                         },
                     )
@@ -6820,12 +8235,18 @@ class AppHandler(BaseHTTPRequestHandler):
                     raise OkxApiError("; ".join(errors))
 
                 merged_orders = merge_order_feeds(merged_orders, stream_orders, cached_orders, limit=20)
+                persist_local_orders(merged_orders, source="rest_multi")
+                journal = get_execution_journal_snapshot(inst_type, limit=20)
                 json_response(
                     self,
                     {
                         "ok": True,
-                        "orders": merged_orders[:20],
+                        "orders": journal.get("orders") or merged_orders[:20],
                         "source": "rest_multi",
+                        "journal": journal.get("summary") or {},
+                        "symbols": journal.get("symbols") or [],
+                        "lastReconciledAt": journal.get("lastReconciledAt") or "",
+                        "lastSource": journal.get("lastSource") or "",
                         "stream": PRIVATE_ORDER_STREAM.snapshot(),
                     },
                 )
@@ -6837,6 +8258,10 @@ class AppHandler(BaseHTTPRequestHandler):
                             "ok": True,
                             "orders": merged_live_orders,
                             "source": "private_ws" if stream_orders else "local_cache",
+                            "journal": cached_journal.get("summary") or {},
+                            "symbols": cached_journal.get("symbols") or [],
+                            "lastReconciledAt": cached_journal.get("lastReconciledAt") or "",
+                            "lastSource": cached_journal.get("lastSource") or "",
                             "stream": PRIVATE_ORDER_STREAM.snapshot(),
                         },
                     )
