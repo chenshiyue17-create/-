@@ -50,6 +50,7 @@ MAC_LOTTO_LOG_PATH = DATA_DIR / "mac-lotto.log"
 HOST = os.environ.get("OKX_LOCAL_APP_HOST", "127.0.0.1")
 PORT = int(os.environ.get("OKX_LOCAL_APP_PORT", "8765"))
 MAX_LOG_ENTRIES = 120
+SPOT_SELL_PROTECTION_PCT = Decimal("2.0")
 SECURE_FILE_MAGIC = "okx-local-app-secure-v1"
 KEYCHAIN_SERVICE = "com.cc.okxlocalapp.local-file-key"
 KEYCHAIN_ACCOUNT = "default"
@@ -5706,6 +5707,54 @@ class AutomationEngine:
             )
             self._set_market(f"swap:{target['swapInstId']}", {"prepared": True, "instId": target["swapInstId"]})
 
+    def _spot_reference_price(self, client: OkxClient, inst_id: str, side: str) -> Decimal:
+        row = extract_first_row(client.get_ticker(inst_id))
+        bid_px = safe_decimal(row.get("bidPx") or row.get("bidPrice"), "0")
+        ask_px = safe_decimal(row.get("askPx") or row.get("askPrice"), "0")
+        last_px = safe_decimal(row.get("last"), "0")
+        if side == "sell":
+            return bid_px if bid_px > 0 else (last_px if last_px > 0 else ask_px)
+        return ask_px if ask_px > 0 else (last_px if last_px > 0 else bid_px)
+
+    def _build_protected_spot_sell_order(
+        self,
+        client: OkxClient,
+        inst_id: str,
+        size: Decimal,
+    ) -> tuple[dict[str, Any], str]:
+        meta = get_instrument_meta(client, "SPOT", inst_id)
+        tick_size = max(safe_decimal(meta.get("tickSz"), "0.00000001"), Decimal("0.00000001"))
+        lot_size = max(safe_decimal(meta.get("lotSz") or meta.get("minSz"), "0.00000001"), Decimal("0.00000001"))
+        min_size = max(safe_decimal(meta.get("minSz") or meta.get("lotSz"), "0.00000001"), Decimal("0.00000001"))
+        rounded_size = round_down(size, lot_size)
+        if rounded_size <= 0 or rounded_size < min_size:
+            raise OkxApiError(f"现货卖出数量过小，无法在 {inst_id} 发单")
+
+        reference_px = self._spot_reference_price(client, inst_id, "sell")
+        if reference_px <= 0:
+            raise OkxApiError(f"未拿到 {inst_id} 的可用卖一/现价，无法构造保护价卖单")
+
+        protected_px = round_down(
+            reference_px * (Decimal("1") - (SPOT_SELL_PROTECTION_PCT / Decimal("100"))),
+            tick_size,
+        )
+        if protected_px <= 0:
+            protected_px = round_down(reference_px, tick_size)
+        if protected_px <= 0:
+            raise OkxApiError(f"未拿到 {inst_id} 的有效保护价，无法发单")
+
+        payload: dict[str, Any] = {
+            "instId": inst_id,
+            "tdMode": "cash",
+            "side": "sell",
+            "ordType": "ioc",
+            "px": decimal_to_str(protected_px),
+            "sz": decimal_to_str(rounded_size),
+            "clOrdId": build_cl_ord_id("s"),
+        }
+        label = f"保护价 IOC · {decimal_to_str(protected_px)}"
+        return payload, label
+
     def start(self, *, autostart: bool = False) -> None:
         with self.lock:
             if self.thread and self.thread.is_alive():
@@ -6366,25 +6415,38 @@ class AutomationEngine:
                         )
 
     def _place_spot_order(self, client: OkxClient, inst_id: str, side: str, size: Decimal, reason: str, *, market_key: str = "spot") -> None:
-        payload: dict[str, Any] = {
-            "instId": inst_id,
-            "tdMode": "cash",
-            "side": side,
-            "ordType": "market",
-            "clOrdId": build_cl_ord_id("s"),
-        }
+        execution_mode = "市价"
         if side == "buy":
-            payload["sz"] = decimal_to_str(size)
-            payload["tgtCcy"] = "quote_ccy"
+            payload: dict[str, Any] = {
+                "instId": inst_id,
+                "tdMode": "cash",
+                "side": side,
+                "ordType": "market",
+                "clOrdId": build_cl_ord_id("s"),
+                "sz": decimal_to_str(size),
+                "tgtCcy": "quote_ccy",
+            }
         else:
-            payload["sz"] = decimal_to_str(size)
+            try:
+                payload, execution_mode = self._build_protected_spot_sell_order(client, inst_id, size)
+            except Exception as exc:
+                payload = {
+                    "instId": inst_id,
+                    "tdMode": "cash",
+                    "side": side,
+                    "ordType": "market",
+                    "clOrdId": build_cl_ord_id("s"),
+                    "sz": decimal_to_str(size),
+                }
+                execution_mode = "市价回退"
+                self._log("warn", f"{reason} · 现货 {inst_id} 未能构造保护价 IOC，回退市价: {exc}")
         result = client.place_order(payload)
         order = (result.get("data") or [{}])[0]
         if order.get("ordId") or order.get("clOrdId"):
             PRIVATE_ORDER_STREAM._ingest_orders([order])
         order_id = order.get("ordId", "")
         self._increment_order_count(market_key, order_id, reason)
-        self._log("info", f"{reason} · 现货 {inst_id} 已发单")
+        self._log("info", f"{reason} · 现货 {inst_id} 已发单 · {execution_mode}")
 
     def _place_swap_order(
         self,
