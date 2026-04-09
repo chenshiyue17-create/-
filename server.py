@@ -952,6 +952,20 @@ def decimal_to_str(value: Decimal | str | int | float) -> str:
     return rendered or "0"
 
 
+def format_decimal(value: Decimal | str | int | float, places: int = 2) -> str:
+    number = safe_decimal(value)
+    if places <= 0:
+        quantized = number.quantize(Decimal("1"))
+    else:
+        quantized = number.quantize(Decimal("1").scaleb(-places))
+    rendered = format(quantized, "f")
+    if rendered in ("", "-0"):
+        return "0"
+    if "." in rendered:
+        rendered = rendered.rstrip("0").rstrip(".")
+    return rendered or "0"
+
+
 def round_down(value: Decimal, step: Decimal) -> Decimal:
     if step <= 0:
         return value
@@ -986,6 +1000,7 @@ def default_automation_config() -> dict[str, Any]:
         "spotInstId": "BTC-USDT",
         "swapInstId": "BTC-USDT-SWAP",
         "watchlistSymbols": "BTC",
+        "watchlistOverrides": {},
         "bar": "5m",
         "fastEma": 9,
         "slowEma": 21,
@@ -1139,28 +1154,174 @@ def normalize_watchlist_symbols(raw: Any, config: dict[str, Any] | None = None) 
     return (normalized or ["BTC"])[:8]
 
 
+WATCHLIST_OVERRIDE_DECIMAL_FIELDS = {
+    "spotQuoteBudget",
+    "spotMaxExposure",
+    "swapContracts",
+    "swapLeverage",
+    "stopLossPct",
+    "takeProfitPct",
+    "maxDailyLossPct",
+}
+WATCHLIST_OVERRIDE_INT_FIELDS = {
+    "fastEma",
+    "slowEma",
+    "pollSeconds",
+    "cooldownSeconds",
+    "maxOrdersPerDay",
+}
+WATCHLIST_OVERRIDE_BOOL_FIELDS = {"spotEnabled", "swapEnabled"}
+WATCHLIST_OVERRIDE_ENUM_FIELDS = {
+    "bar": {"1m", "5m", "15m", "1H"},
+    "swapTdMode": {"cross", "isolated"},
+    "swapStrategyMode": {"long_only", "short_only", "trend_follow"},
+}
+WATCHLIST_OVERRIDE_ALLOWED_FIELDS = (
+    WATCHLIST_OVERRIDE_DECIMAL_FIELDS
+    | WATCHLIST_OVERRIDE_INT_FIELDS
+    | WATCHLIST_OVERRIDE_BOOL_FIELDS
+    | set(WATCHLIST_OVERRIDE_ENUM_FIELDS.keys())
+)
+
+
+def normalize_symbol_token(raw: Any) -> str:
+    value = str(raw or "").strip().upper()
+    if "-" in value:
+        value = value.split("-")[0]
+    return re.sub(r"[^A-Z0-9]", "", value)
+
+
+def parse_watchlist_overrides(raw: Any) -> tuple[dict[str, dict[str, Any]], str]:
+    if raw in (None, "", {}, []):
+        return {}, ""
+    parsed = raw
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return {}, ""
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError as exc:
+            return {}, f"按币覆盖配置不是合法 JSON: {exc.msg}"
+    if not isinstance(parsed, dict):
+        return {}, "按币覆盖配置必须是对象，例如 {\"BTC\": {\"fastEma\": 12}}"
+
+    normalized: dict[str, dict[str, Any]] = {}
+    for symbol_key, override in parsed.items():
+        symbol = normalize_symbol_token(symbol_key)
+        if not symbol:
+            continue
+        if not isinstance(override, dict):
+            return {}, f"{symbol} 的按币覆盖必须是对象"
+        normalized_override: dict[str, Any] = {}
+        for field, value in override.items():
+            if field not in WATCHLIST_OVERRIDE_ALLOWED_FIELDS:
+                return {}, f"{symbol} 的按币覆盖字段不支持: {field}"
+            if field in WATCHLIST_OVERRIDE_DECIMAL_FIELDS:
+                normalized_override[field] = decimal_to_str(safe_decimal(value, "0"))
+            elif field in WATCHLIST_OVERRIDE_INT_FIELDS:
+                try:
+                    normalized_override[field] = int(value)
+                except (TypeError, ValueError):
+                    return {}, f"{symbol} 的按币覆盖字段 {field} 必须是整数"
+            elif field in WATCHLIST_OVERRIDE_BOOL_FIELDS:
+                normalized_override[field] = bool(value)
+            else:
+                normalized_value = str(value or "").strip()
+                allowed = WATCHLIST_OVERRIDE_ENUM_FIELDS.get(field)
+                if allowed and normalized_value not in allowed:
+                    return {}, f"{symbol} 的按币覆盖字段 {field} 不支持值 {normalized_value}"
+                normalized_override[field] = normalized_value
+        if normalized_override:
+            normalized[symbol] = normalized_override
+    return normalized, ""
+
+
+def validate_single_automation_target(config: dict[str, Any]) -> str:
+    if str(config.get("bar") or "") not in {"1m", "5m", "15m", "1H"}:
+        return "K 线周期仅支持 1m、5m、15m、1H"
+    fast = int(config.get("fastEma", 0))
+    slow = int(config.get("slowEma", 0))
+    poll = int(config.get("pollSeconds", 0))
+    cooldown = int(config.get("cooldownSeconds", 0))
+    max_orders = int(config.get("maxOrdersPerDay", 0))
+    if fast < 2 or slow <= fast:
+        return "EMA 参数不合法，必须满足 slow > fast >= 2"
+    if poll < 5 or poll > 300:
+        return "轮询秒数需在 5 到 300 之间"
+    if cooldown < 0 or cooldown > 3600:
+        return "冷却秒数需在 0 到 3600 之间"
+    if max_orders < 1 or max_orders > 500:
+        return "每日最大订单数需在 1 到 500 之间"
+    if config.get("swapStrategyMode") not in ("long_only", "short_only", "trend_follow"):
+        return "永续策略模式不支持"
+    if config.get("swapTdMode") not in ("cross", "isolated"):
+        return "永续保证金模式仅支持 cross 或 isolated"
+    for field in (
+        "spotQuoteBudget",
+        "spotMaxExposure",
+        "swapContracts",
+        "swapLeverage",
+        "stopLossPct",
+        "takeProfitPct",
+        "maxDailyLossPct",
+    ):
+        if safe_decimal(config.get(field), "0") < 0:
+            return f"{field} 不能小于 0"
+    return ""
+
+
+def allocate_watchlist_numeric_field(
+    symbols: list[str],
+    overrides: dict[str, dict[str, Any]],
+    field: str,
+    total: Decimal,
+) -> dict[str, Decimal]:
+    explicit: dict[str, Decimal] = {}
+    for symbol in symbols:
+        if field in (overrides.get(symbol) or {}):
+            explicit[symbol] = safe_decimal(overrides[symbol].get(field), "0")
+    remaining_symbols = [symbol for symbol in symbols if symbol not in explicit]
+    remaining_total = total - sum(explicit.values(), Decimal("0"))
+    if remaining_total < 0:
+        remaining_total = Decimal("0")
+    per_symbol = remaining_total / Decimal(len(remaining_symbols)) if remaining_symbols else Decimal("0")
+    allocations: dict[str, Decimal] = {}
+    for symbol in symbols:
+        allocations[symbol] = explicit.get(symbol, per_symbol)
+    return allocations
+
+
 def build_execution_targets(config: dict[str, Any]) -> list[dict[str, Any]]:
     symbols = normalize_watchlist_symbols(config.get("watchlistSymbols"), config)
     target_count = max(1, len(symbols))
+    overrides = copy.deepcopy(config.get("watchlistOverrides") or {})
     spot_budget = safe_decimal(config.get("spotQuoteBudget"), "0")
     spot_exposure = safe_decimal(config.get("spotMaxExposure"), "0")
     swap_contracts = safe_decimal(config.get("swapContracts"), "0")
+    spot_budget_allocations = allocate_watchlist_numeric_field(symbols, overrides, "spotQuoteBudget", spot_budget)
+    spot_exposure_allocations = allocate_watchlist_numeric_field(symbols, overrides, "spotMaxExposure", spot_exposure)
+    swap_contract_allocations = allocate_watchlist_numeric_field(symbols, overrides, "swapContracts", swap_contracts)
     targets: list[dict[str, Any]] = []
 
     for index, symbol in enumerate(symbols):
         pair_config = deep_merge(config, {})
         pair_config["watchlistSymbols"] = ",".join(symbols)
+        pair_config["watchlistOverrides"] = copy.deepcopy(overrides)
         pair_config["watchlistSymbol"] = symbol
         pair_config["watchlistIndex"] = index
         pair_config["watchlistCount"] = target_count
         pair_config["spotInstId"] = f"{symbol}-USDT"
         pair_config["swapInstId"] = f"{symbol}-USDT-SWAP"
-        if target_count > 1:
-            if pair_config.get("spotEnabled"):
-                pair_config["spotQuoteBudget"] = decimal_to_str(spot_budget / Decimal(target_count))
-                pair_config["spotMaxExposure"] = decimal_to_str(spot_exposure / Decimal(target_count))
-            if pair_config.get("swapEnabled"):
-                pair_config["swapContracts"] = decimal_to_str(swap_contracts / Decimal(target_count))
+        if pair_config.get("spotEnabled"):
+            pair_config["spotQuoteBudget"] = decimal_to_str(spot_budget_allocations.get(symbol, Decimal("0")))
+            pair_config["spotMaxExposure"] = decimal_to_str(spot_exposure_allocations.get(symbol, Decimal("0")))
+        if pair_config.get("swapEnabled"):
+            pair_config["swapContracts"] = decimal_to_str(swap_contract_allocations.get(symbol, Decimal("0")))
+        symbol_override = copy.deepcopy(overrides.get(symbol) or {})
+        if symbol_override:
+            pair_config = deep_merge(pair_config, symbol_override)
+        pair_config["watchlistOverride"] = symbol_override
         targets.append(pair_config)
 
     return targets
@@ -1192,6 +1353,8 @@ def build_watchlist_entry(
     spot_market: dict[str, Any],
     swap_market: dict[str, Any],
 ) -> dict[str, Any]:
+    symbol_override = copy.deepcopy(target.get("watchlistOverride") or {})
+    override_keys = sorted(symbol_override.keys())
     spot_notional = safe_decimal(spot_market.get("positionNotional"), "0")
     swap_notional = safe_decimal(swap_market.get("positionNotional"), "0")
     spot_pnl = safe_decimal(spot_market.get("floatingPnl"), "0")
@@ -1216,6 +1379,10 @@ def build_watchlist_entry(
         status = "观察中"
 
     detail_bits = []
+    if override_keys:
+        detail_bits.append(
+            f"独立覆盖 {len(override_keys)} 项 · {target.get('bar', '5m')} EMA {target.get('fastEma', '-')}/{target.get('slowEma', '-')}"
+        )
     if str(spot_market.get("lastMessage") or "").strip():
         detail_bits.append(f"现货 {spot_market.get('lastMessage')}")
     if str(swap_market.get("lastMessage") or "").strip():
@@ -1232,7 +1399,9 @@ def build_watchlist_entry(
             "swapLeverage": decimal_to_str(safe_decimal(target.get("swapLeverage"), "0")),
             "swapTdMode": str(target.get("swapTdMode") or "cross"),
             "swapStrategyMode": str(target.get("swapStrategyMode") or "trend_follow"),
+            "overrideKeys": override_keys,
         },
+        "overrideActive": bool(override_keys),
         "summary": {
             "status": status,
             "detail": " · ".join(detail_bits[:2]),
@@ -2594,41 +2763,29 @@ def validate_automation_config(config: dict[str, Any]) -> tuple[bool, str, dict[
     normalized = deep_merge(default_automation_config(), config)
     watchlist_symbols = normalize_watchlist_symbols(normalized.get("watchlistSymbols"), normalized)
     normalized["watchlistSymbols"] = ",".join(watchlist_symbols)
+    watchlist_overrides, overrides_error = parse_watchlist_overrides(normalized.get("watchlistOverrides"))
+    if overrides_error:
+        return False, overrides_error, normalized
+    normalized["watchlistOverrides"] = {
+        symbol: copy.deepcopy(override)
+        for symbol, override in watchlist_overrides.items()
+        if symbol in watchlist_symbols
+    }
     primary_symbol = watchlist_symbols[0]
     normalized["spotInstId"] = f"{primary_symbol}-USDT"
     normalized["swapInstId"] = f"{primary_symbol}-USDT-SWAP"
     if normalized.get("strategyPreset") not in ("dual_engine", "btc_lotto"):
         return False, "策略模式不支持", normalized
-    fast = int(normalized.get("fastEma", 0))
-    slow = int(normalized.get("slowEma", 0))
-    poll = int(normalized.get("pollSeconds", 0))
-    cooldown = int(normalized.get("cooldownSeconds", 0))
-    max_orders = int(normalized.get("maxOrdersPerDay", 0))
-    if fast < 2 or slow <= fast:
-        return False, "EMA 参数不合法，必须满足 slow > fast >= 2", normalized
-    if poll < 5 or poll > 300:
-        return False, "轮询秒数需在 5 到 300 之间", normalized
-    if cooldown < 0 or cooldown > 3600:
-        return False, "冷却秒数需在 0 到 3600 之间", normalized
-    if max_orders < 1 or max_orders > 500:
-        return False, "每日最大订单数需在 1 到 500 之间", normalized
-    if normalized.get("swapStrategyMode") not in ("long_only", "short_only", "trend_follow"):
-        return False, "永续策略模式不支持", normalized
-    if normalized.get("swapTdMode") not in ("cross", "isolated"):
-        return False, "永续保证金模式仅支持 cross 或 isolated", normalized
     if len(watchlist_symbols) > 8:
         return False, "多币 watchlist 最多支持 8 个标的", normalized
-    for field in (
-        "spotQuoteBudget",
-        "spotMaxExposure",
-        "swapContracts",
-        "swapLeverage",
-        "stopLossPct",
-        "takeProfitPct",
-        "maxDailyLossPct",
-    ):
-        if safe_decimal(normalized.get(field), "0") < 0:
-            return False, f"{field} 不能小于 0", normalized
+    base_error = validate_single_automation_target(normalized)
+    if base_error:
+        return False, base_error, normalized
+    for symbol, override in normalized["watchlistOverrides"].items():
+        target_config = deep_merge(normalized, override)
+        override_error = validate_single_automation_target(target_config)
+        if override_error:
+            return False, f"{symbol} 覆盖配置无效：{override_error}", normalized
     return True, "", normalized
 
 

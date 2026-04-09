@@ -254,15 +254,143 @@ function formatStrategyMode(mode) {
   return "只做多";
 }
 
+function normalizeWatchlistOverrideSymbol(raw) {
+  let value = String(raw || "").trim().toUpperCase();
+  if (value.includes("-")) value = value.split("-")[0];
+  return value.replace(/[^A-Z0-9]/g, "");
+}
+
+function parseWatchlistOverridesValue(raw, watchlist = []) {
+  if (!raw || (typeof raw === "string" && !raw.trim())) return {};
+  let parsed = raw;
+  if (typeof raw === "string") {
+    try {
+      parsed = JSON.parse(raw);
+    } catch (_) {
+      return {};
+    }
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+  const watchlistSet = new Set((watchlist || []).map((symbol) => normalizeWatchlistOverrideSymbol(symbol)).filter(Boolean));
+  const normalized = {};
+  Object.entries(parsed).forEach(([symbolKey, override]) => {
+    const symbol = normalizeWatchlistOverrideSymbol(symbolKey);
+    if (!symbol || !override || typeof override !== "object" || Array.isArray(override)) return;
+    if (watchlistSet.size && !watchlistSet.has(symbol)) return;
+    const next = {};
+    Object.entries(override).forEach(([field, value]) => {
+      if (["fastEma", "slowEma", "pollSeconds", "cooldownSeconds", "maxOrdersPerDay"].includes(field)) {
+        const num = Number(value);
+        if (Number.isFinite(num)) next[field] = Math.trunc(num);
+      } else if (["spotEnabled", "swapEnabled"].includes(field)) {
+        next[field] = Boolean(value);
+      } else if (
+        [
+          "bar",
+          "spotQuoteBudget",
+          "spotMaxExposure",
+          "swapContracts",
+          "swapTdMode",
+          "swapStrategyMode",
+          "swapLeverage",
+          "stopLossPct",
+          "takeProfitPct",
+          "maxDailyLossPct",
+        ].includes(field)
+      ) {
+        next[field] = String(value ?? "").trim();
+      }
+    });
+    if (Object.keys(next).length) normalized[symbol] = next;
+  });
+  return normalized;
+}
+
+function serializeWatchlistOverrides(raw, watchlist = []) {
+  const normalized = parseWatchlistOverridesValue(raw, watchlist);
+  const ordered = {};
+  Object.keys(normalized).sort().forEach((symbol) => {
+    ordered[symbol] = normalized[symbol];
+  });
+  return Object.keys(ordered).length ? JSON.stringify(ordered, null, 2) : "";
+}
+
+function getWatchlistOverrideParseError(raw) {
+  const text = String(raw || "").trim();
+  if (!text) return "";
+  try {
+    const parsed = JSON.parse(text);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return "按币覆盖参数必须是 JSON 对象，例如 {\"BTC\": {\"fastEma\": 12}}";
+    }
+    return "";
+  } catch (error) {
+    return `按币覆盖参数不是合法 JSON: ${error.message}`;
+  }
+}
+
+function allocateWatchlistNumericField(symbols, overrides, field, total) {
+  const normalizedSymbols = (symbols || []).map((symbol) => normalizeWatchlistOverrideSymbol(symbol)).filter(Boolean);
+  const totalValue = Number(total || 0);
+  const explicit = {};
+  normalizedSymbols.forEach((symbol) => {
+    if (overrides[symbol] && overrides[symbol][field] !== undefined && overrides[symbol][field] !== "") {
+      const value = Number(overrides[symbol][field]);
+      if (Number.isFinite(value)) explicit[symbol] = value;
+    }
+  });
+  const reserved = Object.values(explicit).reduce((sum, value) => sum + Number(value || 0), 0);
+  const remainingSymbols = normalizedSymbols.filter((symbol) => explicit[symbol] === undefined);
+  const remaining = Math.max(totalValue - reserved, 0);
+  const perSymbol = remainingSymbols.length ? remaining / remainingSymbols.length : 0;
+  const allocations = {};
+  normalizedSymbols.forEach((symbol) => {
+    allocations[symbol] = explicit[symbol] !== undefined ? explicit[symbol] : perSymbol;
+  });
+  return allocations;
+}
+
+function buildDraftExecutionTargets(config = collectAutomationConfig()) {
+  const normalized = normalizeAutomationConfigForCompare(config);
+  const watchlist = normalized.watchlistSymbols.split(",").filter(Boolean);
+  const overrides = parseWatchlistOverridesValue(normalized.watchlistOverrides, watchlist);
+  const spotBudgetAllocations = allocateWatchlistNumericField(watchlist, overrides, "spotQuoteBudget", normalized.spotQuoteBudget);
+  const spotCapAllocations = allocateWatchlistNumericField(watchlist, overrides, "spotMaxExposure", normalized.spotMaxExposure);
+  const swapContractAllocations = allocateWatchlistNumericField(watchlist, overrides, "swapContracts", normalized.swapContracts);
+  return watchlist.map((symbol, index) => {
+    const override = overrides[symbol] || {};
+    const target = {
+      ...normalized,
+      watchlistSymbols: watchlist.join(","),
+      watchlistSymbol: symbol,
+      watchlistIndex: index,
+      watchlistCount: watchlist.length,
+      spotInstId: `${symbol}-USDT`,
+      swapInstId: `${symbol}-USDT-SWAP`,
+      watchlistOverride: override,
+    };
+    if (target.spotEnabled) {
+      target.spotQuoteBudget = String(spotBudgetAllocations[symbol] ?? 0);
+      target.spotMaxExposure = String(spotCapAllocations[symbol] ?? 0);
+    }
+    if (target.swapEnabled) {
+      target.swapContracts = String(swapContractAllocations[symbol] ?? 0);
+    }
+    return { ...target, ...override, watchlistOverride: override };
+  });
+}
+
 function normalizeAutomationConfigForCompare(config = {}) {
   const spotInstId = String(config.spotInstId || "BTC-USDT").trim().toUpperCase();
   const swapInstId = String(config.swapInstId || "BTC-USDT-SWAP").trim().toUpperCase();
   const watchlistSymbols = parseWatchlistSymbols(config.watchlistSymbols, spotInstId, swapInstId).join(",");
+  const watchlist = watchlistSymbols.split(",").filter(Boolean);
   return {
     strategyPreset: String(config.strategyPreset || "dual_engine"),
     spotInstId,
     swapInstId,
     watchlistSymbols,
+    watchlistOverrides: serializeWatchlistOverrides(config.watchlistOverrides, watchlist),
     bar: String(config.bar || "5m"),
     fastEma: Number(config.fastEma ?? 9),
     slowEma: Number(config.slowEma ?? 21),
@@ -300,7 +428,8 @@ function buildStrategyFormSummary(config = {}) {
   const watchlist = normalized.watchlistSymbols
     ? normalized.watchlistSymbols.split(",").filter(Boolean)
     : ["BTC"];
-  return `${preset.label} · ${normalized.bar} · EMA ${normalized.fastEma}/${normalized.slowEma} · ${watchlist.join(" / ")} · ${watchlist.length} 币组合`;
+  const overrideCount = Object.keys(parseWatchlistOverridesValue(normalized.watchlistOverrides, watchlist)).length;
+  return `${preset.label} · ${normalized.bar} · EMA ${normalized.fastEma}/${normalized.slowEma} · ${watchlist.join(" / ")} · ${watchlist.length} 币组合${overrideCount ? ` · ${overrideCount} 币独立覆盖` : ""}`;
 }
 
 function setStrategyApplyState(stage, title, detail = "") {
@@ -314,49 +443,65 @@ function setStrategyApplyState(stage, title, detail = "") {
 }
 
 function buildDraftPortfolioEntries(config = collectAutomationConfig()) {
-  const normalized = normalizeAutomationConfigForCompare(config);
-  const watchlist = normalized.watchlistSymbols.split(",").filter(Boolean);
-  const count = Math.max(1, watchlist.length);
-  const perSpotBudget = Number(normalized.spotQuoteBudget || 0) / count;
-  const perSpotCap = Number(normalized.spotMaxExposure || 0) / count;
-  const perSwapContracts = Number(normalized.swapContracts || 0) / count;
-  return watchlist.map((symbol) => ({
+  return buildDraftExecutionTargets(config).map((target) => {
+    const symbol = target.watchlistSymbol || target.spotInstId.split("-")[0];
+    const perSpotBudget = Number(target.spotQuoteBudget || 0);
+    const perSpotCap = Number(target.spotMaxExposure || 0);
+    const perSwapContracts = Number(target.swapContracts || 0);
+    const overrideFields = Object.keys(target.watchlistOverride || {});
+    const summaryDetail = [
+      `${target.bar} · EMA ${target.fastEma}/${target.slowEma}`,
+      `SL ${target.stopLossPct}% / TP ${target.takeProfitPct}%`,
+      overrideFields.length ? `独立覆盖 ${overrideFields.length} 项` : "沿用组合参数",
+    ].join(" · ");
+    return {
     symbol,
+    allocation: {
+      spotBudget: String(target.spotQuoteBudget || "0"),
+      spotMaxExposure: String(target.spotMaxExposure || "0"),
+      swapContracts: String(target.swapContracts || "0"),
+      swapLeverage: String(target.swapLeverage || "0"),
+      swapTdMode: target.swapTdMode || "cross",
+      swapStrategyMode: target.swapStrategyMode || "trend_follow",
+      overrideKeys: overrideFields,
+    },
+    overrideActive: overrideFields.length > 0,
     spot: {
-      enabled: normalized.spotEnabled,
+      enabled: target.spotEnabled,
       instId: `${symbol}-USDT`,
       signal: "hold",
       trend: "flat",
       positionSide: "flat",
       positionSize: "0",
       positionNotional: "0",
-      lastMessage: normalized.spotEnabled ? "保存并启动后开始独立现货决策" : "现货策略未启用",
+      lastMessage: target.spotEnabled ? "保存并启动后开始独立现货决策" : "现货策略未启用",
       floatingPnl: "0",
       floatingPnlPct: "0",
       riskLabel: `单次 ${formatMoney(perSpotBudget)}U · 上限 ${formatMoney(perSpotCap)}U`,
     },
     swap: {
-      enabled: normalized.swapEnabled,
+      enabled: target.swapEnabled,
       instId: `${symbol}-USDT-SWAP`,
       signal: "hold",
       trend: "flat",
       positionSide: "flat",
       positionSize: "0",
       positionNotional: "0",
-      lastMessage: normalized.swapEnabled ? "保存并启动后开始独立永续决策" : "永续策略未启用",
+      lastMessage: target.swapEnabled ? "保存并启动后开始独立永续决策" : "永续策略未启用",
       floatingPnl: "0",
       floatingPnlPct: "0",
-      riskLabel: `${formatMoney(perSwapContracts)} 张 · ${normalized.swapLeverage}x · ${normalized.swapTdMode === "isolated" ? "逐仓" : "全仓"}`,
+      riskLabel: `${formatMoney(perSwapContracts)} 张 · ${target.swapLeverage}x · ${target.swapTdMode === "isolated" ? "逐仓" : "全仓"}`,
     },
     summary: {
       status: "待启动",
-      detail: "当前只是组合草稿，保存并启动后才会变成真实执行状态",
+      detail: summaryDetail,
       exposureTotal: "0",
       floatingPnl: "0",
       floatingPnlPct: "0",
-      riskLabel: `现货 ${formatMoney(perSpotBudget)}U / ${formatMoney(perSpotCap)}U · 永续 ${formatMoney(perSwapContracts)} 张 · ${formatStrategyMode(normalized.swapStrategyMode)}`,
+      riskLabel: `现货 ${formatMoney(perSpotBudget)}U / ${formatMoney(perSpotCap)}U · 永续 ${formatMoney(perSwapContracts)} 张 · ${formatStrategyMode(target.swapStrategyMode)}`,
     },
-  }));
+  };
+  });
 }
 
 function inferEnvPreset(envPreset, baseUrl, simulated) {
@@ -1373,6 +1518,80 @@ function renderAnalysisState(analysis) {
   }
 }
 
+function extractAutomationStopReason(statusText = "", lastError = "") {
+  const rawStatus = String(statusText || "").trim();
+  const rawError = String(lastError || "").trim();
+  const trimmedStatus = rawStatus
+    .replace(/^自动量化已停止[:：]?\s*/, "")
+    .replace(/^组合策略已停止[:：]?\s*/, "")
+    .replace(/^已停止[:：]?\s*/, "")
+    .trim();
+  if (rawError && rawError !== rawStatus) return rawError;
+  if (trimmedStatus && trimmedStatus !== rawStatus) return trimmedStatus;
+  return rawError || trimmedStatus || rawStatus;
+}
+
+function deriveDeskModePresentation(automation = {}, modeText = "模拟盘") {
+  const statusText = String(automation.statusText || "").trim();
+  const modeDetail = String(automation.modeText || "").trim();
+  const running = Boolean(automation.running);
+  const consecutiveErrors = Number(automation.consecutiveErrors || 0);
+  const stopReason = extractAutomationStopReason(statusText, automation.lastError);
+  const hasHardStop = !running && (
+    consecutiveErrors > 0
+    || /连续错误过多|错误|失败|异常/.test(statusText)
+    || /连续错误过多|错误|失败|异常/.test(stopReason)
+  );
+
+  if (hasHardStop) {
+    return {
+      tone: "danger",
+      title: "自动量化已停机",
+      sub: `${modeText} · ${modeDetail || "组合交易执行已暂停"}`,
+      alert: {
+        eyebrow: "需要处理",
+        main: /连续错误过多/.test(`${statusText} ${stopReason}`)
+          ? "连续错误过多，系统已自动熔断"
+          : "最近一轮执行失败，系统已停止",
+        sub: stopReason && stopReason !== statusText
+          ? stopReason
+          : (consecutiveErrors > 0
+            ? `最近已连续报错 ${consecutiveErrors} 次，请先处理后再重启。`
+            : "当前组合已自动暂停，请先处理最近一次错误。"),
+      },
+    };
+  }
+
+  if (!running && /已停止|已手动停止/.test(statusText)) {
+    return {
+      tone: "warn",
+      title: "自动量化已暂停",
+      sub: `${modeText} · ${modeDetail || "组合交易未运行"}`,
+      alert: {
+        eyebrow: "当前待机",
+        main: extractAutomationStopReason(statusText, "") || "已手动停止",
+        sub: "仓位摘要和收益会继续展示，但不会再自动发单。",
+      },
+    };
+  }
+
+  if (running) {
+    return {
+      tone: "ok",
+      title: `${modeText} · 自动量化运行中`,
+      sub: modeDetail || "组合交易正在轮询、独立决策与风控。",
+      alert: null,
+    };
+  }
+
+  return {
+    tone: "idle",
+    title: `${modeText} · ${statusText || "未启动"}`,
+    sub: modeDetail || "模拟 / 实盘 + 策略状态",
+    alert: null,
+  };
+}
+
 function renderDeskOverview() {
   const account = dashboardState.account || {};
   const summary = account.summary || {};
@@ -1395,6 +1614,7 @@ function renderDeskOverview() {
   const pollSeconds = Number($("autoPollSeconds").value || 0);
   const cycleDurationMs = Number(automation.lastCycleDurationMs || 0);
   const modeText = $("simulated").value === "true" ? "模拟盘" : "实盘";
+  const modePresentation = deriveDeskModePresentation(automation, modeText);
   const dockPnlMain = $("dock-pnl-main");
   const dockPnlSub = $("dock-pnl-sub");
   const minerDailyUsd = Number(minerProgress.dailyUsd || 0);
@@ -1441,8 +1661,30 @@ function renderDeskOverview() {
     ? `上一轮耗时 ${cycleDurationMs} ms`
     : "等待第一轮执行完成";
 
-  $("desk-mode").textContent = `${modeText} · ${automation.statusText || "未启动"}`;
-  $("desk-mode-sub").textContent = automation.modeText || "模拟 / 实盘 + 策略状态";
+  $("desk-mode").textContent = modePresentation.title;
+  $("desk-mode-sub").textContent = modePresentation.sub;
+  const deskModeCard = $("desk-mode-card");
+  if (deskModeCard) {
+    deskModeCard.classList.remove("danger", "warn", "ok", "idle");
+    deskModeCard.classList.add(modePresentation.tone || "idle");
+  }
+  const deskModeAlert = $("desk-mode-alert");
+  const deskModeAlertEyebrow = $("desk-mode-alert-eyebrow");
+  const deskModeAlertMain = $("desk-mode-alert-main");
+  const deskModeAlertSub = $("desk-mode-alert-sub");
+  if (deskModeAlert && deskModeAlertEyebrow && deskModeAlertMain && deskModeAlertSub) {
+    if (modePresentation.alert) {
+      deskModeAlert.classList.remove("hidden");
+      deskModeAlertEyebrow.textContent = modePresentation.alert.eyebrow || "需要处理";
+      deskModeAlertMain.textContent = modePresentation.alert.main || "";
+      deskModeAlertSub.textContent = modePresentation.alert.sub || "";
+    } else {
+      deskModeAlert.classList.add("hidden");
+      deskModeAlertEyebrow.textContent = "";
+      deskModeAlertMain.textContent = "";
+      deskModeAlertSub.textContent = "";
+    }
+  }
 
   const blockHeight = minerNetwork.tipHeight || "--";
   const fastFee = minerFees.fastestFee;
@@ -2297,6 +2539,7 @@ function collectAutomationConfig() {
     spotInstId: $("spotInstId").value.trim(),
     swapInstId: $("swapInstId").value.trim(),
     watchlistSymbols: $("autoWatchlistSymbols").value.trim(),
+    watchlistOverrides: $("autoWatchlistOverrides").value.trim(),
     bar: $("autoBar").value,
     fastEma: Number($("autoFastEma").value || 9),
     slowEma: Number($("autoSlowEma").value || 21),
@@ -2366,6 +2609,10 @@ function fillAutomationForm(config) {
   $("spotInstId").value = config.spotInstId || "BTC-USDT";
   $("swapInstId").value = config.swapInstId || "BTC-USDT-SWAP";
   $("autoWatchlistSymbols").value = config.watchlistSymbols || (config.spotInstId || "BTC-USDT").split("-")[0];
+  $("autoWatchlistOverrides").value = serializeWatchlistOverrides(
+    config.watchlistOverrides,
+    parseWatchlistSymbols(config.watchlistSymbols, config.spotInstId || "BTC-USDT", config.swapInstId || "BTC-USDT-SWAP")
+  );
   $("autoBar").value = config.bar || "5m";
   $("autoFastEma").value = config.fastEma ?? 9;
   $("autoSlowEma").value = config.slowEma ?? 21;
@@ -2713,8 +2960,7 @@ function groupOrdersBySymbol(orders, meta = {}) {
   });
 
   return Array.from(groups.entries()).map(([symbol, items]) => {
-    const working = items.filter((item) => ["live", "effective", "partially_filled"].includes(item.state)).length;
-    const filled = items.filter((item) => item.state === "filled").length;
+    const executionStats = collectOrderExecutionStats(items);
     const estimates = items.map((item) => estimateOrderPnl(item, meta));
     const numeric = estimates.filter((item) => Number.isFinite(item.value));
     const realizedPnl = estimates
@@ -2750,8 +2996,12 @@ function groupOrdersBySymbol(orders, meta = {}) {
     return {
       symbol,
       orders: items.slice().sort((a, b) => Number(b.uTime || b.cTime || 0) - Number(a.uTime || a.cTime || 0)),
-      working,
-      filled,
+      working: executionStats.working,
+      filled: executionStats.filled,
+      riskCount: executionStats.risk,
+      successRate: executionStats.successRate,
+      topCancelReason: executionStats.topCancelReason,
+      latestCancelReason: executionStats.latestCancelReason,
       orderCount: items.length,
       pnlTotal,
       realizedPnl,
@@ -2896,7 +3146,7 @@ function matchesOrderStateFilter(order, filter) {
   const state = String(order?.state || "");
   if (filter === "working") return ["live", "effective", "partially_filled"].includes(state);
   if (filter === "filled") return state === "filled";
-  if (filter === "risk") return ["canceled", "mmp_canceled", "failed", "rejected"].includes(state);
+  if (filter === "risk") return isRiskOrder(order);
   return true;
 }
 
@@ -2905,6 +3155,73 @@ function matchesOrderMarketFilter(order, filter) {
   if (filter === "spot") return instId && !instId.endsWith("-SWAP");
   if (filter === "swap") return instId.endsWith("-SWAP");
   return true;
+}
+
+function isRiskOrder(order) {
+  return ["canceled", "mmp_canceled", "order_failed", "failed", "rejected"].includes(String(order?.state || ""));
+}
+
+function getOrderCancelReason(order) {
+  return String(
+    order?.cancelSourceReason
+      || order?.sMsg
+      || order?.failCodeMsg
+      || order?.msg
+      || ""
+  ).trim();
+}
+
+function summarizeOrderCancelReason(reason) {
+  const text = String(reason || "").trim();
+  if (!text) return "";
+  const lower = text.toLowerCase();
+  if (
+    lower.includes("estimated fill price exceeded the price limit")
+    || lower.includes("slipped beyond the best bid or ask price by at least 5%")
+  ) {
+    return "滑点 / 价格保护触发，交易所取消了这笔单。";
+  }
+  if (lower.includes("insufficient")) return "资金或可用仓位不足。";
+  if (lower.includes("reduce only")) return "仅减仓限制触发。";
+  if (lower.includes("post only")) return "Post Only 条件未满足。";
+  if (lower.includes("risk")) return "交易所风控拦截。";
+  if (text.length > 44) return `${text.slice(0, 44)}...`;
+  return text;
+}
+
+function collectOrderExecutionStats(orders) {
+  const list = orders || [];
+  const working = list.filter((item) => ["live", "effective", "partially_filled"].includes(String(item.state || ""))).length;
+  const filled = list.filter((item) => String(item.state || "") === "filled").length;
+  const risk = list.filter((item) => isRiskOrder(item)).length;
+  const successRate = list.length ? (filled / list.length) * 100 : 0;
+  const reasonCounts = new Map();
+  let latestRiskOrder = null;
+
+  list.forEach((order) => {
+    if (!isRiskOrder(order)) return;
+    const summarized = summarizeOrderCancelReason(getOrderCancelReason(order));
+    if (summarized) {
+      reasonCounts.set(summarized, (reasonCounts.get(summarized) || 0) + 1);
+    }
+    const stamp = Number(order?.uTime || order?.cTime || 0);
+    if (!latestRiskOrder || stamp >= Number(latestRiskOrder?.uTime || latestRiskOrder?.cTime || 0)) {
+      latestRiskOrder = order;
+    }
+  });
+
+  const topCancelReason = Array.from(reasonCounts.entries())
+    .sort((left, right) => right[1] - left[1])[0]?.[0] || "";
+
+  return {
+    total: list.length,
+    working,
+    filled,
+    risk,
+    successRate,
+    topCancelReason,
+    latestCancelReason: summarizeOrderCancelReason(getOrderCancelReason(latestRiskOrder)),
+  };
 }
 
 function renderOrderTerminalToolbar(groups, hasVisibleGroups = true) {
@@ -3003,6 +3320,7 @@ function renderOrderGlobalSummary(groups) {
   const estimated = groups.reduce((sum, group) => sum + Number(group.estimatedPnl || 0), 0);
   const activeSymbols = groups.length;
   const visibleOrders = groups.reduce((sum, group) => sum + Number(group.orderCount || 0), 0);
+  const execution = collectOrderExecutionStats(groups.flatMap((group) => group.orders || []));
   const totalTone = total > 0 ? "positive" : total < 0 ? "negative" : "muted";
   const stateLabelMap = {
     all: "全部状态",
@@ -3024,7 +3342,7 @@ function renderOrderGlobalSummary(groups) {
       <div>
         <span class="order-global-summary-eyebrow">组合订单收益总览</span>
         <strong class="tone-${totalTone}">${formatSignedMoney(total)} USDT</strong>
-        <small>${activeSymbols} 个币种 · ${visibleOrders} 笔当前可见订单 · 过滤后的组合口径</small>
+        <small>${activeSymbols} 个币种 · ${visibleOrders} 笔当前可见订单 · 成交 ${execution.filled} / 异常 ${execution.risk}</small>
       </div>
     </div>
     <div class="order-global-summary-grid">
@@ -3044,10 +3362,19 @@ function renderOrderGlobalSummary(groups) {
         <small>没有明确收益字段时的估算</small>
       </div>
       <div class="order-global-summary-card">
+        <span>成交 / 异常</span>
+        <strong>${execution.filled} / ${execution.risk}</strong>
+        <small>${execution.total ? `${formatPercentValue(execution.successRate)} 成功率` : "等待订单样本"}</small>
+      </div>
+      <div class="order-global-summary-card">
         <span>当前聚焦</span>
         <strong>${escapeHtml(dashboardState.selectedOrderSymbol || groups[0]?.symbol || "--")}</strong>
         <small>${escapeHtml(stateLabel)} · ${escapeHtml(marketLabel)}</small>
       </div>
+    </div>
+    <div class="order-global-summary-note">
+      <b>最近异常</b>
+      <span>${escapeHtml(execution.latestCancelReason || execution.topCancelReason || "当前没有明显异常撤单，订单终端会在这里提示最近一次失败或取消的原因。")}</span>
     </div>
   `;
 }
@@ -3077,9 +3404,16 @@ function renderOrderSymbolOverview(groups, meta = {}) {
         <div class="order-symbol-metrics">
           <div><b>收益汇总</b><span class="tone-${pnlClass}">${group.hasPnl ? `${formatSignedMoney(group.pnlTotal)} USDT` : "--"}</span></div>
           <div><b>收益口径</b><span>${escapeHtml(group.scopeLabel)}</span></div>
-          <div><b>工作中 / 已成交</b><span>${group.working} / ${group.filled}</span></div>
+          <div><b>工作中 / 已成交 / 异常</b><span>${group.working} / ${group.filled} / ${group.riskCount}</span></div>
+          <div><b>成交率</b><span>${group.orderCount ? formatPercentValue(group.successRate) : "--"}</span></div>
           <div><b>最新更新时间</b><span>${escapeHtml(group.latestAt)}</span></div>
         </div>
+        ${group.topCancelReason ? `
+          <div class="order-warning-note">
+            <b>最近异常</b>
+            <span>${escapeHtml(group.topCancelReason)}</span>
+          </div>
+        ` : ""}
         <div class="order-symbol-actions">
           <button class="btn btn-ghost order-symbol-filter" type="button" data-order-symbol="${escapeHtml(group.symbol)}">看这条订单流</button>
           <button class="btn btn-secondary order-symbol-switch" type="button" data-order-symbol="${escapeHtml(group.symbol)}">切到下单上下文</button>
@@ -3177,6 +3511,8 @@ function renderOrderTerminalFocus(selectedGroup, meta = {}) {
       <div><b>待成交 / 待补口径</b><span>${selectedGroup.pendingCount} / ${selectedGroup.unresolvedCount}</span></div>
       <div><b>watchlist</b><span>${escapeHtml(watchlistLabel)}</span></div>
       <div><b>工作中 / 已成交</b><span>${selectedGroup.working} / ${selectedGroup.filled}</span></div>
+      <div><b>异常 / 成交率</b><span>${selectedGroup.riskCount} / ${formatPercentValue(selectedGroup.successRate)}</span></div>
+      <div><b>最近异常</b><span>${escapeHtml(selectedGroup.topCancelReason || "当前没有明显异常撤单")}</span></div>
     </div>
   `;
 
@@ -3278,12 +3614,18 @@ function renderOrderSummary(data, orders) {
       : data?.source === "rest_multi"
         ? "REST 聚合"
         : "REST";
-  const working = orders.filter((item) => ["live", "effective", "partially_filled"].includes(item.state)).length;
-  const filled = orders.filter((item) => item.state === "filled").length;
+  const stats = collectOrderExecutionStats(orders);
   $("order-summary-count").textContent = String((data?.orders || []).length || 0);
-  $("order-summary-working").textContent = String(working);
-  $("order-summary-filled").textContent = String(filled);
+  $("order-summary-working").textContent = String(stats.working);
+  $("order-summary-filled").textContent = String(stats.filled);
+  if ($("order-summary-risk")) $("order-summary-risk").textContent = String(stats.risk);
+  if ($("order-summary-rate")) $("order-summary-rate").textContent = stats.total ? formatPercentValue(stats.successRate) : "--";
   $("order-summary-source").textContent = source;
+  if ($("orderSummaryInsight")) {
+    $("orderSummaryInsight").innerHTML = stats.risk
+      ? `<b>最近异常</b><span>${escapeHtml(stats.latestCancelReason || stats.topCancelReason || "存在已撤或失败订单，详情区会继续显示交易所原始原因。")}</span>`
+      : `<b>当前概览</b><span>${stats.total ? `最近 ${stats.total} 笔里成交 ${stats.filled} 笔，当前没有明显异常撤单。` : "订单一进来，这里会直接告诉你成功率和最新异常原因。"}</span>`;
+  }
 }
 
 function renderOrderDetail(order, meta = {}) {
@@ -3316,6 +3658,13 @@ function renderOrderDetail(order, meta = {}) {
   const requestSize = formatOrderValue(order.sz);
   const filledSize = formatOrderValue(order.accFillSz || order.fillSz || 0);
   const pnl = buildOrderPnlContext(order, meta);
+  const cancelReason = getOrderCancelReason(order);
+  const cancelReasonShort = summarizeOrderCancelReason(cancelReason);
+  const executionSummary = isRiskOrder(order)
+    ? (cancelReasonShort || "这笔单被交易所撤销或拒绝。")
+    : order.state === "filled"
+      ? "这笔单已经成交，收益卡会继续结合成交、持仓和现价给出解释。"
+      : "这笔单当前还在工作中或等待成交完成。";
 
   target.className = "order-detail";
   target.innerHTML = `
@@ -3357,8 +3706,11 @@ function renderOrderDetail(order, meta = {}) {
       <div><b>订单标签</b><span>${escapeHtml(order.tag || "--")}</span></div>
       <div><b>仅减仓</b><span>${order.reduceOnly ? "是" : "否"}</span></div>
       <div><b>成交来源</b><span>${escapeHtml(meta?.stream?.connected ? "实时推送" : source)}</span></div>
+      <div><b>订单结果</b><span>${escapeHtml(executionSummary)}</span></div>
+      <div><b>取消来源</b><span>${escapeHtml(order.cancelSource || "--")}</span></div>
       <div><b>收益判断</b><span>${escapeHtml(pnl.detailText)}</span></div>
-      <div><b>收益说明</b><span>${escapeHtml(pnl.noteText)}</span></div>
+      <div class="span-wide"><b>收益说明</b><span>${escapeHtml(pnl.noteText)}</span></div>
+      <div class="span-wide"><b>取消原因</b><span>${escapeHtml(cancelReason || "当前没有取消原因，这笔单不是撤单/失败单，或交易所没有返回额外说明。")}</span></div>
     </div>
     <div class="order-detail-note">
       最近一笔会优先高亮；如果下单后私有 WS 还没回报，这里会先显示本地回执，再自动切换成交易所最新状态。收益区会明确告诉你：现在显示的是已实现收益、相关持仓浮盈，还是当前还不能从这笔订单单独算出收益。
@@ -3467,9 +3819,16 @@ function renderOrderFeed(data) {
             <div class="orders-group-metrics">
               <div><b>收益汇总</b><span class="tone-${pnlClass}">${group.hasPnl ? `${formatSignedMoney(group.pnlTotal)} USDT` : "--"}</span></div>
               <div><b>收益口径</b><span>${escapeHtml(group.scopeLabel)}</span></div>
-              <div><b>工作中 / 已成交</b><span>${group.working} / ${group.filled}</span></div>
+              <div><b>工作中 / 已成交 / 异常</b><span>${group.working} / ${group.filled} / ${group.riskCount}</span></div>
+              <div><b>成交率</b><span>${group.orderCount ? formatPercentValue(group.successRate) : "--"}</span></div>
               <div><b>最近更新时间</b><span>${escapeHtml(group.latestAt)}</span></div>
             </div>
+            ${group.topCancelReason ? `
+              <div class="order-warning-note">
+                <b>最近异常</b>
+                <span>${escapeHtml(group.topCancelReason)}</span>
+              </div>
+            ` : ""}
             ${filteredOrders.length ? `<div class="orders-group-cards">
               ${groupOrders.map((order) => {
                 const key = getOrderKey(order);
@@ -3477,6 +3836,7 @@ function renderOrderFeed(data) {
                 const sideClass = order.side === "sell" ? "down" : "up";
                 const activeClass = key === dashboardState.selectedOrderKey ? "active" : "";
                 const targetPrice = order.ordType === "market" ? "市价" : formatOrderValue(order.px);
+                const cancelReason = summarizeOrderCancelReason(getOrderCancelReason(order));
                 return `
                   <button type="button" class="order-card compact ${sideClass} ${activeClass}" data-order-key="${escapeHtml(key)}" data-order-symbol="${escapeHtml(group.symbol)}">
                     <div class="order-card-head">
@@ -3491,6 +3851,12 @@ function renderOrderFeed(data) {
                       <div><b>数量</b><span>${escapeHtml(formatOrderValue(order.sz))}</span></div>
                       <div><b>已成交</b><span>${escapeHtml(formatOrderValue(order.accFillSz || order.fillSz || 0))}</span></div>
                     </div>
+                    ${cancelReason ? `
+                      <div class="order-card-reason">
+                        <b>异常原因</b>
+                        <span>${escapeHtml(cancelReason)}</span>
+                      </div>
+                    ` : ""}
                     <div class="order-card-foot">
                       <span>${escapeHtml(formatOrderTime(order.cTime))}</span>
                       <span>${escapeHtml(order.clOrdId || order.ordId || "--")}</span>
@@ -3787,7 +4153,7 @@ function renderPortfolioWatchlist(entries = []) {
             <strong>${entry.symbol || "--"}</strong>
             <span>${summary.status || "观察中"}</span>
           </div>
-          <span class="pill portfolio-coin-pill">${formatStrategyMode(entry.allocation?.swapStrategyMode || $("autoSwapStrategyMode")?.value || "trend_follow")}</span>
+          <span class="pill portfolio-coin-pill">${formatStrategyMode(entry.allocation?.swapStrategyMode || $("autoSwapStrategyMode")?.value || "trend_follow")}${entry.overrideActive ? " · 独立参数" : ""}</span>
         </div>
         <div class="portfolio-coin-hero">
           <div class="portfolio-hero-block">
@@ -3815,7 +4181,7 @@ function renderPortfolioWatchlist(entries = []) {
           <div>
             <b>独立风控</b>
             <span>${summary.riskLabel || "等待风控拆分"}</span>
-            <small>现货与永续各自按预算、上限、张数和杠杆拆分</small>
+            <small>${entry.overrideActive ? `当前币已单独覆盖 ${((entry.allocation?.overrideKeys || []).length || 0)} 项参数` : "现货与永续各自按预算、上限、张数和杠杆拆分"}</small>
           </div>
           <div>
             <b>独立仓位摘要</b>
@@ -4094,6 +4460,10 @@ async function testConfig() {
 
 async function saveAutomationConfig({ silent = false } = {}) {
   const payload = collectAutomationConfig();
+  const overrideError = getWatchlistOverrideParseError(payload.watchlistOverrides);
+  if (overrideError) {
+    throw new Error(overrideError);
+  }
   const data = await request("/api/automation/config", {
     method: "POST",
     body: JSON.stringify(payload),
@@ -4605,6 +4975,9 @@ async function boot() {
   $("spotInstId").addEventListener("input", updateQuickState);
   $("swapInstId").addEventListener("input", updateQuickState);
   $("autoWatchlistSymbols").addEventListener("input", updateQuickState);
+  $("autoWatchlistOverrides").addEventListener("input", () => {
+    renderStrategyPortfolio();
+  });
   if ($("orderSpotInstMirror")) {
     $("orderSpotInstMirror").addEventListener("input", () => {
       $("spotInstId").value = $("orderSpotInstMirror").value.trim().toUpperCase();
@@ -4640,6 +5013,11 @@ async function boot() {
   $("autoWatchlistSymbols").addEventListener("change", () => {
     scheduleAutoAnalysis({ force: true });
   });
+  $("autoWatchlistOverrides").addEventListener("change", () => {
+    renderDeskGuards();
+    renderDeskOverview();
+    scheduleAutoAnalysis({ force: true });
+  });
   $("marketBar").addEventListener("change", restartLiveFeedSoon);
 
   [
@@ -4669,6 +5047,7 @@ async function boot() {
     "autoCooldownSeconds",
     "autoMaxOrdersPerDay",
     "autoSpotEnabled",
+    "autoWatchlistOverrides",
     "autoSpotQuoteBudget",
     "autoSpotMaxExposure",
     "autoSwapEnabled",

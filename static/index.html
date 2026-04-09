@@ -229,8 +229,13 @@
               <strong id="desk-cycle">--</strong>
               <small id="desk-cycle-sub">等待配置</small>
             </div>
-            <div class="cockpit-card">
+            <div class="cockpit-card status-card idle" id="desk-mode-card">
               <span>执行环境</span>
+              <div class="desk-mode-alert hidden" id="desk-mode-alert" aria-live="polite">
+                <div class="desk-mode-alert-eyebrow" id="desk-mode-alert-eyebrow">需要处理</div>
+                <div class="desk-mode-alert-main" id="desk-mode-alert-main">--</div>
+                <div class="desk-mode-alert-sub" id="desk-mode-alert-sub">--</div>
+              </div>
               <strong id="desk-mode">--</strong>
               <small id="desk-mode-sub">模拟 / 实盘 + 策略状态</small>
             </div>
@@ -623,6 +628,11 @@
             <label>
               <span>多币 watchlist</span>
               <input id="autoWatchlistSymbols" placeholder="BTC,ETH,SOL" />
+            </label>
+            <label class="wide-field">
+              <span>按币覆盖参数 (JSON)</span>
+              <textarea id="autoWatchlistOverrides" rows="8" placeholder='{"BTC":{"fastEma":12,"slowEma":48,"spotQuoteBudget":"60","swapLeverage":"3"},"ETH":{"swapStrategyMode":"long_only","swapContracts":"2"}}'></textarea>
+              <small class="field-hint">支持按币覆盖 EMA、周期、预算、张数、杠杆、方向、止盈止损。未覆盖的币会继续按组合总参数并自动拆分预算。</small>
             </label>
             <label class="checkbox-row">
               <span>启用现货策略</span>
@@ -1107,10 +1117,19 @@
                 <strong id="order-summary-filled">0</strong>
               </div>
               <div class="order-summary-chip">
+                <span>异常 / 已撤</span>
+                <strong id="order-summary-risk">0</strong>
+              </div>
+              <div class="order-summary-chip">
+                <span>成交率</span>
+                <strong id="order-summary-rate">--</strong>
+              </div>
+              <div class="order-summary-chip">
                 <span>数据源</span>
                 <strong id="order-summary-source">-</strong>
               </div>
             </div>
+            <div id="orderSummaryInsight" class="order-summary-insight">订单终端会在这里提示最近的异常原因和成交概览。</div>
             <div id="orderGlobalSummary" class="order-global-summary empty">订单终端会在这里显示组合总收益、已实现、持仓浮动和现价估算。</div>
             <div id="orderSymbolOverview" class="order-symbol-overview empty">更多币种订单进来后，这里会按币显示独立订单流和收益汇总。</div>
             <div id="orderTerminalFocus" class="order-terminal-focus empty">聚焦某个币后，这里会显示当前订单流、收益拆分和下单上下文。</div>
