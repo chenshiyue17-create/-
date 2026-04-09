@@ -1052,6 +1052,7 @@ def default_automation_config() -> dict[str, Any]:
         "stopLossPct": "1.2",
         "takeProfitPct": "2.4",
         "maxDailyLossPct": "3.0",
+        "targetBalanceMultiple": "1",
         "arbEntrySpreadPct": "0.18",
         "arbExitSpreadPct": "0.05",
         "arbMinFundingRatePct": "0.005",
@@ -1108,6 +1109,10 @@ def default_automation_state() -> dict[str, Any]:
         "sessionStartEq": "",
         "currentEq": "",
         "maxObservedEq": "",
+        "targetBalanceEq": "",
+        "targetBalanceProgressPct": "0",
+        "targetBalanceRemainingEq": "",
+        "targetBalanceReached": False,
         "dailyDrawdownPct": "0",
         "orderCountToday": 0,
         "today": "",
@@ -1334,6 +1339,7 @@ def validate_single_automation_target(config: dict[str, Any]) -> str:
         "stopLossPct",
         "takeProfitPct",
         "maxDailyLossPct",
+        "targetBalanceMultiple",
         "arbEntrySpreadPct",
         "arbExitSpreadPct",
         "arbMinFundingRatePct",
@@ -1369,6 +1375,9 @@ def validate_single_automation_target(config: dict[str, Any]) -> str:
             return f"波段策略杠杆不能高于 {decimal_to_str(DIP_SWING_MAX_LEVERAGE)}x"
         if safe_decimal(config.get("takeProfitPct"), "0") < Decimal("8"):
             return "波段策略的目标止盈建议至少 8%"
+    target_multiple = safe_decimal(config.get("targetBalanceMultiple"), "1")
+    if target_multiple < Decimal("1") or target_multiple > Decimal("100"):
+        return "目标余额倍数需在 1 到 100 之间"
     return ""
 
 
@@ -1439,6 +1448,41 @@ def resolve_selected_execution_target(config: dict[str, Any]) -> dict[str, Any]:
         ):
             return target
     return deep_merge(config, {})
+
+
+def resolve_target_balance_multiple(config: dict[str, Any]) -> Decimal:
+    raw = safe_decimal(config.get("targetBalanceMultiple"), "1")
+    if raw < Decimal("1"):
+        return Decimal("1")
+    if raw > Decimal("100"):
+        return Decimal("100")
+    return raw
+
+
+def build_target_balance_snapshot(
+    start_eq: Decimal,
+    current_eq: Decimal,
+    target_multiple: Decimal,
+) -> dict[str, Any]:
+    if start_eq <= 0 or current_eq <= 0 or target_multiple <= Decimal("1"):
+        return {
+            "targetEq": Decimal("0"),
+            "remainingEq": Decimal("0"),
+            "progressPct": Decimal("0"),
+            "currentMultiple": Decimal("1"),
+            "reached": False,
+        }
+    target_eq = start_eq * target_multiple
+    remaining_eq = max(target_eq - current_eq, Decimal("0"))
+    progress_pct = (current_eq / target_eq) * Decimal("100") if target_eq > 0 else Decimal("0")
+    current_multiple = current_eq / start_eq if start_eq > 0 else Decimal("1")
+    return {
+        "targetEq": target_eq,
+        "remainingEq": remaining_eq,
+        "progressPct": progress_pct,
+        "currentMultiple": current_multiple,
+        "reached": current_eq >= target_eq,
+    }
 
 
 def strategy_mode_text(mode: str) -> str:
@@ -3403,6 +3447,7 @@ def strategy_detail_line(config: dict[str, Any], origin_label: str = "") -> str:
             parts.append(origin_label)
         return " · ".join(part for part in parts if part)
     if str(config.get("strategyPreset") or "") == "dip_swing":
+        target_multiple = resolve_target_balance_multiple(config)
         parts = [
             "趋势转强 + 回踩接多",
             f"只做多 · {config.get('swapTdMode', 'isolated')} {config.get('swapLeverage', '2')}x",
@@ -3411,6 +3456,8 @@ def strategy_detail_line(config: dict[str, Any], origin_label: str = "") -> str:
             f"回撤阈值 {format_decimal(DIP_SWING_PULLBACK_PCT, 1)}%",
             f"强平缓冲 ≥ {format_decimal(DIP_SWING_MIN_LIQ_BUFFER_PCT, 0)}%",
         ]
+        if target_multiple > Decimal("1"):
+            parts.append(f"目标余额 {format_decimal(target_multiple, 0)}x")
         if origin_label:
             parts.append(origin_label)
         return " · ".join(part for part in parts if part)
@@ -5624,6 +5671,7 @@ def build_dip_swing_analysis(
     pullback_pct = safe_decimal(signal.get("pullbackPct"), "0")
     rebound_pct = safe_decimal(signal.get("reboundPct"), "0")
     leverage = safe_decimal(selected_target.get("swapLeverage"), "1")
+    target_multiple = resolve_target_balance_multiple(selected_target)
     positions = fetched["positions"] or []
     open_position = next((row for row in positions if safe_decimal(row.get("pos"), "0") != 0), {})
     pos_value = safe_decimal(open_position.get("pos"), "0")
@@ -5693,6 +5741,8 @@ def build_dip_swing_analysis(
         f"资金费 {compact_metric(funding_rate_pct, '0.001')}%",
         f"目标止盈 {selected_target.get('takeProfitPct', '8')}%",
     ]
+    if target_multiple > Decimal("1"):
+        summary_bits.append(f"目标余额 {format_decimal(target_multiple, 0)}x")
     if position_side == "long" and liq_buffer > 0:
         summary_bits.append(f"强平缓冲 {compact_metric(liq_buffer, '0.1')}%")
     if blockers:
@@ -7131,9 +7181,10 @@ class AutomationEngine:
 
         self._update_state(mutate)
 
-    def _touch_session(self, total_eq: Decimal) -> dict[str, Any]:
+    def _touch_session(self, total_eq: Decimal, automation: dict[str, Any] | None = None) -> dict[str, Any]:
         today = datetime.now().date().isoformat()
         stamp = now_local_iso()
+        target_multiple = resolve_target_balance_multiple(automation or {})
 
         def mutate(state: dict[str, Any]) -> None:
             if state.get("today") != today:
@@ -7156,6 +7207,11 @@ class AutomationEngine:
             if start_eq > 0:
                 drawdown = ((total_eq - start_eq) / start_eq) * Decimal("100")
             state["dailyDrawdownPct"] = decimal_to_str(drawdown)
+            target_snapshot = build_target_balance_snapshot(start_eq, total_eq, target_multiple)
+            state["targetBalanceEq"] = decimal_to_str(target_snapshot["targetEq"])
+            state["targetBalanceProgressPct"] = decimal_to_str(target_snapshot["progressPct"])
+            state["targetBalanceRemainingEq"] = decimal_to_str(target_snapshot["remainingEq"])
+            state["targetBalanceReached"] = bool(target_snapshot["reached"])
             curve = state.setdefault("equityCurve", [])
             curve.append({"ts": stamp, "eq": decimal_to_str(total_eq)})
             state["equityCurve"] = curve[-120:]
@@ -7176,6 +7232,30 @@ class AutomationEngine:
             target["lastMessage"] = message
 
         self._update_state(mutate)
+
+    def _target_balance_snapshot(self, automation: dict[str, Any]) -> dict[str, Any]:
+        if not bool(self.config_store.current().get("simulated")):
+            return build_target_balance_snapshot(Decimal("0"), Decimal("0"), Decimal("1"))
+        state = self.state_store.current()
+        start_eq = safe_decimal(state.get("sessionStartEq"), "0")
+        current_eq = safe_decimal(state.get("currentEq"), "0")
+        target_multiple = resolve_target_balance_multiple(automation)
+        return build_target_balance_snapshot(start_eq, current_eq, target_multiple)
+
+    def _target_scaled_swap_contracts(self, automation: dict[str, Any], lot_size: Decimal) -> Decimal:
+        base_contracts = safe_decimal(automation.get("swapContracts"), "0")
+        rounded_base = round_down(base_contracts, lot_size)
+        if rounded_base <= 0:
+            return Decimal("0")
+        target_snapshot = self._target_balance_snapshot(automation)
+        target_multiple = resolve_target_balance_multiple(automation)
+        if target_multiple <= Decimal("1") or not bool(self.config_store.current().get("simulated")):
+            return rounded_base
+        current_multiple = safe_decimal(target_snapshot.get("currentMultiple"), "1")
+        if current_multiple <= 0:
+            current_multiple = Decimal("1")
+        aggressive_scale = max(Decimal("1"), target_multiple - min(current_multiple, target_multiple) + Decimal("1"))
+        return round_down(rounded_base * aggressive_scale, lot_size)
 
     def _cooldown_ready(self, market: str, cooldown_seconds: int) -> tuple[bool, str]:
         state = self.snapshot()["markets"].get(market, {})
@@ -7430,7 +7510,7 @@ class AutomationEngine:
             or account_snapshot["summary"].get("totalEq"),
             "0",
         )
-        session_state = self._touch_session(total_eq)
+        session_state = self._touch_session(total_eq, effective_automation)
         targets = build_execution_targets(effective_automation)
         return {
             "accountSnapshot": account_snapshot,
@@ -7455,8 +7535,25 @@ class AutomationEngine:
         drawdown_pct = safe_decimal(session_state.get("dailyDrawdownPct"), "0")
         max_orders_per_day = int(effective_automation.get("maxOrdersPerDay", 20))
         order_count_today = int(session_state.get("orderCountToday", 0))
+        target_multiple = resolve_target_balance_multiple(effective_automation)
+        target_eq = safe_decimal(session_state.get("targetBalanceEq"), "0")
+        target_reached = bool(session_state.get("targetBalanceReached"))
         stop_reason = ""
         checks: list[dict[str, Any]] = []
+
+        if target_multiple > Decimal("1") and target_eq > 0:
+            checks.append(
+                {
+                    "name": "target_balance",
+                    "passed": not target_reached,
+                    "detail": (
+                        f"目标 {format_decimal(target_multiple, 0)}x · 当前 {format_decimal(safe_decimal(session_state.get('currentEq'), '0'), 2)} "
+                        f"/ 目标 {format_decimal(target_eq, 2)} USDT"
+                    ),
+                }
+            )
+            if target_reached and not stop_reason:
+                stop_reason = f"模拟盘目标已完成：余额达到 {format_decimal(target_multiple, 0)}x"
 
         if max_daily_loss > 0:
             passed = drawdown_pct > -max_daily_loss
@@ -8218,6 +8315,8 @@ class AutomationEngine:
         liq_price = safe_decimal(open_position.get("liqPx"), "0")
         liq_buffer = liquidation_buffer_pct(last_price, liq_price, "long" if pos_value > 0 else "short" if pos_value < 0 else "flat")
         lot_size = safe_decimal(meta.get("lotSz"), "1")
+        target_snapshot = self._target_balance_snapshot(automation)
+        planned_trade_contracts = self._target_scaled_swap_contracts(automation, lot_size)
         position_side = "flat"
         if pos_value > 0:
             position_side = "long"
@@ -8234,6 +8333,11 @@ class AutomationEngine:
         )
         if liq_buffer > 0:
             status_text += f" / 强平缓冲 {compact_metric(liq_buffer, '0.1')}%"
+        if safe_decimal(target_snapshot.get("targetEq"), "0") > 0:
+            status_text += (
+                f" / 目标 {compact_metric(target_snapshot.get('progressPct'), '0.1')}%"
+                f" / 计划 {decimal_to_str(planned_trade_contracts)} 张"
+            )
         self._set_market(
             market_key,
             {
@@ -8249,7 +8353,7 @@ class AutomationEngine:
                 "floatingPnl": decimal_to_str(floating_pnl),
                 "floatingPnlPct": decimal_to_str(floating_pnl_pct),
                 "pnlSource": "逐仓永续未实现盈亏",
-                "riskBudget": decimal_to_str(safe_decimal(automation.get("swapContracts"), "0")),
+                "riskBudget": decimal_to_str(planned_trade_contracts),
                 "riskCap": decimal_to_str(safe_decimal(automation.get("swapLeverage"), "0")),
                 "riskMode": str(automation.get("swapTdMode") or "isolated"),
                 "riskLabel": build_market_risk_label(automation, "swap"),
@@ -8332,7 +8436,7 @@ class AutomationEngine:
             self._set_market(market_key, {"lastMessage": f"波段持仓中 · {status_text} · 目标 {automation.get('takeProfitPct', '8')}%"})
             return
 
-        trade_contracts = round_down(safe_decimal(automation.get("swapContracts"), "0"), lot_size)
+        trade_contracts = planned_trade_contracts
         if trade_contracts <= 0:
             self._set_market(market_key, {"lastMessage": "永续张数为 0，已停止发单"})
             return

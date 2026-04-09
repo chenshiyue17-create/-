@@ -181,6 +181,7 @@ const STRATEGY_PRESETS = {
       stopLossPct: "1.2",
       takeProfitPct: "8",
       maxDailyLossPct: "0.8",
+      targetBalanceMultiple: "10",
       autostart: false,
       allowLiveTrading: false,
       allowLiveAutostart: false,
@@ -695,6 +696,7 @@ function normalizeAutomationConfigForCompare(config = {}) {
     stopLossPct: String(config.stopLossPct ?? "1.2"),
     takeProfitPct: String(config.takeProfitPct ?? "2.4"),
     maxDailyLossPct: String(config.maxDailyLossPct ?? "3.0"),
+    targetBalanceMultiple: String(config.targetBalanceMultiple ?? "1"),
     arbEntrySpreadPct: String(config.arbEntrySpreadPct ?? "0.18"),
     arbExitSpreadPct: String(config.arbExitSpreadPct ?? "0.05"),
     arbMinFundingRatePct: String(config.arbMinFundingRatePct ?? "0.005"),
@@ -2035,12 +2037,21 @@ function renderDeskOverview() {
   const minerDailyUsd = Number(minerProgress.dailyUsd || 0);
   const railBalanceMain = $("rail-balance-main");
   const railBalanceSub = $("rail-balance-sub");
+  const railBalanceTarget = $("rail-balance-target");
+  const railBalanceProgress = $("rail-balance-progress");
   const railMinerMain = $("rail-miner-main");
   const railMinerSub = $("rail-miner-sub");
   const balanceBreakdown = summary.displayBreakdown
     || (fundingTotalEq > 0
       ? `资金账户 ${formatMoney(fundingTotalEq)} USDT · 交易账户 ${formatMoney(tradingTotalEq)} USDT`
       : (tradingTotalEq > 0 ? `交易账户 ${formatMoney(tradingTotalEq)} USDT` : ""));
+  const balanceGoalBase = startEq > 0 ? startEq : totalEq;
+  const stateTargetEq = Number(automation.targetBalanceEq || 0);
+  const stateTargetProgressPct = Number(automation.targetBalanceProgressPct || 0);
+  const balanceTargetEq = stateTargetEq > 0 ? stateTargetEq : (balanceGoalBase > 0 ? balanceGoalBase * 10 : 0);
+  const balanceTargetProgressPct = stateTargetEq > 0
+    ? stateTargetProgressPct
+    : (balanceTargetEq > 0 ? (totalEq / balanceTargetEq) * 100 : 0);
 
   $("desk-total-equity").textContent = totalEq > 0 ? `${formatMoney(totalEq)} USDT` : "--";
   $("desk-total-equity-sub").textContent =
@@ -2120,6 +2131,16 @@ function renderDeskOverview() {
     railBalanceSub.textContent = balanceBreakdown || (totalEq > 0
       ? `USDT · 调整后 ${formatMoney(Number(summary.adjEq || totalEq))}`
       : "USDT");
+  }
+  if (railBalanceTarget) {
+    railBalanceTarget.textContent = balanceTargetEq > 0
+      ? `目标 ${formatMoney(balanceTargetEq)} USDT`
+      : "目标等待余额";
+  }
+  if (railBalanceProgress) {
+    railBalanceProgress.textContent = balanceTargetEq > 0
+      ? `进度 ${formatPercentValue(balanceTargetProgressPct)}`
+      : "进度 0%";
   }
   if (railMinerMain) {
     railMinerMain.textContent = formatMoney(minerDailyUsd || 0);
@@ -2950,8 +2971,9 @@ function collectPublicConfigForAnalysis() {
 
 function collectAutomationConfig() {
   syncWatchlistOverridesValueFromEditor();
+  const strategyPreset = $("autoStrategyPreset").value || "dual_engine";
   return {
-    strategyPreset: $("autoStrategyPreset").value || "dual_engine",
+    strategyPreset,
     spotInstId: $("spotInstId").value.trim(),
     swapInstId: $("swapInstId").value.trim(),
     watchlistSymbols: $("autoWatchlistSymbols").value.trim(),
@@ -2973,6 +2995,7 @@ function collectAutomationConfig() {
     stopLossPct: $("autoStopLossPct").value.trim(),
     takeProfitPct: $("autoTakeProfitPct").value.trim(),
     maxDailyLossPct: $("autoMaxDailyLossPct").value.trim(),
+    targetBalanceMultiple: strategyPreset === "dip_swing" ? "10" : "1",
     arbEntrySpreadPct: $("autoArbEntrySpreadPct")?.value.trim() || "0.18",
     arbExitSpreadPct: $("autoArbExitSpreadPct")?.value.trim() || "0.05",
     arbMinFundingRatePct: $("autoArbMinFundingRatePct")?.value.trim() || "0.005",
