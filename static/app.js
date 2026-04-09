@@ -160,8 +160,8 @@ const STRATEGY_PRESETS = {
     },
   },
   dip_swing: {
-    label: "低买高卖",
-    description: "逐仓低杠杆回撤买入，固定 8% 止盈，强平缓冲不足时优先主动离场。",
+    label: "波段",
+    description: "逐仓低杠杆做趋势内波段，回踩或转强就接，固定 8% 止盈，强平缓冲不足时优先主动离场。",
     config: {
       strategyPreset: "dip_swing",
       bar: "15m",
@@ -724,7 +724,7 @@ function buildStrategyFormSummary(config = {}) {
   const presetDetail = normalized.strategyPreset === "basis_arb"
     ? `入场 ${normalized.arbEntrySpreadPct}% / 回补 ${normalized.arbExitSpreadPct}% / 资金费 ${normalized.arbMinFundingRatePct}%`
     : normalized.strategyPreset === "dip_swing"
-      ? `15m 低吸 · 逐仓 ${normalized.swapLeverage}x · TP ${normalized.takeProfitPct}%`
+      ? `15m 波段 · 逐仓 ${normalized.swapLeverage}x · TP ${normalized.takeProfitPct}%`
     : `${normalized.bar} · EMA ${normalized.fastEma}/${normalized.slowEma}`;
   return `${preset.label} · ${presetDetail} · ${watchlist.join(" / ")} · ${watchlist.length} 币组合${overrideCount ? ` · ${overrideCount} 币独立覆盖` : ""}`;
 }
@@ -756,7 +756,7 @@ function buildDraftPortfolioEntries(config = collectAutomationConfig()) {
         ].join(" · ")
       : isDipSwing
         ? [
-            `${target.bar} · 回撤低吸`,
+            `${target.bar} · 趋势波段`,
             `逐仓 ${target.swapLeverage}x · SL ${target.stopLossPct}% / TP ${target.takeProfitPct}%`,
             overrideFields.length ? `独立覆盖 ${overrideFields.length} 项` : "沿用组合参数",
           ].join(" · ")
@@ -1828,7 +1828,10 @@ function renderDeskGuards() {
 function renderAnalysisState(analysis) {
   const data = analysis || {};
   const isBasisArb = data.selectedStrategyName?.includes("高频套利");
-  const isDipSwing = data.selectedStrategyName?.includes("低买高卖");
+  const isDipSwing =
+    data.selectedStrategyName?.includes("波段") ||
+    data.selectedStrategyDetail?.includes("回踩接多") ||
+    data.research?.mode === "dip_swing";
   const marketTopCandidates = Array.isArray(data.marketTopCandidates) ? data.marketTopCandidates : [];
   $("analysis-decision").textContent =
     data.decisionLabel
@@ -4760,7 +4763,7 @@ function renderPortfolioWatchlist(entries = []) {
     const strategyPill = entry.allocation?.strategyPreset === "basis_arb"
       ? "高频套利"
       : entry.allocation?.strategyPreset === "dip_swing"
-        ? "低买高卖"
+        ? "波段"
         : formatStrategyMode(entry.allocation?.swapStrategyMode || $("autoSwapStrategyMode")?.value || "trend_follow");
     return `
       <article class="portfolio-coin-card tone-${toneClass}">
@@ -4867,7 +4870,7 @@ function renderStrategyPortfolio() {
       isBasisArb
         ? `${analysis.selectedStrategyName || "高频套利"} · 可做 ${analysis.candidateCount || 0} · 市场 ${analysis.marketCandidateCount || 0} · 对冲 ${arbRuntime.hedged || 0} · 回补 ${arbRuntime.exitQueue || 0}${analysis.reverseBasisCount ? ` · 反向 ${analysis.reverseBasisCount}` : ""}${arbRuntime.rollback ? ` · 回滚 ${arbRuntime.rollback}` : ""}`
         : isDipSwing
-          ? `${analysis.selectedStrategyName || "低买高卖"} · ${analysis.decisionLabel || "观察中"} · 回撤 ${analysis.pullbackPct || "--"}% · 反弹 ${analysis.reboundPct || "--"}%${analysis.liquidationBufferPct ? ` · 缓冲 ${analysis.liquidationBufferPct}%` : ""}`
+          ? `${analysis.selectedStrategyName || "波段"} · ${analysis.decisionLabel || "观察中"} · 回撤 ${analysis.pullbackPct || "--"}% · 反弹 ${analysis.reboundPct || "--"}%${analysis.liquidationBufferPct ? ` · 缓冲 ${analysis.liquidationBufferPct}%` : ""}`
         : `${analysis.selectedStrategyName || "当前策略"} · ${analysis.decisionLabel || "组合执行中"}`
     )
     : `${watchlist.length} 个币各自独立决策、独立风控、独立仓位摘要`;

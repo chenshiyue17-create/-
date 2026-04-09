@@ -103,9 +103,9 @@ BASIS_ARB_PREFERRED_SYMBOLS = (
 BASIS_ARB_SCAN_LOCK = threading.RLock()
 BASIS_ARB_MARKET_UNIVERSE_CACHE: dict[str, Any] = {"ts": 0.0, "symbols": []}
 BASIS_ARB_MARKET_SCAN_CACHE: dict[str, Any] = {"ts": 0.0, "key": "", "rows": []}
-DIP_SWING_PULLBACK_PCT = Decimal("1.8")
-DIP_SWING_REBOUND_PCT = Decimal("0.25")
-DIP_SWING_MIN_LIQ_BUFFER_PCT = Decimal("12")
+DIP_SWING_PULLBACK_PCT = Decimal("0.6")
+DIP_SWING_REBOUND_PCT = Decimal("0.10")
+DIP_SWING_MIN_LIQ_BUFFER_PCT = Decimal("10")
 DIP_SWING_MAX_LEVERAGE = Decimal("3")
 
 
@@ -1360,15 +1360,15 @@ def validate_single_automation_target(config: dict[str, Any]) -> str:
             return "高频套利的回补价差必须小于入场价差"
     if str(config.get("strategyPreset") or "") == "dip_swing":
         if not config.get("swapEnabled"):
-            return "低买高卖必须启用永续"
+            return "波段策略必须启用永续"
         if str(config.get("swapStrategyMode") or "") != "long_only":
-            return "低买高卖只支持 long_only"
+            return "波段策略只支持 long_only"
         if str(config.get("swapTdMode") or "") != "isolated":
-            return "低买高卖必须使用 isolated 逐仓"
+            return "波段策略必须使用 isolated 逐仓"
         if safe_decimal(config.get("swapLeverage"), "1") > DIP_SWING_MAX_LEVERAGE:
-            return f"低买高卖杠杆不能高于 {decimal_to_str(DIP_SWING_MAX_LEVERAGE)}x"
+            return f"波段策略杠杆不能高于 {decimal_to_str(DIP_SWING_MAX_LEVERAGE)}x"
         if safe_decimal(config.get("takeProfitPct"), "0") < Decimal("8"):
-            return "低买高卖的目标止盈建议至少 8%"
+            return "波段策略的目标止盈建议至少 8%"
     return ""
 
 
@@ -3308,7 +3308,7 @@ def strategy_label(preset: str) -> str:
         "dual_engine": "标准双引擎",
         "btc_lotto": "BTC 乐透机",
         "basis_arb": "高频套利",
-        "dip_swing": "低买高卖",
+        "dip_swing": "波段",
     }.get(preset, "标准双引擎")
 
 
@@ -3327,7 +3327,7 @@ def strategy_scope_label(config: dict[str, Any]) -> str:
     if str(config.get("strategyPreset") or "") == "basis_arb":
         return "现货 + 永续对冲"
     if str(config.get("strategyPreset") or "") == "dip_swing":
-        return "逐仓永续低吸"
+        return "逐仓永续波段"
     scopes: list[str] = []
     if config.get("spotEnabled"):
         scopes.append("现货")
@@ -3340,7 +3340,7 @@ def strategy_mode_label(config: dict[str, Any]) -> str:
     if str(config.get("strategyPreset") or "") == "basis_arb":
         return "基差回归套利"
     if str(config.get("strategyPreset") or "") == "dip_swing":
-        return "回撤买入 / 反弹止盈"
+        return "趋势转强 / 回踩接多"
     if not config.get("swapEnabled"):
         return "现货执行"
     mode = str(config.get("swapStrategyMode", "trend_follow"))
@@ -3355,7 +3355,7 @@ def strategy_mode_badge(config: dict[str, Any]) -> str:
     if str(config.get("strategyPreset") or "") == "basis_arb":
         return "套利"
     if str(config.get("strategyPreset") or "") == "dip_swing":
-        return "低吸"
+        return "波段"
     if not config.get("swapEnabled"):
         return "现货"
     mode = str(config.get("swapStrategyMode", "trend_follow"))
@@ -3375,7 +3375,7 @@ def strategy_short_name(config: dict[str, Any], rank: int | None = None) -> str:
     elif preset_value == "basis_arb":
         preset = "套利"
     elif preset_value == "dip_swing":
-        preset = "低吸"
+        preset = "波段"
     else:
         preset = "双引擎"
     leverage = f"{int(safe_decimal(config.get('swapLeverage'), '1'))}x" if config.get("swapEnabled") else ""
@@ -3404,7 +3404,7 @@ def strategy_detail_line(config: dict[str, Any], origin_label: str = "") -> str:
         return " · ".join(part for part in parts if part)
     if str(config.get("strategyPreset") or "") == "dip_swing":
         parts = [
-            "回撤买入 + 反弹止盈",
+            "趋势转强 + 回踩接多",
             f"只做多 · {config.get('swapTdMode', 'isolated')} {config.get('swapLeverage', '2')}x",
             f"目标止盈 {config.get('takeProfitPct', '8')}%",
             f"止损 {config.get('stopLossPct', '2.5')}%",
@@ -3511,9 +3511,11 @@ def build_pullback_signal(
 ) -> dict[str, Any]:
     closes = [row["close"] for row in candles]
     if len(closes) < slow + 2:
-        raise OkxApiError("K 线样本不足，无法计算低吸信号")
+        raise OkxApiError("K 线样本不足，无法计算波段信号")
     fast_values = ema(closes, fast)
     slow_values = ema(closes, slow)
+    prev_fast = fast_values[-2]
+    prev_slow = slow_values[-2]
     curr_fast = fast_values[-1]
     curr_slow = slow_values[-1]
     last_close = closes[-1]
@@ -3529,8 +3531,11 @@ def build_pullback_signal(
         trend = "down"
     else:
         trend = "flat"
+    bull_cross = prev_fast <= prev_slow and curr_fast > curr_slow
     bounce_ready = last_close >= prev_close and rebound_pct >= rebound_threshold_pct
-    if trend == "up" and pullback_pct >= pullback_threshold_pct and bounce_ready:
+    if trend == "up" and bull_cross:
+        signal = "bull_cross_buy"
+    elif trend == "up" and pullback_pct >= pullback_threshold_pct and bounce_ready:
         signal = "pullback_buy"
     elif trend == "down":
         signal = "trend_break"
@@ -3546,6 +3551,7 @@ def build_pullback_signal(
         "recentLow": decimal_to_str(recent_low),
         "pullbackPct": decimal_to_str(pullback_pct),
         "reboundPct": decimal_to_str(rebound_pct),
+        "bullCross": bull_cross,
     }
 
 
@@ -5582,7 +5588,7 @@ def build_dip_swing_analysis(
     selected_target = resolve_selected_execution_target(automation)
     inst_id = str(selected_target.get("swapInstId") or automation.get("swapInstId") or "")
     if not inst_id:
-        raise OkxApiError("低买高卖策略缺少永续交易对")
+        raise OkxApiError("波段策略缺少永续交易对")
     jobs: dict[str, Any] = {
         "swapTicker": lambda: extract_first_row(client.get_ticker(inst_id)),
         "markPrice": lambda: extract_first_row(client.get_mark_price("SWAP", inst_id)),
@@ -5638,7 +5644,7 @@ def build_dip_swing_analysis(
     blockers: list[str] = []
     warnings: list[str] = []
     if str(selected_target.get("swapTdMode") or "") != "isolated":
-        blockers.append("低买高卖策略要求逐仓，避免把整账户拖进强平")
+        blockers.append("波段策略要求逐仓，避免把整账户拖进强平")
     if leverage > DIP_SWING_MAX_LEVERAGE:
         blockers.append(f"当前杠杆 {decimal_to_str(leverage)}x 过高，已限制到 ≤ {decimal_to_str(DIP_SWING_MAX_LEVERAGE)}x")
     if position_side == "long" and liq_buffer > 0 and liq_buffer <= DIP_SWING_MIN_LIQ_BUFFER_PCT:
@@ -5648,40 +5654,40 @@ def build_dip_swing_analysis(
     if basis_pct >= Decimal("0.20"):
         warnings.append("永续高于标记价较多，追高风险升高")
     if signal["trend"] != "up":
-        warnings.append("当前趋势未转强，不做低吸开多")
+        warnings.append("当前趋势未转强，不做波段开多")
     elif pullback_pct < DIP_SWING_PULLBACK_PCT:
         warnings.append(
-            f"当前回撤 {compact_metric(pullback_pct, '0.1')}%，还没到低吸区 {format_decimal(DIP_SWING_PULLBACK_PCT, 1)}%"
+            f"当前回撤 {compact_metric(pullback_pct, '0.1')}%，还没到波段回踩区 {format_decimal(DIP_SWING_PULLBACK_PCT, 1)}%"
         )
-    elif signal["signal"] != "pullback_buy":
+    elif signal["signal"] not in {"pullback_buy", "bull_cross_buy"}:
         warnings.append(
             f"回撤够了，但反弹确认只有 {compact_metric(rebound_pct, '0.1')}%，继续等确认"
         )
     if position_side == "short":
-        blockers.append("检测到空单残留，先清掉再切换到低买高卖")
+        blockers.append("检测到空单残留，先清掉再切换到波段策略")
 
     allow_new_entries = (
         not blockers
         and position_side == "flat"
         and signal["trend"] == "up"
-        and signal["signal"] == "pullback_buy"
+        and signal["signal"] in {"pullback_buy", "bull_cross_buy"}
     )
     if blockers:
         decision = "skip"
         decision_label = "先收缩风险"
     elif allow_new_entries:
         decision = "execute"
-        decision_label = "允许低吸开多"
+        decision_label = "允许波段开多"
     elif signal["trend"] != "up":
         decision = "observe"
         decision_label = "趋势未转强"
     else:
         decision = "observe"
-        decision_label = "等待回撤买点"
+        decision_label = "等待下一次回踩"
 
     symbol = strategy_symbol_label(selected_target)
     summary_bits = [
-        f"{symbol} 低买高卖",
+        f"{symbol} 波段",
         f"回撤 {compact_metric(pullback_pct, '0.1')}%",
         f"反弹 {compact_metric(rebound_pct, '0.1')}%",
         f"资金费 {compact_metric(funding_rate_pct, '0.001')}%",
@@ -5692,18 +5698,22 @@ def build_dip_swing_analysis(
     if blockers:
         summary_bits.append(blockers[0])
     elif allow_new_entries:
-        summary_bits.append("回撤和反弹确认都到位，允许逐仓开多")
+        summary_bits.append(
+            "趋势转强、回踩或金叉条件已到，允许逐仓开多"
+            if signal["signal"] == "bull_cross_buy"
+            else "回踩和反弹确认都到位，允许逐仓开多"
+        )
     elif signal["trend"] != "up":
         summary_bits.append("趋势还没重新抬头，继续等")
     else:
-        summary_bits.append("继续等更深回撤或更明确的反弹确认")
+        summary_bits.append("继续等下一次更好的回踩或更明确的反弹确认")
 
     return {
         "statusText": "已联网分析",
         "decision": decision,
         "decisionLabel": decision_label,
         "summary": " · ".join(summary_bits),
-        "selectedStrategyName": f"{symbol} 低买高卖",
+        "selectedStrategyName": f"{symbol} 波段",
         "selectedStrategyDetail": strategy_detail_line(selected_target),
         "selectedReturnPct": "",
         "selectedDrawdownPct": "",
@@ -5712,7 +5722,7 @@ def build_dip_swing_analysis(
         "allowNewEntries": allow_new_entries,
         "optimizerRefreshed": False,
         "lastAnalyzedAt": now_local_iso(),
-        "marketRegime": "回撤低吸",
+        "marketRegime": "趋势波段",
         "spotTrend": "",
         "swapTrend": f"{signal['trend']} / {signal['signal']}",
         "volatilityPct": compact_metric(recent_range_pct(candles), "0.01"),
@@ -5729,7 +5739,7 @@ def build_dip_swing_analysis(
         "liquidationBufferPct": compact_metric(liq_buffer, "0.1") if liq_buffer > 0 else "",
         "research": {
             "running": False,
-            "statusText": "低买高卖模式",
+            "statusText": "波段模式",
             "mode": "dip_swing",
             "lastRunAt": now_local_iso(),
             "historyLimit": len(candles),
@@ -8245,7 +8255,7 @@ class AutomationEngine:
                 "riskLabel": build_market_risk_label(automation, "swap"),
                 "liquidationPrice": decimal_to_str(liq_price) if liq_price > 0 else "",
                 "liquidationBufferPct": decimal_to_str(liq_buffer) if liq_buffer > 0 else "",
-                "lastMessage": f"低吸监控 · {status_text}",
+                "lastMessage": f"波段监控 · {status_text}",
             },
         )
 
@@ -8258,7 +8268,7 @@ class AutomationEngine:
                     "buy",
                     close_size,
                     automation["swapTdMode"],
-                    "切换低买高卖，先平空单",
+                    "切换波段策略，先平空单",
                     reduce_only=True,
                     market_key=market_key,
                 )
@@ -8286,7 +8296,7 @@ class AutomationEngine:
                     "sell",
                     round_down(abs_pos, lot_size),
                     automation["swapTdMode"],
-                    "低吸多单止损",
+                    "波段多单止损",
                     reduce_only=True,
                     market_key=market_key,
                 )
@@ -8298,7 +8308,7 @@ class AutomationEngine:
                     "sell",
                     round_down(abs_pos, lot_size),
                     automation["swapTdMode"],
-                    "低吸多单止盈",
+                    "波段多单止盈",
                     reduce_only=True,
                     market_key=market_key,
                 )
@@ -8319,25 +8329,25 @@ class AutomationEngine:
                 else:
                     self._set_market(market_key, {"lastMessage": f"趋势转弱，但{reason}"})
                 return
-            self._set_market(market_key, {"lastMessage": f"低吸持仓中 · {status_text} · 目标 {automation.get('takeProfitPct', '8')}%"})
+            self._set_market(market_key, {"lastMessage": f"波段持仓中 · {status_text} · 目标 {automation.get('takeProfitPct', '8')}%"})
             return
 
         trade_contracts = round_down(safe_decimal(automation.get("swapContracts"), "0"), lot_size)
         if trade_contracts <= 0:
             self._set_market(market_key, {"lastMessage": "永续张数为 0，已停止发单"})
             return
-        if signal["signal"] != "pullback_buy":
+        if signal["signal"] not in {"pullback_buy", "bull_cross_buy"}:
             if signal["trend"] != "up":
                 self._set_market(market_key, {"lastMessage": f"趋势未转强 · {status_text}"})
             else:
-                self._set_market(market_key, {"lastMessage": f"等待更好的回撤买点 · {status_text}"})
+                self._set_market(market_key, {"lastMessage": f"等待下一次更好的回踩 · {status_text}"})
             return
         if not allow_new_entries:
-            self._set_market(market_key, {"lastMessage": f"低吸买点出现，但当前联网决策层为“{analysis_label}”，本轮不新开仓"})
+            self._set_market(market_key, {"lastMessage": f"波段买点出现，但当前联网决策层为“{analysis_label}”，本轮不新开仓"})
             return
         cooldown_ready, reason = self._cooldown_ready(market_key, int(automation["cooldownSeconds"]))
         if not cooldown_ready:
-            self._set_market(market_key, {"lastMessage": f"低吸买点出现，但{reason}"})
+            self._set_market(market_key, {"lastMessage": f"波段买点出现，但{reason}"})
             return
         self._place_swap_order(
             client,
@@ -8345,7 +8355,7 @@ class AutomationEngine:
             "buy",
             trade_contracts,
             automation["swapTdMode"],
-            "低吸开多",
+            "波段开多",
             market_key=market_key,
         )
 
