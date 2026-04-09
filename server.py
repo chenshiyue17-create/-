@@ -1228,6 +1228,36 @@ def default_automation_state() -> dict[str, Any]:
     }
 
 
+LEGACY_NON_SWING_MARKERS = (
+    "高频套利",
+    "价差回归套利",
+    "当前负基差",
+    "不做这侧套利",
+    "watchlist 可做",
+    "市场候选",
+    "反向",
+    "套利入场",
+    "套利窗口",
+    "资金费",
+)
+
+
+def has_legacy_non_swing_text(value: Any) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    return any(marker in text for marker in LEGACY_NON_SWING_MARKERS)
+
+
+def sanitize_only_dip_swing_message(message: Any, *, fallback: str = "等待波段买点确认") -> str:
+    text = str(message or "").strip()
+    if not text:
+        return ""
+    if has_legacy_non_swing_text(text) or "联网决策层" in text:
+        return fallback
+    return text
+
+
 def normalize_watchlist_symbols(raw: Any, config: dict[str, Any] | None = None) -> list[str]:
     tokens = re.split(r"[\s,;/|]+", str(raw or "").strip())
     normalized: list[str] = []
@@ -1732,6 +1762,109 @@ def reconcile_runtime_state_with_automation(state: dict[str, Any], automation: d
         markets["spot"] = copy.deepcopy(watchlist_entries[0].get("spot") or default_market_state())
         markets["swap"] = copy.deepcopy(watchlist_entries[0].get("swap") or default_market_state())
     return hydrated
+
+
+def sanitize_only_dip_swing_analysis(analysis: dict[str, Any], automation: dict[str, Any]) -> dict[str, Any]:
+    effective = enforce_only_dip_swing_strategy(deep_merge(default_automation_config(), automation or {}))
+    sanitized = copy.deepcopy(analysis or {})
+    symbols = normalize_watchlist_symbols(effective.get("watchlistSymbols"), effective)
+    primary_symbol = symbols[0] if symbols else "BTC"
+    stale = (
+        has_legacy_non_swing_text(sanitized.get("selectedStrategyName"))
+        or has_legacy_non_swing_text(sanitized.get("selectedStrategyDetail"))
+        or has_legacy_non_swing_text(sanitized.get("decisionLabel"))
+        or has_legacy_non_swing_text(sanitized.get("summary"))
+        or has_legacy_non_swing_text(sanitized.get("marketRegime"))
+    )
+
+    sanitized["selectedStrategyName"] = f"{primary_symbol} 波段"
+    sanitized["selectedStrategyDetail"] = strategy_detail_line(effective)
+    if stale:
+        allow_new_entries = bool(sanitized.get("allowNewEntries"))
+        sanitized["decision"] = "execute" if allow_new_entries else "observe"
+        sanitized["decisionLabel"] = "允许波段开多" if allow_new_entries else "等待波段买点"
+        sanitized["summary"] = "当前只保留波段策略，旧套利分析结果已隐藏。"
+        sanitized["marketRegime"] = "波段观察"
+        sanitized["warnings"] = []
+        sanitized["blockers"] = []
+    return sanitized
+
+
+def sanitize_only_dip_swing_runtime_state(state: dict[str, Any], automation: dict[str, Any]) -> dict[str, Any]:
+    effective = enforce_only_dip_swing_strategy(deep_merge(default_automation_config(), automation or {}))
+    sanitized = reconcile_runtime_state_with_automation(copy.deepcopy(state or {}), effective)
+    sanitized["analysis"] = sanitize_only_dip_swing_analysis(sanitized.get("analysis") or {}, effective)
+
+    if has_legacy_non_swing_text(sanitized.get("modeText")):
+        sanitized["modeText"] = "波段"
+    if has_legacy_non_swing_text(sanitized.get("statusText")):
+        sanitized["statusText"] = (
+            "自动量化已启动，策略会按轮询周期检查波段信号并执行风控。"
+            if sanitized.get("running")
+            else "自动量化已停止"
+        )
+
+    last_pipeline = copy.deepcopy(sanitized.get("lastPipeline") or {})
+    if has_legacy_non_swing_text(last_pipeline.get("summary")):
+        last_pipeline["summary"] = (
+            f"{sanitized['analysis'].get('selectedStrategyName', '波段')} · "
+            f"{sanitized['analysis'].get('decisionLabel', '等待波段买点')}"
+        )
+    sanitized["lastPipeline"] = last_pipeline
+
+    research = copy.deepcopy(sanitized.get("research") or {})
+    if str(research.get("mode") or "").strip() == "basis_arb":
+        research["mode"] = "dip_swing"
+        research["statusText"] = "波段分析模式"
+        best_config = deep_merge(default_automation_config(), research.get("bestConfig") or {})
+        research["bestConfig"] = enforce_only_dip_swing_strategy(best_config)
+    sanitized["research"] = research
+
+    markets = sanitized.get("markets") or {}
+    for key, market in list(markets.items()):
+        if not isinstance(market, dict):
+            continue
+        patched = copy.deepcopy(market)
+        patched["lastMessage"] = sanitize_only_dip_swing_message(patched.get("lastMessage"))
+        if str(patched.get("trend") or "").strip() == "basis_arb":
+            patched["trend"] = "dip_swing"
+        if str(patched.get("riskMode") or "").strip() == "basis_arb":
+            patched["riskMode"] = str(patched.get("tdMode") or effective.get("swapTdMode") or "isolated")
+        patched["arbStage"] = ""
+        patched["arbBias"] = ""
+        patched["arbSpotSize"] = ""
+        patched["arbSwapSize"] = ""
+        patched["arbOpenedAt"] = ""
+        patched["arbEntrySpreadPct"] = ""
+        patched["arbEntrySpotPx"] = ""
+        patched["arbEntrySwapPx"] = ""
+        markets[key] = patched
+    sanitized["markets"] = markets
+
+    cleaned_watchlist: list[dict[str, Any]] = []
+    for entry in sanitized.get("watchlist") or []:
+        patched_entry = copy.deepcopy(entry)
+        allocation = copy.deepcopy(patched_entry.get("allocation") or {})
+        allocation["strategyPreset"] = ONLY_STRATEGY_PRESET
+        patched_entry["allocation"] = allocation
+        for leg_name in ("spot", "swap"):
+            leg = copy.deepcopy(patched_entry.get(leg_name) or {})
+            leg["lastMessage"] = sanitize_only_dip_swing_message(leg.get("lastMessage"))
+            if str(leg.get("trend") or "").strip() == "basis_arb":
+                leg["trend"] = "dip_swing"
+            if str(leg.get("riskMode") or "").strip() == "basis_arb":
+                leg["riskMode"] = str(leg.get("tdMode") or effective.get("swapTdMode") or "isolated")
+            leg["arbStage"] = ""
+            patched_entry[leg_name] = leg
+        summary = copy.deepcopy(patched_entry.get("summary") or {})
+        summary["arbStage"] = ""
+        summary["arbStageText"] = ""
+        summary["status"] = "持仓中" if summary.get("activeLegs") else "观察中"
+        summary["detail"] = sanitize_only_dip_swing_message(summary.get("detail"), fallback="等待波段买点确认")
+        patched_entry["summary"] = summary
+        cleaned_watchlist.append(patched_entry)
+    sanitized["watchlist"] = cleaned_watchlist
+    return sanitized
 
 
 def summarize_basis_arb_watchlist(entries: list[dict[str, Any]]) -> dict[str, int]:
@@ -9043,9 +9176,23 @@ class AppHandler(BaseHTTPRequestHandler):
                     response = remote_gateway_request(config, "GET", self.path)
                     payload = response.json()
                     if path == "/api/focus-snapshot":
+                        if isinstance(payload.get("automationState"), dict):
+                            payload["automationState"] = sanitize_only_dip_swing_runtime_state(
+                                payload.get("automationState") or {},
+                                AUTOMATION_CONFIG.current(),
+                            )
                         payload["minerOverview"] = miner_focus_overview(MINER_CONFIG.current())
                     payload["executionMode"] = "remote"
                     payload["remoteGatewayUrl"] = remote_gateway_url(config)
+                    json_response(self, payload, status=response.status_code)
+                elif path == "/api/automation/state":
+                    response = remote_gateway_request(config, "GET", self.path)
+                    payload = response.json()
+                    if isinstance(payload.get("state"), dict):
+                        payload["state"] = sanitize_only_dip_swing_runtime_state(
+                            payload.get("state") or {},
+                            AUTOMATION_CONFIG.current(),
+                        )
                     json_response(self, payload, status=response.status_code)
                 else:
                     response = remote_gateway_request(config, "GET", self.path)
@@ -9156,7 +9303,7 @@ class AppHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/automation/state":
-            state = AUTOMATION_ENGINE.snapshot()
+            state = sanitize_only_dip_swing_runtime_state(AUTOMATION_ENGINE.snapshot(), AUTOMATION_CONFIG.current())
             state["executionJournal"] = get_execution_journal_snapshot(limit=20)
             json_response(self, {"ok": True, "state": state})
             return
@@ -9164,7 +9311,10 @@ class AppHandler(BaseHTTPRequestHandler):
         if path == "/api/focus-snapshot":
             payload: dict[str, Any] = {
                 "ok": True,
-                "automationState": AUTOMATION_ENGINE.snapshot(),
+                "automationState": sanitize_only_dip_swing_runtime_state(
+                    AUTOMATION_ENGINE.snapshot(),
+                    AUTOMATION_CONFIG.current(),
+                ),
                 "executionJournal": get_execution_journal_snapshot(limit=20),
                 "timestamp": int(time.time()),
             }

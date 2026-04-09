@@ -293,7 +293,7 @@
             </div>
             <div class="guard-card analysis-card">
               <div class="block-head">
-                <h3>联网决策层</h3>
+                <h3>波段决策层</h3>
                 <span class="pill" id="analysis-pill">待分析</span>
               </div>
               <div class="guard-list">
@@ -302,20 +302,20 @@
                   <span id="analysis-decision">等待首轮联网分析</span>
                 </div>
                 <div class="guard-item">
-                  <b>当前策略</b>
-                  <span id="analysis-strategy">先联网分析，再给出本轮最优策略</span>
+                  <b>当前模式</b>
+                  <span id="analysis-strategy">只保留波段策略，等待本轮开多判断</span>
                 </div>
                 <div class="guard-item">
-                  <b>市场状态</b>
-                  <span id="analysis-market">等待波动、价差、资金费和趋势分析</span>
+                  <b>波段状态</b>
+                  <span id="analysis-market">等待趋势、回撤、反弹和强平缓冲分析</span>
                 </div>
                 <div class="guard-item">
-                  <b>联网上下文</b>
+                  <b>行情上下文</b>
                   <span id="analysis-refresh">等待最新分析时间</span>
                 </div>
                 <div class="guard-item">
                   <b>原因解释</b>
-                  <span id="analysis-reason">这层会决定是允许开新仓、只观察，还是直接跳过。</span>
+                  <span id="analysis-reason">这里只保留波段开多、观察和风控解释。</span>
                 </div>
               </div>
             </div>
@@ -697,7 +697,7 @@
             </label>
             <label>
               <span>永续杠杆</span>
-              <input id="autoSwapLeverage" type="number" min="1" max="10" step="1" value="5" />
+              <input id="autoSwapLeverage" type="number" min="1" max="10" step="1" value="10" />
             </label>
             <label>
               <span>止损 (%)</span>
@@ -705,31 +705,11 @@
             </label>
             <label>
               <span>止盈 (%)</span>
-              <input id="autoTakeProfitPct" type="number" min="0" step="0.1" value="2.4" />
+              <input id="autoTakeProfitPct" type="number" min="0" step="0.1" value="8" />
             </label>
             <label>
               <span>日内最大回撤 (%)</span>
-              <input id="autoMaxDailyLossPct" type="number" min="0" step="0.1" value="3.0" />
-            </label>
-            <label data-arb-only class="hidden">
-              <span>套利入场价差 (%)</span>
-              <input id="autoArbEntrySpreadPct" type="number" min="0" step="0.001" value="0.18" />
-            </label>
-            <label data-arb-only class="hidden">
-              <span>套利回补价差 (%)</span>
-              <input id="autoArbExitSpreadPct" type="number" min="0" step="0.001" value="0.05" />
-            </label>
-            <label data-arb-only class="hidden">
-              <span>最低资金费 (%)</span>
-              <input id="autoArbMinFundingRatePct" type="number" min="0" step="0.001" value="0.005" />
-            </label>
-            <label data-arb-only class="hidden">
-              <span>最长持有 (分钟)</span>
-              <input id="autoArbMaxHoldMinutes" type="number" min="0" step="1" value="180" />
-            </label>
-            <label data-arb-only class="checkbox-row hidden">
-              <span>要求资金费同向</span>
-              <input id="autoArbRequireFundingAlignment" type="checkbox" checked />
+              <input id="autoMaxDailyLossPct" type="number" min="0" step="0.1" value="0.8" />
             </label>
             <label class="checkbox-row">
               <span>服务启动后自动启动策略</span>
