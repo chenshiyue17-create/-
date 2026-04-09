@@ -1423,6 +1423,34 @@ def build_market_risk_label(target: dict[str, Any], market_kind: str) -> str:
     return f"{format_decimal(contracts, 2)} 张 · {format_decimal(leverage, 0)}x · {td_mode}"
 
 
+def apply_target_market_allocation(
+    target: dict[str, Any],
+    market_kind: str,
+    market_state: dict[str, Any],
+) -> dict[str, Any]:
+    patched = copy.deepcopy(market_state or default_market_state())
+    if market_kind == "spot":
+        patched.update(
+            {
+                "riskBudget": decimal_to_str(safe_decimal(target.get("spotQuoteBudget"), "0")),
+                "riskCap": decimal_to_str(safe_decimal(target.get("spotMaxExposure"), "0")),
+                "riskMode": "basis_arb" if str(target.get("strategyPreset") or "") == "basis_arb" else "cash",
+                "riskLabel": build_market_risk_label(target, "spot"),
+            }
+        )
+        return patched
+
+    patched.update(
+        {
+            "riskBudget": decimal_to_str(safe_decimal(target.get("swapContracts"), "0")),
+            "riskCap": decimal_to_str(safe_decimal(target.get("swapLeverage"), "0")),
+            "riskMode": "basis_arb" if str(target.get("strategyPreset") or "") == "basis_arb" else str(target.get("swapTdMode") or "cross"),
+            "riskLabel": build_market_risk_label(target, "swap"),
+        }
+    )
+    return patched
+
+
 def basis_arb_stage_text(stage: str) -> str:
     normalized = str(stage or "").strip().lower()
     if normalized == "reverse_basis":
@@ -1456,6 +1484,8 @@ def build_watchlist_entry(
     spot_market: dict[str, Any],
     swap_market: dict[str, Any],
 ) -> dict[str, Any]:
+    spot_market = apply_target_market_allocation(target, "spot", spot_market)
+    swap_market = apply_target_market_allocation(target, "swap", swap_market)
     symbol_override = copy.deepcopy(target.get("watchlistOverride") or {})
     override_keys = sorted(symbol_override.keys())
     spot_notional = safe_decimal(spot_market.get("positionNotional"), "0")
@@ -1531,6 +1561,48 @@ def build_watchlist_entry(
             ),
         },
     }
+
+
+def reconcile_runtime_state_with_automation(state: dict[str, Any], automation: dict[str, Any]) -> dict[str, Any]:
+    hydrated = copy.deepcopy(state)
+    if not hydrated.get("running") and not hydrated.get("watchlist"):
+        return hydrated
+
+    markets = hydrated.setdefault("markets", {})
+    targets = build_execution_targets(automation)
+    if not targets:
+        return hydrated
+
+    watchlist_entries: list[dict[str, Any]] = []
+    for target in targets:
+        spot_key = f"spot:{target['spotInstId']}"
+        swap_key = f"swap:{target['swapInstId']}"
+        spot_market = apply_target_market_allocation(
+            target,
+            "spot",
+            markets.get(spot_key) or default_market_state(),
+        )
+        swap_market = apply_target_market_allocation(
+            target,
+            "swap",
+            markets.get(swap_key) or default_market_state(),
+        )
+        markets[spot_key] = spot_market
+        markets[swap_key] = swap_market
+        watchlist_entries.append(
+            build_watchlist_entry(
+                str(target.get("watchlistSymbol") or ""),
+                target,
+                spot_market,
+                swap_market,
+            )
+        )
+
+    hydrated["watchlist"] = watchlist_entries
+    if watchlist_entries:
+        markets["spot"] = copy.deepcopy(watchlist_entries[0].get("spot") or default_market_state())
+        markets["swap"] = copy.deepcopy(watchlist_entries[0].get("swap") or default_market_state())
+    return hydrated
 
 
 def summarize_basis_arb_watchlist(entries: list[dict[str, Any]]) -> dict[str, int]:
@@ -6375,9 +6447,14 @@ class AutomationEngine:
         self.thread: threading.Thread | None = None
         self.stop_event = threading.Event()
         self.lock = threading.RLock()
+        self._prepared_swap_signature: tuple[Any, ...] | None = None
 
     def snapshot(self) -> dict[str, Any]:
-        return self.state_store.current()
+        snapshot = self.state_store.current()
+        ok, _, automation = validate_automation_config(self.automation_store.current())
+        if not ok:
+            return snapshot
+        return reconcile_runtime_state_with_automation(snapshot, automation)
 
     def _update_state(self, mutator) -> dict[str, Any]:
         return self.state_store.update(mutator)
@@ -6512,6 +6589,26 @@ class AutomationEngine:
             )
             self._set_market(f"swap:{target['swapInstId']}", {"prepared": True, "instId": target["swapInstId"]})
 
+    def _swap_prepare_signature(self, automation: dict[str, Any]) -> tuple[Any, ...]:
+        targets = build_execution_targets(automation)
+        enabled_targets = [
+            (
+                str(target.get("swapInstId") or ""),
+                str(target.get("swapLeverage") or ""),
+                str(target.get("swapTdMode") or ""),
+            )
+            for target in targets
+            if target.get("swapEnabled")
+        ]
+        return (bool(automation.get("enforceNetMode")), tuple(enabled_targets))
+
+    def _ensure_swap_prepared(self, client: OkxClient, automation: dict[str, Any]) -> None:
+        signature = self._swap_prepare_signature(automation)
+        if signature == self._prepared_swap_signature:
+            return
+        self._prepare_swap(client, automation)
+        self._prepared_swap_signature = signature
+
     def _spot_reference_price(self, client: OkxClient, inst_id: str, side: str) -> Decimal:
         row = extract_first_row(client.get_ticker(inst_id))
         bid_px = safe_decimal(row.get("bidPx") or row.get("bidPrice"), "0")
@@ -6575,7 +6672,7 @@ class AutomationEngine:
             self._guard_live_mode(automation, api_config, autostart=autostart)
             client = OkxClient(api_config)
             client.get_account_balance()
-            self._prepare_swap(client, automation)
+            self._ensure_swap_prepared(client, automation)
             self.stop_event = threading.Event()
             self._update_state(
                 lambda state: state.update(
@@ -6613,6 +6710,7 @@ class AutomationEngine:
                 }
             )
         )
+        self._prepared_swap_signature = None
         self._log("info", reason)
 
     def run_once(self) -> None:
@@ -6626,7 +6724,7 @@ class AutomationEngine:
             raise OkxApiError(error)
         self._guard_live_mode(automation, api_config, autostart=False)
         client = OkxClient(api_config)
-        self._prepare_swap(client, automation)
+        self._ensure_swap_prepared(client, automation)
         self._run_cycle(client, automation)
 
     def _run_loop(self) -> None:
@@ -6646,6 +6744,7 @@ class AutomationEngine:
             try:
                 ensure_live_route_ready(api_config, force=False)
                 client = OkxClient(api_config)
+                self._ensure_swap_prepared(client, automation)
                 self._run_cycle(client, automation)
                 self._update_state(lambda state: state.update({"consecutiveErrors": 0}))
             except Exception as exc:
