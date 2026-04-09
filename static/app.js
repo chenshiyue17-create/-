@@ -161,7 +161,7 @@ const STRATEGY_PRESETS = {
   },
   dip_swing: {
     label: "波段",
-    description: "逐仓低杠杆做趋势内波段，回踩或转强就接，固定 8% 止盈，强平缓冲不足时优先主动离场。",
+    description: "逐仓 10x 做趋势内波段，回踩或转强就接，固定 8% 止盈，强平缓冲不足时优先主动离场。",
     config: {
       strategyPreset: "dip_swing",
       bar: "15m",
@@ -177,10 +177,10 @@ const STRATEGY_PRESETS = {
       swapContracts: "1",
       swapTdMode: "isolated",
       swapStrategyMode: "long_only",
-      swapLeverage: "2",
-      stopLossPct: "2.5",
+      swapLeverage: "10",
+      stopLossPct: "1.2",
       takeProfitPct: "8",
-      maxDailyLossPct: "1.5",
+      maxDailyLossPct: "0.8",
       autostart: false,
       allowLiveTrading: false,
       allowLiveAutostart: false,

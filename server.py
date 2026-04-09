@@ -105,8 +105,8 @@ BASIS_ARB_MARKET_UNIVERSE_CACHE: dict[str, Any] = {"ts": 0.0, "symbols": []}
 BASIS_ARB_MARKET_SCAN_CACHE: dict[str, Any] = {"ts": 0.0, "key": "", "rows": []}
 DIP_SWING_PULLBACK_PCT = Decimal("0.6")
 DIP_SWING_REBOUND_PCT = Decimal("0.10")
-DIP_SWING_MIN_LIQ_BUFFER_PCT = Decimal("10")
-DIP_SWING_MAX_LEVERAGE = Decimal("3")
+DIP_SWING_MIN_LIQ_BUFFER_PCT = Decimal("18")
+DIP_SWING_MAX_LEVERAGE = Decimal("10")
 
 
 def _extract_a_records_from_doh(payload: dict[str, Any]) -> list[str]:
