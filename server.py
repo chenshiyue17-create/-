@@ -73,6 +73,36 @@ OKX_DNS_CACHE_LOCK = threading.RLock()
 OKX_ROUTE_CACHE: dict[str, dict[str, Any]] = {}
 OKX_ROUTE_CACHE_LOCK = threading.RLock()
 ORIGINAL_GETADDRINFO = socket.getaddrinfo
+BASIS_ARB_SCAN_SYMBOL_LIMIT = 24
+BASIS_ARB_PREFERRED_SYMBOLS = (
+    "BTC",
+    "ETH",
+    "SOL",
+    "DOGE",
+    "XRP",
+    "ADA",
+    "SUI",
+    "TRX",
+    "LINK",
+    "AVAX",
+    "LTC",
+    "BCH",
+    "TON",
+    "ARB",
+    "PEPE",
+    "APT",
+    "DOT",
+    "NEAR",
+    "ETC",
+    "FIL",
+    "ATOM",
+    "WLD",
+    "OP",
+    "INJ",
+)
+BASIS_ARB_SCAN_LOCK = threading.RLock()
+BASIS_ARB_MARKET_UNIVERSE_CACHE: dict[str, Any] = {"ts": 0.0, "symbols": []}
+BASIS_ARB_MARKET_SCAN_CACHE: dict[str, Any] = {"ts": 0.0, "key": "", "rows": []}
 
 
 def _extract_a_records_from_doh(payload: dict[str, Any]) -> list[str]:
@@ -4952,6 +4982,181 @@ def pct_gap(numerator: Decimal, denominator: Decimal) -> Decimal:
     return ((numerator - denominator) / denominator) * Decimal("100")
 
 
+def build_basis_arb_scan_target(config: dict[str, Any], symbol: str) -> dict[str, Any]:
+    target = deep_merge({}, config)
+    target["watchlistSymbol"] = symbol
+    target["spotInstId"] = f"{symbol}-USDT"
+    target["swapInstId"] = f"{symbol}-USDT-SWAP"
+    return target
+
+
+def evaluate_basis_arb_target_snapshot(
+    target: dict[str, Any],
+    spot_ticker: dict[str, Any],
+    swap_ticker: dict[str, Any],
+    funding_row: dict[str, Any],
+) -> dict[str, Any]:
+    spot_bid = ticker_bid_price(spot_ticker)
+    spot_ask = ticker_ask_price(spot_ticker)
+    swap_bid = ticker_bid_price(swap_ticker)
+    swap_ask = ticker_ask_price(swap_ticker)
+    spot_last = safe_decimal(spot_ticker.get("last"), "0")
+    swap_last = safe_decimal(swap_ticker.get("last"), "0")
+    funding_rate_pct = safe_decimal(funding_row.get("fundingRate"), "0") * Decimal("100")
+    entry_threshold = safe_decimal(target.get("arbEntrySpreadPct"), "0")
+    exit_threshold = safe_decimal(target.get("arbExitSpreadPct"), "0")
+    min_funding = safe_decimal(target.get("arbMinFundingRatePct"), "0")
+    require_funding_alignment = bool(target.get("arbRequireFundingAlignment"))
+    funding_aligned = funding_rate_pct >= min_funding if require_funding_alignment else True
+    entry_spread_pct = pct_gap(swap_bid, spot_ask)
+    close_spread_pct = pct_gap(swap_ask, spot_bid)
+    reverse_basis = entry_spread_pct <= 0
+    funding_blocked = (
+        entry_spread_pct > 0
+        and entry_spread_pct >= entry_threshold
+        and require_funding_alignment
+        and not funding_aligned
+    )
+    return {
+        "symbol": str(target.get("watchlistSymbol") or target.get("spotInstId") or "").split("-")[0],
+        "target": target,
+        "spotTicker": spot_ticker,
+        "swapTicker": swap_ticker,
+        "spotLast": spot_last,
+        "swapLast": swap_last,
+        "fundingRatePct": funding_rate_pct,
+        "entrySpreadPct": entry_spread_pct,
+        "closeSpreadPct": close_spread_pct,
+        "entryThresholdPct": entry_threshold,
+        "exitThresholdPct": exit_threshold,
+        "fundingThresholdPct": min_funding,
+        "requireFundingAlignment": require_funding_alignment,
+        "fundingAligned": funding_aligned,
+        "reverseBasis": reverse_basis,
+        "fundingBlocked": funding_blocked,
+        "candidate": (not reverse_basis) and entry_spread_pct >= entry_threshold and funding_aligned,
+    }
+
+
+def fetch_basis_arb_target_snapshot(client: OkxClient, target: dict[str, Any]) -> dict[str, Any]:
+    spot_ticker = extract_first_row(client.get_ticker(target["spotInstId"]))
+    swap_ticker = extract_first_row(client.get_ticker(target["swapInstId"]))
+    funding_row = extract_first_row(client.get_funding_rate(target["swapInstId"]))
+    return evaluate_basis_arb_target_snapshot(target, spot_ticker, swap_ticker, funding_row)
+
+
+def list_basis_arb_market_symbols(
+    client: OkxClient,
+    config: dict[str, Any],
+    *,
+    limit: int = BASIS_ARB_SCAN_SYMBOL_LIMIT,
+) -> list[str]:
+    watchlist_symbols = normalize_watchlist_symbols(config.get("watchlistSymbols"), config)
+    now = time.time()
+    with BASIS_ARB_SCAN_LOCK:
+        cached_symbols = list(BASIS_ARB_MARKET_UNIVERSE_CACHE.get("symbols") or [])
+        cached_ts = float(BASIS_ARB_MARKET_UNIVERSE_CACHE.get("ts") or 0.0)
+    shared_symbols = cached_symbols
+    if not shared_symbols or now - cached_ts >= 900:
+        spot_rows = (client.get_public_instruments("SPOT").get("data") or [])
+        swap_rows = (client.get_public_instruments("SWAP").get("data") or [])
+
+        def collect_spot_symbols(rows: list[dict[str, Any]]) -> set[str]:
+            symbols: set[str] = set()
+            for row in rows:
+                inst_id = str(row.get("instId") or "")
+                if not inst_id.endswith("-USDT"):
+                    continue
+                state = str(row.get("state") or "live").strip().lower()
+                quote_ccy = str(row.get("quoteCcy") or "").strip().upper()
+                if state not in {"", "live"} or quote_ccy not in {"", "USDT"}:
+                    continue
+                symbol = normalize_symbol_token(inst_id)
+                if symbol:
+                    symbols.add(symbol)
+            return symbols
+
+        def collect_swap_symbols(rows: list[dict[str, Any]]) -> set[str]:
+            symbols: set[str] = set()
+            for row in rows:
+                inst_id = str(row.get("instId") or "")
+                if not inst_id.endswith("-USDT-SWAP"):
+                    continue
+                state = str(row.get("state") or "live").strip().lower()
+                settle_ccy = str(row.get("settleCcy") or "").strip().upper()
+                if state not in {"", "live"} or settle_ccy not in {"", "USDT"}:
+                    continue
+                symbol = normalize_symbol_token(inst_id)
+                if symbol:
+                    symbols.add(symbol)
+            return symbols
+
+        shared_symbols = sorted(collect_spot_symbols(spot_rows) & collect_swap_symbols(swap_rows))
+        with BASIS_ARB_SCAN_LOCK:
+            BASIS_ARB_MARKET_UNIVERSE_CACHE["ts"] = now
+            BASIS_ARB_MARKET_UNIVERSE_CACHE["symbols"] = list(shared_symbols)
+
+    ordered: list[str] = []
+    for symbol in watchlist_symbols:
+        if symbol in shared_symbols and symbol not in ordered:
+            ordered.append(symbol)
+    for symbol in BASIS_ARB_PREFERRED_SYMBOLS:
+        if symbol in shared_symbols and symbol not in ordered:
+            ordered.append(symbol)
+    for symbol in shared_symbols:
+        if symbol not in ordered:
+            ordered.append(symbol)
+        if len(ordered) >= max(limit, len(watchlist_symbols)):
+            break
+    return ordered[: max(limit, len(watchlist_symbols))]
+
+
+def scan_basis_arb_market_snapshots(
+    client: OkxClient,
+    config: dict[str, Any],
+    symbols: list[str],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    normalized_symbols = [normalize_symbol_token(symbol) for symbol in symbols if normalize_symbol_token(symbol)]
+    if not normalized_symbols:
+        return [], []
+    cache_key = json.dumps(
+        {
+            "symbols": normalized_symbols,
+            "entry": decimal_to_str(safe_decimal(config.get("arbEntrySpreadPct"), "0")),
+            "exit": decimal_to_str(safe_decimal(config.get("arbExitSpreadPct"), "0")),
+            "funding": decimal_to_str(safe_decimal(config.get("arbMinFundingRatePct"), "0")),
+            "requireFundingAlignment": bool(config.get("arbRequireFundingAlignment")),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    now = time.time()
+    with BASIS_ARB_SCAN_LOCK:
+        cached_key = str(BASIS_ARB_MARKET_SCAN_CACHE.get("key") or "")
+        cached_ts = float(BASIS_ARB_MARKET_SCAN_CACHE.get("ts") or 0.0)
+        if cached_key == cache_key and now - cached_ts < 20:
+            return copy.deepcopy(BASIS_ARB_MARKET_SCAN_CACHE.get("rows") or []), []
+
+    targets = [build_basis_arb_scan_target(config, symbol) for symbol in normalized_symbols]
+    rows: list[dict[str, Any]] = []
+    errors: list[str] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(len(targets), 8))) as executor:
+        future_map = {executor.submit(fetch_basis_arb_target_snapshot, client, target): target for target in targets}
+        for future in concurrent.futures.as_completed(future_map):
+            target = future_map[future]
+            try:
+                rows.append(future.result())
+            except Exception as exc:
+                errors.append(f"{target.get('watchlistSymbol') or target.get('spotInstId')}: {exc}")
+    if errors and not rows:
+        raise OkxApiError(f"扩展市场扫描失败: {'; '.join(errors)}")
+    with BASIS_ARB_SCAN_LOCK:
+        BASIS_ARB_MARKET_SCAN_CACHE["ts"] = now
+        BASIS_ARB_MARKET_SCAN_CACHE["key"] = cache_key
+        BASIS_ARB_MARKET_SCAN_CACHE["rows"] = copy.deepcopy(rows)
+    return rows, errors
+
+
 def build_basis_arb_analysis(
     automation: dict[str, Any],
     client: OkxClient,
@@ -4959,55 +5164,10 @@ def build_basis_arb_analysis(
     targets = build_execution_targets(automation)
     watchlist_count = len(targets)
 
-    def fetch_target_snapshot(target: dict[str, Any]) -> dict[str, Any]:
-        spot_ticker = extract_first_row(client.get_ticker(target["spotInstId"]))
-        swap_ticker = extract_first_row(client.get_ticker(target["swapInstId"]))
-        funding_row = extract_first_row(client.get_funding_rate(target["swapInstId"]))
-        spot_bid = ticker_bid_price(spot_ticker)
-        spot_ask = ticker_ask_price(spot_ticker)
-        swap_bid = ticker_bid_price(swap_ticker)
-        swap_ask = ticker_ask_price(swap_ticker)
-        spot_last = safe_decimal(spot_ticker.get("last"), "0")
-        swap_last = safe_decimal(swap_ticker.get("last"), "0")
-        funding_rate_pct = safe_decimal(funding_row.get("fundingRate"), "0") * Decimal("100")
-        entry_threshold = safe_decimal(target.get("arbEntrySpreadPct"), "0")
-        exit_threshold = safe_decimal(target.get("arbExitSpreadPct"), "0")
-        min_funding = safe_decimal(target.get("arbMinFundingRatePct"), "0")
-        require_funding_alignment = bool(target.get("arbRequireFundingAlignment"))
-        funding_aligned = funding_rate_pct >= min_funding if require_funding_alignment else True
-        entry_spread_pct = pct_gap(swap_bid, spot_ask)
-        close_spread_pct = pct_gap(swap_ask, spot_bid)
-        reverse_basis = entry_spread_pct <= 0
-        funding_blocked = (
-            entry_spread_pct > 0
-            and entry_spread_pct >= entry_threshold
-            and require_funding_alignment
-            and not funding_aligned
-        )
-        return {
-            "symbol": str(target.get("watchlistSymbol") or target.get("spotInstId") or "").split("-")[0],
-            "target": target,
-            "spotTicker": spot_ticker,
-            "swapTicker": swap_ticker,
-            "spotLast": spot_last,
-            "swapLast": swap_last,
-            "fundingRatePct": funding_rate_pct,
-            "entrySpreadPct": entry_spread_pct,
-            "closeSpreadPct": close_spread_pct,
-            "entryThresholdPct": entry_threshold,
-            "exitThresholdPct": exit_threshold,
-            "fundingThresholdPct": min_funding,
-            "requireFundingAlignment": require_funding_alignment,
-            "fundingAligned": funding_aligned,
-            "reverseBasis": reverse_basis,
-            "fundingBlocked": funding_blocked,
-            "candidate": (not reverse_basis) and entry_spread_pct >= entry_threshold and funding_aligned,
-        }
-
     target_snapshots: list[dict[str, Any]] = []
     errors: list[str] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(len(targets), 8))) as executor:
-        future_map = {executor.submit(fetch_target_snapshot, target): target for target in targets}
+        future_map = {executor.submit(fetch_basis_arb_target_snapshot, client, target): target for target in targets}
         for future in concurrent.futures.as_completed(future_map):
             target = future_map[future]
             try:
@@ -5022,6 +5182,35 @@ def build_basis_arb_analysis(
     positive_snapshots = [row for row in target_snapshots if not row.get("reverseBasis")]
     reverse_basis_count = sum(1 for row in target_snapshots if row.get("reverseBasis"))
     funding_blocked_count = sum(1 for row in target_snapshots if row.get("fundingBlocked"))
+    watchlist_symbols = [str(row.get("symbol") or "") for row in target_snapshots if row.get("symbol")]
+
+    market_scan_symbols = list_basis_arb_market_symbols(client, automation)
+    extra_scan_symbols = [symbol for symbol in market_scan_symbols if symbol not in set(watchlist_symbols)]
+    extra_market_snapshots, market_scan_errors = scan_basis_arb_market_snapshots(client, automation, extra_scan_symbols)
+    market_snapshots = target_snapshots + extra_market_snapshots
+    market_candidate_snapshots = [row for row in market_snapshots if row.get("candidate")]
+    market_positive_snapshots = [row for row in market_snapshots if not row.get("reverseBasis")]
+    market_reverse_basis_count = sum(1 for row in market_snapshots if row.get("reverseBasis"))
+    market_funding_blocked_count = sum(1 for row in market_snapshots if row.get("fundingBlocked"))
+    market_candidate_count = len(market_candidate_snapshots)
+    market_top_candidates = [
+        {
+            "symbol": str(row.get("symbol") or ""),
+            "entrySpreadPct": compact_metric(safe_decimal(row.get("entrySpreadPct"), "0"), "0.001"),
+            "fundingRatePct": compact_metric(safe_decimal(row.get("fundingRatePct"), "0"), "0.001"),
+        }
+        for row in sorted(
+            market_candidate_snapshots,
+            key=lambda row: (
+                safe_decimal(row.get("entrySpreadPct"), "0"),
+                safe_decimal(row.get("fundingRatePct"), "0"),
+            ),
+            reverse=True,
+        )[:3]
+    ]
+    outside_watchlist_candidates = [
+        item for item in market_top_candidates if str(item.get("symbol") or "") not in set(watchlist_symbols)
+    ]
 
     if candidate_snapshots:
         selected_snapshot = max(
@@ -5113,6 +5302,7 @@ def build_basis_arb_analysis(
     swap_last = safe_decimal(selected_snapshot.get("swapLast"), "0")
     entry_spread_pct = safe_decimal(selected_snapshot.get("entrySpreadPct"), "0")
     close_spread_pct = safe_decimal(selected_snapshot.get("closeSpreadPct"), "0")
+    candidate_count = len(candidate_snapshots)
     mid_spread_pct = pct_gap(swap_last, spot_last)
     basis_pct = pct_gap(swap_last, mark_price)
     volatility_pct = max(recent_range_pct(fetched["spotCandles"]), recent_range_pct(fetched["swapCandles"]))
@@ -5144,12 +5334,32 @@ def build_basis_arb_analysis(
             warnings.append(
                 f"当前币永续只分到 {decimal_to_str(allocated_swap_contracts)} 张，触发时可能因最小张数或步长被挡住"
             )
+    if market_candidate_count == 0:
+        warnings.append(f"扩展市场已扫 {len(market_snapshots)} 币，当前也没有正基差候选")
+    elif outside_watchlist_candidates:
+        warnings.append(
+            "watchlist 暂时没窗口，但扩展市场有候选: "
+            + " / ".join(
+                f"{item['symbol']} {item['entrySpreadPct']}% · 资金费 {item['fundingRatePct']}%"
+                for item in outside_watchlist_candidates
+            )
+        )
+    elif market_candidate_count > candidate_count:
+        warnings.append(f"扩展市场共发现 {market_candidate_count} 币可做，watchlist 当前命中 {candidate_count} 币")
+    if market_scan_errors:
+        skipped_symbols = [str(item).split(":", 1)[0] for item in market_scan_errors[:3]]
+        warnings.append(
+            f"扩展扫描跳过 {len(market_scan_errors)} 币"
+            + (f": {', '.join(skipped_symbols)}" if skipped_symbols else "")
+        )
 
-    candidate_count = len(candidate_snapshots)
     allow_new_entries = candidate_count > 0 and not blockers
     if allow_new_entries:
         decision = "execute"
         decision_label = f"可做 {candidate_count} 币"
+    elif market_candidate_count > 0:
+        decision = "observe"
+        decision_label = f"watchlist 无窗口，市场有 {market_candidate_count} 币"
     elif blockers:
         decision = "skip"
         decision_label = "暂停套利"
@@ -5171,7 +5381,14 @@ def build_basis_arb_analysis(
         f"资金费 {decimal_to_str(funding_rate_pct.quantize(Decimal('0.001')))}%",
     ]
     if allow_new_entries:
-        summary_bits.append(f"可做 {candidate_count} / 反向 {reverse_basis_count} / 资金费未对齐 {funding_blocked_count}")
+        summary_bits.append(
+            f"watchlist 可做 {candidate_count} / 市场候选 {market_candidate_count} / 反向 {reverse_basis_count}"
+        )
+    elif market_candidate_count > 0:
+        summary_bits.append(
+            "watchlist 暂时没窗口，但扩展市场有候选: "
+            + " / ".join(item["symbol"] for item in outside_watchlist_candidates or market_top_candidates)
+        )
     elif blockers:
         summary_bits.append(blockers[0])
     elif funding_blocked_count > 0 and candidate_count == 0 and reverse_basis_count < watchlist_count:
@@ -5212,6 +5429,11 @@ def build_basis_arb_analysis(
         "candidateCount": candidate_count,
         "reverseBasisCount": reverse_basis_count,
         "fundingBlockedCount": funding_blocked_count,
+        "marketScanCount": len(market_snapshots),
+        "marketCandidateCount": market_candidate_count,
+        "marketReverseBasisCount": market_reverse_basis_count,
+        "marketFundingBlockedCount": market_funding_blocked_count,
+        "marketTopCandidates": market_top_candidates,
         "selectedWatchlistSymbol": selected_symbol,
         "allocatedSpotBudget": decimal_to_str(allocated_spot_budget),
         "allocatedSwapContracts": decimal_to_str(allocated_swap_contracts),
@@ -7429,8 +7651,11 @@ class AutomationEngine:
         broken_pairs = int(arb_runtime.get("brokenPair") or 0)
         reverse_basis_pairs = int(arb_runtime.get("reverseBasis") or 0)
         if is_basis_arb:
+            candidate_count = int(analysis.get("candidateCount") or 0)
+            market_candidate_count = int(analysis.get("marketCandidateCount") or 0)
             pipeline_summary = (
-                f"可做 {window_open} · "
+                f"可做 {candidate_count} · "
+                f"市场 {market_candidate_count} · "
                 f"对冲 {hedged_pairs} · "
                 f"回补 {exit_queue}"
             )
@@ -7445,7 +7670,8 @@ class AutomationEngine:
             mode_text = (
                 f"{analysis.get('selectedStrategyName', strategy_label(effective_automation.get('strategyPreset', 'basis_arb')))}"
                 f" · {len(watchlist_entries)} 币"
-                f" · 可做 {window_open}"
+                f" · 可做 {candidate_count}"
+                f" · 市场 {market_candidate_count}"
                 f" · 对冲 {hedged_pairs}"
                 f" · 回补 {exit_queue}"
             )
