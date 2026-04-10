@@ -85,7 +85,7 @@ const STRATEGY_PRESETS = {
       spotQuoteBudget: "0",
       spotMaxExposure: "0",
       swapEnabled: true,
-      swapContracts: "1",
+      swapContracts: "0",
       swapTdMode: "isolated",
       swapStrategyMode: "long_only",
       swapLeverage: "10",
@@ -249,7 +249,6 @@ const WATCHLIST_OVERRIDE_EDITOR_FIELDS = [
   { key: "pollSeconds", label: "轮询秒数", kind: "int", min: 1, step: 1 },
   { key: "cooldownSeconds", label: "冷却秒数", kind: "int", min: 0, step: 1 },
   { key: "maxOrdersPerDay", label: "每日订单上限", kind: "int", min: 0, step: 1 },
-  { key: "swapContracts", label: "永续张数", kind: "string-number", min: 0, step: 1 },
   { key: "swapLeverage", label: "永续杠杆", kind: "string-number", min: 1, max: 10, step: 1 },
   { key: "stopLossPct", label: "止损 (%)", kind: "string-number", min: 0, step: 0.1 },
   { key: "takeProfitPct", label: "止盈 (%)", kind: "string-number", min: 0, step: 0.1 },
@@ -295,7 +294,6 @@ function parseWatchlistOverridesValue(raw, watchlist = []) {
           "bar",
           "spotQuoteBudget",
           "spotMaxExposure",
-          "swapContracts",
           "swapTdMode",
           "swapStrategyMode",
           "swapLeverage",
@@ -495,7 +493,6 @@ function buildDraftExecutionTargets(config = collectAutomationConfig()) {
   const overrides = parseWatchlistOverridesValue(normalized.watchlistOverrides, watchlist);
   const spotBudgetAllocations = allocateWatchlistNumericField(watchlist, overrides, "spotQuoteBudget", normalized.spotQuoteBudget);
   const spotCapAllocations = allocateWatchlistNumericField(watchlist, overrides, "spotMaxExposure", normalized.spotMaxExposure);
-  const swapContractAllocations = allocateWatchlistNumericField(watchlist, overrides, "swapContracts", normalized.swapContracts);
   return watchlist.map((symbol, index) => {
     const override = overrides[symbol] || {};
     const target = {
@@ -513,7 +510,7 @@ function buildDraftExecutionTargets(config = collectAutomationConfig()) {
       target.spotMaxExposure = String(spotCapAllocations[symbol] ?? 0);
     }
     if (target.swapEnabled) {
-      target.swapContracts = String(swapContractAllocations[symbol] ?? 0);
+      target.swapContracts = "0";
     }
     return { ...target, ...override, watchlistOverride: override };
   });
@@ -540,7 +537,7 @@ function normalizeAutomationConfigForCompare(config = {}) {
     spotQuoteBudget: String(config.spotQuoteBudget ?? "100"),
     spotMaxExposure: String(config.spotMaxExposure ?? "300"),
     swapEnabled: Boolean(config.swapEnabled),
-    swapContracts: String(config.swapContracts ?? "1"),
+    swapContracts: "0",
     swapTdMode: String(config.swapTdMode || "cross"),
     swapStrategyMode: String(config.swapStrategyMode || "trend_follow"),
     swapLeverage: String(config.swapLeverage ?? "5"),
@@ -593,11 +590,10 @@ function buildDraftPortfolioEntries(config = collectAutomationConfig()) {
     const symbol = target.watchlistSymbol || target.spotInstId.split("-")[0];
     const perSpotBudget = Number(target.spotQuoteBudget || 0);
     const perSpotCap = Number(target.spotMaxExposure || 0);
-    const perSwapContracts = Number(target.swapContracts || 0);
     const overrideFields = Object.keys(target.watchlistOverride || {});
     const summaryDetail = [
       `${target.bar} · 趋势波段`,
-      `逐仓 ${target.swapLeverage}x · SL ${target.stopLossPct}% / TP ${target.takeProfitPct}%`,
+      `逐仓 ${target.swapLeverage}x · 动态仓位 · SL ${target.stopLossPct}% / TP ${target.takeProfitPct}%`,
       overrideFields.length ? `独立覆盖 ${overrideFields.length} 项` : "沿用组合参数",
     ].join(" · ");
     return {
@@ -606,7 +602,7 @@ function buildDraftPortfolioEntries(config = collectAutomationConfig()) {
       strategyPreset: target.strategyPreset || ONLY_STRATEGY_PRESET,
       spotBudget: String(target.spotQuoteBudget || "0"),
       spotMaxExposure: String(target.spotMaxExposure || "0"),
-      swapContracts: String(target.swapContracts || "0"),
+      swapContracts: "",
       swapLeverage: String(target.swapLeverage || "0"),
       swapTdMode: target.swapTdMode || "cross",
       swapStrategyMode: target.swapStrategyMode || "trend_follow",
@@ -637,7 +633,7 @@ function buildDraftPortfolioEntries(config = collectAutomationConfig()) {
       lastMessage: target.swapEnabled ? "保存并启动后开始独立永续决策" : "永续策略未启用",
       floatingPnl: "0",
       floatingPnlPct: "0",
-      riskLabel: `${formatMoney(perSwapContracts)} 张 · ${target.swapLeverage}x · ${target.swapTdMode === "isolated" ? "逐仓" : "全仓"}`,
+      riskLabel: `动态仓位 · ${target.swapLeverage}x · ${target.swapTdMode === "isolated" ? "逐仓" : "全仓"}`,
     },
     summary: {
       status: "待启动",
@@ -645,7 +641,7 @@ function buildDraftPortfolioEntries(config = collectAutomationConfig()) {
       exposureTotal: "0",
       floatingPnl: "0",
       floatingPnlPct: "0",
-      riskLabel: `现货 ${formatMoney(perSpotBudget)}U / ${formatMoney(perSpotCap)}U · 永续 ${formatMoney(perSwapContracts)} 张 · ${formatStrategyMode(target.swapStrategyMode)}`,
+      riskLabel: `现货 ${formatMoney(perSpotBudget)}U / ${formatMoney(perSpotCap)}U · 永续动态仓位 · ${formatStrategyMode(target.swapStrategyMode)}`,
     },
   };
   });
@@ -2846,7 +2842,7 @@ function collectAutomationConfig() {
     spotQuoteBudget: $("autoSpotQuoteBudget").value.trim(),
     spotMaxExposure: $("autoSpotMaxExposure").value.trim(),
     swapEnabled: $("autoSwapEnabled").checked,
-    swapContracts: $("autoSwapContracts").value.trim(),
+    swapContracts: "0",
     swapTdMode: $("autoSwapTdMode").value,
     swapStrategyMode: $("autoSwapStrategyMode").value,
     swapLeverage: $("autoSwapLeverage").value.trim(),
@@ -2927,7 +2923,6 @@ function fillAutomationForm(config) {
   $("autoSpotQuoteBudget").value = "0";
   $("autoSpotMaxExposure").value = "0";
   $("autoSwapEnabled").checked = true;
-  $("autoSwapContracts").value = config.swapContracts ?? "1";
   $("autoSwapTdMode").value = "isolated";
   $("autoSwapStrategyMode").value = "long_only";
   $("autoSwapLeverage").value = config.swapLeverage ?? "10";
@@ -3162,7 +3157,7 @@ function buildOrderMarginContext(order) {
   return {
     modeLabel: tdModeLabel,
     marginText: margin > 0 ? formatMoney(margin) : "--",
-    marginScopeText: margin > 0 ? "按成交均价、张数、合约面值、杠杆估算" : "当前字段不足，无法估算保证金",
+    marginScopeText: margin > 0 ? "按成交均价、成交数量、合约面值、杠杆估算" : "当前字段不足，无法估算保证金",
     notionalText: notional > 0 ? formatMoney(notional) : "--",
     notionalScopeText: "按成交均价估算名义仓位",
     contractValueText,
@@ -5077,7 +5072,7 @@ function renderPortfolioWatchlist(entries = []) {
           <div>
             <b>独立风控</b>
             <span>${summary.riskLabel || "等待风控拆分"}</span>
-            <small>${entry.overrideActive ? `当前币已单独覆盖 ${((entry.allocation?.overrideKeys || []).length || 0)} 项参数` : "现货与永续各自按预算、上限、张数和杠杆拆分"}</small>
+            <small>${entry.overrideActive ? `当前币已单独覆盖 ${((entry.allocation?.overrideKeys || []).length || 0)} 项参数` : "现货按预算拆分，永续按动态仓位与杠杆执行"}</small>
           </div>
           <div>
             <b>独立仓位摘要</b>
@@ -6013,7 +6008,6 @@ async function boot() {
     "autoSpotQuoteBudget",
     "autoSpotMaxExposure",
     "autoSwapEnabled",
-    "autoSwapContracts",
     "autoSwapTdMode",
     "autoSwapStrategyMode",
     "autoSwapLeverage",

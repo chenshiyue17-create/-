@@ -1063,7 +1063,7 @@ def default_automation_config() -> dict[str, Any]:
         "spotQuoteBudget": "0",
         "spotMaxExposure": "0",
         "swapEnabled": True,
-        "swapContracts": "1",
+        "swapContracts": "0",
         "swapTdMode": "isolated",
         "swapLeverage": "10",
         "swapStrategyMode": "long_only",
@@ -1488,10 +1488,8 @@ def build_execution_targets(config: dict[str, Any]) -> list[dict[str, Any]]:
     overrides = copy.deepcopy(config.get("watchlistOverrides") or {})
     spot_budget = safe_decimal(config.get("spotQuoteBudget"), "0")
     spot_exposure = safe_decimal(config.get("spotMaxExposure"), "0")
-    swap_contracts = safe_decimal(config.get("swapContracts"), "0")
     spot_budget_allocations = allocate_watchlist_numeric_field(symbols, overrides, "spotQuoteBudget", spot_budget)
     spot_exposure_allocations = allocate_watchlist_numeric_field(symbols, overrides, "spotMaxExposure", spot_exposure)
-    swap_contract_allocations = allocate_watchlist_numeric_field(symbols, overrides, "swapContracts", swap_contracts)
     targets: list[dict[str, Any]] = []
 
     for index, symbol in enumerate(symbols):
@@ -1506,11 +1504,13 @@ def build_execution_targets(config: dict[str, Any]) -> list[dict[str, Any]]:
         if pair_config.get("spotEnabled"):
             pair_config["spotQuoteBudget"] = decimal_to_str(spot_budget_allocations.get(symbol, Decimal("0")))
             pair_config["spotMaxExposure"] = decimal_to_str(spot_exposure_allocations.get(symbol, Decimal("0")))
-        if pair_config.get("swapEnabled"):
-            pair_config["swapContracts"] = decimal_to_str(swap_contract_allocations.get(symbol, Decimal("0")))
+        if pair_config.get("swapEnabled") and str(pair_config.get("strategyPreset") or "") == "dip_swing":
+            pair_config["swapContracts"] = "0"
         symbol_override = copy.deepcopy(overrides.get(symbol) or {})
         if symbol_override:
             pair_config = deep_merge(pair_config, symbol_override)
+            if str(pair_config.get("strategyPreset") or "") == "dip_swing":
+                pair_config["swapContracts"] = "0"
         pair_config["watchlistOverride"] = symbol_override
         targets.append(pair_config)
 
@@ -1704,16 +1704,16 @@ def build_market_risk_label(target: dict[str, Any], market_kind: str) -> str:
         return (
             f"回撤 ≥ {format_decimal(DIP_SWING_PULLBACK_PCT, 1)}% · 反弹 ≥ {format_decimal(DIP_SWING_REBOUND_PCT, 2)}% · "
             f"TP {format_decimal(safe_decimal(target.get('takeProfitPct'), '8'), 1)}% · "
-            f"缓冲 ≥ {format_decimal(DIP_SWING_MIN_LIQ_BUFFER_PCT, 0)}%"
+            f"缓冲 ≥ {format_decimal(DIP_SWING_MIN_LIQ_BUFFER_PCT, 0)}% · "
+            f"动态仓位 · {format_decimal(safe_decimal(target.get('swapLeverage'), '10'), 0)}x 逐仓"
         )
     if market_kind == "spot":
         budget = safe_decimal(target.get("spotQuoteBudget"), "0")
         cap = safe_decimal(target.get("spotMaxExposure"), "0")
         return f"单次 {format_decimal(budget, 2)}U · 上限 {format_decimal(cap, 2)}U"
     leverage = safe_decimal(target.get("swapLeverage"), "0")
-    contracts = safe_decimal(target.get("swapContracts"), "0")
     td_mode = "逐仓" if str(target.get("swapTdMode") or "").strip() == "isolated" else "全仓"
-    return f"{format_decimal(contracts, 2)} 张 · {format_decimal(leverage, 0)}x · {td_mode}"
+    return f"动态仓位 · {format_decimal(leverage, 0)}x · {td_mode}"
 
 
 def apply_target_market_allocation(
@@ -1735,7 +1735,7 @@ def apply_target_market_allocation(
 
     patched.update(
         {
-            "riskBudget": decimal_to_str(safe_decimal(target.get("swapContracts"), "0")),
+            "riskBudget": "" if str(target.get("strategyPreset") or "") == "dip_swing" else decimal_to_str(safe_decimal(target.get("swapContracts"), "0")),
             "riskCap": decimal_to_str(safe_decimal(target.get("swapLeverage"), "0")),
             "riskMode": "basis_arb" if str(target.get("strategyPreset") or "") == "basis_arb" else str(target.get("swapTdMode") or "cross"),
             "riskLabel": build_market_risk_label(target, "swap"),
@@ -1831,7 +1831,7 @@ def build_watchlist_entry(
             "strategyPreset": str(target.get("strategyPreset") or "dual_engine"),
             "spotBudget": decimal_to_str(safe_decimal(target.get("spotQuoteBudget"), "0")),
             "spotMaxExposure": decimal_to_str(safe_decimal(target.get("spotMaxExposure"), "0")),
-            "swapContracts": decimal_to_str(safe_decimal(target.get("swapContracts"), "0")),
+            "swapContracts": "" if str(target.get("strategyPreset") or "") == "dip_swing" else decimal_to_str(safe_decimal(target.get("swapContracts"), "0")),
             "swapLeverage": decimal_to_str(safe_decimal(target.get("swapLeverage"), "0")),
             "swapTdMode": str(target.get("swapTdMode") or "cross"),
             "swapStrategyMode": str(target.get("swapStrategyMode") or "trend_follow"),
@@ -6518,7 +6518,6 @@ def build_basis_arb_analysis(
         },
     )
     allocated_spot_budget = safe_decimal(selected_target.get("spotQuoteBudget"), "0")
-    allocated_swap_contracts = safe_decimal(selected_target.get("swapContracts"), "0")
 
     detail_jobs: dict[str, Any] = {
         "markPrice": lambda: extract_first_row(client.get_mark_price("SWAP", selected_target["swapInstId"])),
@@ -6587,13 +6586,8 @@ def build_basis_arb_analysis(
         warnings.append(f"当前有 {funding_blocked_count} 币资金费未对齐")
     if watchlist_count > 1:
         warnings.append(
-            f"当前 {watchlist_count} 币并行，当前优先币 {selected_symbol} 分到约 {decimal_to_str(allocated_spot_budget)}U 现货预算 / "
-            f"{decimal_to_str(allocated_swap_contracts)} 张永续"
+            f"当前 {watchlist_count} 币并行，当前优先币 {selected_symbol} 分到约 {decimal_to_str(allocated_spot_budget)}U 现货预算，永续按动态仓位执行"
         )
-        if allocated_swap_contracts < Decimal("1"):
-            warnings.append(
-                f"当前币永续只分到 {decimal_to_str(allocated_swap_contracts)} 张，触发时可能因最小张数或步长被挡住"
-            )
     if market_candidate_count == 0:
         warnings.append(f"扩展市场已扫 {len(market_snapshots)} 币，当前也没有正基差候选")
     elif outside_watchlist_candidates:
@@ -6696,7 +6690,7 @@ def build_basis_arb_analysis(
         "marketTopCandidates": market_top_candidates,
         "selectedWatchlistSymbol": selected_symbol,
         "allocatedSpotBudget": decimal_to_str(allocated_spot_budget),
-        "allocatedSwapContracts": decimal_to_str(allocated_swap_contracts),
+        "allocatedSwapContracts": "",
         "openInterest": str(
             fetched["openInterest"].get("oiUsd")
             or fetched["openInterest"].get("oi")
@@ -6880,11 +6874,11 @@ def build_dip_swing_analysis(
     if target_multiple > Decimal("1"):
         if int(ability_snapshot.get("closeOrders") or 0) <= 0:
             warnings.append(
-                f"100x 是项目目标，不会直接放大张数；当前还没拿到足够的平仓样本，先按 {ability_snapshot.get('phaseLabel', '守仓')} 仓位执行"
+                f"100x 是项目目标，不会直接放大仓位；当前还没拿到足够的平仓样本，先按 {ability_snapshot.get('phaseLabel', '守仓')} 仓位执行"
             )
         else:
             warnings.append(
-                f"100x 是项目目标，不会直接放大张数；当前按真实能力 {ability_snapshot.get('phaseLabel', '守仓')} 执行"
+                f"100x 是项目目标，不会直接放大仓位；当前按真实能力 {ability_snapshot.get('phaseLabel', '守仓')} 执行"
                 f" · 近场净收益 {format_decimal(safe_decimal(ability_snapshot.get('netPnl'), '0'), 2)}U"
                 f" · 平仓胜率 {compact_metric(ability_snapshot.get('closeWinRatePct'), '0.1')}%"
             )
@@ -8502,9 +8496,8 @@ class AutomationEngine:
         leverage: Decimal,
         entry_score: int = 0,
     ) -> dict[str, Any]:
-        base_contracts = safe_decimal(automation.get("swapContracts"), "0")
-        rounded_base = round_down(base_contracts, lot_size)
-        if rounded_base <= 0:
+        minimum_contracts = round_down(lot_size, lot_size) if lot_size > 0 else Decimal("0")
+        if minimum_contracts <= 0:
             return {
                 "plannedContracts": Decimal("0"),
                 "baseContracts": Decimal("0"),
@@ -8538,11 +8531,22 @@ class AutomationEngine:
             or last_price <= 0
             or contract_value <= 0
         ):
+            contract_margin = (last_price * contract_value) / leverage if leverage > 0 and last_price > 0 and contract_value > 0 else Decimal("0")
+            planned_contracts = Decimal("0")
+            margin_budget = Decimal("0")
+            margin_usage_pct = Decimal("0")
+            if current_eq > 0 and contract_margin > 0:
+                fixed_margin_ratio = DIP_SWING_TARGET_MIN_MARGIN_RATIO
+                planned_contracts = round_down((current_eq * fixed_margin_ratio) / contract_margin, lot_size)
+                if planned_contracts < minimum_contracts:
+                    planned_contracts = Decimal("0")
+                margin_budget = contract_margin * planned_contracts if planned_contracts > 0 else Decimal("0")
+                margin_usage_pct = ((margin_budget / current_eq) * Decimal("100")) if current_eq > 0 and margin_budget > 0 else Decimal("0")
             return {
-                "plannedContracts": rounded_base,
-                "baseContracts": rounded_base,
-                "marginBudget": Decimal("0"),
-                "marginUsagePct": Decimal("0"),
+                "plannedContracts": planned_contracts,
+                "baseContracts": Decimal("0"),
+                "marginBudget": margin_budget,
+                "marginUsagePct": margin_usage_pct,
                 "phase": "fixed",
                 "phaseLabel": target_execution_phase_label("fixed"),
                 "progressPct": progress_pct,
@@ -8582,16 +8586,21 @@ class AutomationEngine:
         )
         contract_margin = (last_price * contract_value) / leverage
         if contract_margin <= 0:
-            budget_contracts = rounded_base
+            budget_contracts = Decimal("0")
         else:
             budget_contracts = round_down((current_eq * margin_ratio) / contract_margin, lot_size)
         scaled_budget_contracts = round_down(budget_contracts * max(Decimal("0.25"), phase_scale), lot_size)
-        planned_contracts = rounded_base if phase == "protect" else max(rounded_base, scaled_budget_contracts)
+        if phase == "protect":
+            planned_contracts = budget_contracts
+        else:
+            planned_contracts = scaled_budget_contracts
+        if planned_contracts < minimum_contracts:
+            planned_contracts = Decimal("0")
         margin_budget = contract_margin * planned_contracts if contract_margin > 0 else Decimal("0")
         margin_usage_pct = ((margin_budget / current_eq) * Decimal("100")) if current_eq > 0 else Decimal("0")
         return {
             "plannedContracts": planned_contracts,
-            "baseContracts": rounded_base,
+            "baseContracts": Decimal("0"),
             "marginBudget": margin_budget,
             "marginUsagePct": margin_usage_pct,
             "phase": phase,
@@ -9751,7 +9760,7 @@ class AutomationEngine:
                 f" / 能力 {target_plan.get('phaseLabel', target_execution_phase_label(target_plan.get('phase', 'fixed')))}"
                 f" / {ability_text}"
                 f" / 保证金 {format_decimal(safe_decimal(target_plan.get('marginBudget'), '0'), 2)}U"
-                f" / 计划 {decimal_to_str(planned_trade_contracts)} 张"
+                f" / 动态仓位 {decimal_to_str(planned_trade_contracts)} 张"
             )
         self._set_market(
             market_key,
@@ -9768,7 +9777,7 @@ class AutomationEngine:
                 "floatingPnl": decimal_to_str(floating_pnl),
                 "floatingPnlPct": decimal_to_str(floating_pnl_pct),
                 "pnlSource": "逐仓永续未实现盈亏",
-                "riskBudget": decimal_to_str(planned_trade_contracts),
+                "riskBudget": "",
                 "riskCap": decimal_to_str(safe_decimal(automation.get("swapLeverage"), "0")),
                 "riskMode": str(automation.get("swapTdMode") or "isolated"),
                 "riskLabel": build_market_risk_label(automation, "swap"),
@@ -9861,7 +9870,7 @@ class AutomationEngine:
 
         trade_contracts = planned_trade_contracts
         if trade_contracts <= 0:
-            self._set_market(market_key, {"lastMessage": "永续张数为 0，已停止发单"})
+            self._set_market(market_key, {"lastMessage": "当前保证金预算不足以触发最小下单单位，继续观察"})
             return
         if signal["signal"] not in {"pullback_buy", "bull_cross_buy"}:
             if signal["trend"] != "up":
@@ -9898,7 +9907,7 @@ class AutomationEngine:
             "buy",
             trade_contracts,
             automation["swapTdMode"],
-            f"波段开多 · {target_plan.get('phaseLabel', target_execution_phase_label(target_plan.get('phase', 'fixed')))} · {decimal_to_str(trade_contracts)} 张",
+            f"波段开多 · {target_plan.get('phaseLabel', target_execution_phase_label(target_plan.get('phase', 'fixed')))} · 动态仓位 {decimal_to_str(trade_contracts)} 张",
             market_key=market_key,
         )
 
