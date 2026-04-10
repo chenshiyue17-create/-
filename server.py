@@ -126,6 +126,9 @@ DIP_SWING_MIN_ATR_COST_RATIO = Decimal("1.4")
 DIP_SWING_MIN_AVG_QUOTE_VOLUME_USD = Decimal("3000000")
 DIP_SWING_MIN_OPEN_INTEREST_USD = Decimal("6000000")
 DIP_SWING_MIN_PROTECTIVE_EXIT_PCT = Decimal("0.28")
+DIP_SWING_ORDER_PRESSURE_WINDOW_MINUTES = 240
+DIP_SWING_MAX_OPEN_CLOSE_GAP = 4
+DIP_SWING_MAX_CONSECUTIVE_OPEN_STREAK = 3
 DIP_SWING_HARD_BREAK_LOSS_PCT = Decimal("0.45")
 DIP_SWING_ENTRY_ORDER_MAX_AGE_SECONDS = 75
 DIP_SWING_POST_ONLY_BUFFER_PCT = Decimal("0.02")
@@ -2614,6 +2617,7 @@ def build_execution_journal_insight(orders: list[dict[str, Any]], summary: dict[
     open_count = len(filled) - close_count
     realized_value = safe_decimal((summary or {}).get("realizedPnl"), "0")
     fee_value = safe_decimal((summary or {}).get("totalFees"), "0")
+    net_value = safe_decimal((summary or {}).get("netPnl"), decimal_to_str(realized_value + fee_value))
     if close_count <= 0 and open_count > 0:
         message = f"当前这批单全是开仓，还没看到平仓回报，所以已实现收益还是 0。"
         if fee_value != 0:
@@ -2624,10 +2628,98 @@ def build_execution_journal_insight(orders: list[dict[str, Any]], summary: dict[
         if fee_value != 0:
             message += f" 当前已累计手续费 {format_decimal(fee_value, 4)} USDT。"
         return message
+    if close_count > 0 and realized_value > 0 and net_value < 0:
+        return (
+            f"当前已实现盈利 {format_decimal(realized_value, 4)} USDT，"
+            f"但手续费 {format_decimal(fee_value, 4)} USDT 已把净结果压到 {format_decimal(net_value, 4)} USDT。"
+        )
     if realized_value != 0:
         direction = "盈利" if realized_value > 0 else "亏损"
         return f"当前已实现{direction} {format_decimal(realized_value, 4)} USDT。"
     return ""
+
+
+def order_event_timestamp_ms(order: dict[str, Any]) -> int:
+    for key in ("uTime", "fillTime", "cTime"):
+        raw = order.get(key)
+        try:
+            value = int(str(raw or "0").strip() or "0")
+        except (TypeError, ValueError):
+            value = 0
+        if value > 0:
+            return value
+    return 0
+
+
+def build_execution_symbol_pressure_snapshot(
+    inst_id: str,
+    *,
+    journal: dict[str, Any] | None = None,
+    limit: int = 120,
+    window_minutes: int = DIP_SWING_ORDER_PRESSURE_WINDOW_MINUTES,
+) -> dict[str, Any]:
+    journal_snapshot = journal if journal is not None else get_execution_journal_snapshot(limit=limit)
+    orders = [normalize_execution_order(item) for item in (journal_snapshot.get("orders") or [])]
+    if not inst_id:
+        return {
+            "instId": "",
+            "windowMinutes": int(window_minutes),
+            "filledOrders": 0,
+            "openOrders": 0,
+            "closeOrders": 0,
+            "openCloseGap": 0,
+            "consecutiveOpenStreak": 0,
+            "recentRealizedPnl": Decimal("0"),
+            "recentTotalFees": Decimal("0"),
+            "recentNetPnl": Decimal("0"),
+        }
+    cutoff_ms = 0
+    if window_minutes > 0:
+        cutoff_ms = int((time.time() - (window_minutes * 60)) * 1000)
+    filtered: list[dict[str, Any]] = []
+    broader: list[dict[str, Any]] = []
+    for item in orders:
+        if str(item.get("instId") or "") != str(inst_id):
+            continue
+        if classify_execution_order_state(item) != "filled":
+            continue
+        broader.append(item)
+        if cutoff_ms > 0 and order_event_timestamp_ms(item) < cutoff_ms:
+            continue
+        filtered.append(item)
+    if len(filtered) < 8 and broader:
+        filtered = list(broader)
+    filtered.sort(key=order_event_timestamp_ms, reverse=True)
+    open_orders = 0
+    close_orders = 0
+    recent_realized = Decimal("0")
+    recent_fees = Decimal("0")
+    for item in filtered:
+        close_like = is_close_like_execution_order(item)
+        if close_like:
+            close_orders += 1
+        else:
+            open_orders += 1
+        recent_realized += order_realized_pnl(item)
+        recent_fees += order_total_fee(item)
+    consecutive_open_streak = 0
+    for item in filtered:
+        close_like = is_close_like_execution_order(item)
+        if close_like:
+            break
+        consecutive_open_streak += 1
+    return {
+        "instId": str(inst_id),
+        "windowMinutes": int(window_minutes),
+        "filledOrders": len(filtered),
+        "openOrders": open_orders,
+        "closeOrders": close_orders,
+        "openCloseGap": max(0, open_orders - close_orders),
+        "consecutiveOpenStreak": consecutive_open_streak,
+        "recentRealizedPnl": recent_realized,
+        "recentTotalFees": recent_fees,
+        "recentNetPnl": recent_realized + recent_fees,
+    }
 
 
 def backfill_paper_execution_metrics(orders: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -10144,6 +10236,7 @@ class AutomationEngine:
             position_side = "short"
         pending_entry_orders = self._working_swap_orders(inst_id, side="buy", reduce_only=False)
         pending_exit_orders = self._working_swap_orders(inst_id, side="sell", reduce_only=True)
+        symbol_pressure = build_execution_symbol_pressure_snapshot(inst_id, limit=160)
         floating_pnl = safe_decimal(open_position.get("upl"), "0")
         floating_pnl_pct = Decimal("0")
         if entry_price > 0 and last_price > 0 and position_side == "long":
@@ -10156,7 +10249,8 @@ class AutomationEngine:
             f"净优势 {compact_metric(net_edge_pct, '0.01')}% / "
             f"优势/成本 {compact_metric(edge_cost_ratio, '0.01')}x / "
             f"ATR/成本 {compact_metric(atr_cost_ratio, '0.01')}x / "
-            f"成交额 {format_decimal(avg_quote_volume_usd, 0)}U"
+            f"成交额 {format_decimal(avg_quote_volume_usd, 0)}U / "
+            f"开平差 {symbol_pressure['openCloseGap']} / 连开 {symbol_pressure['consecutiveOpenStreak']}"
         )
         if liq_buffer > 0:
             status_text += f" / 强平缓冲 {compact_metric(liq_buffer, '0.1')}%"
@@ -10377,6 +10471,28 @@ class AutomationEngine:
         cooldown_ready, reason = self._cooldown_ready(market_key, int(automation["cooldownSeconds"]))
         if not cooldown_ready:
             self._set_market(market_key, {"lastMessage": f"波段买点出现，但{reason}"})
+            return
+        if int(symbol_pressure.get("consecutiveOpenStreak") or 0) >= DIP_SWING_MAX_CONSECUTIVE_OPEN_STREAK:
+            self._set_market(
+                market_key,
+                {
+                    "lastMessage": (
+                        f"近 {symbol_pressure['windowMinutes']} 分钟已经连续开仓 {symbol_pressure['consecutiveOpenStreak']} 笔"
+                        f"，先等平仓闭环，避免继续被手续费磨损 · {status_text}"
+                    )
+                },
+            )
+            return
+        if int(symbol_pressure.get("openCloseGap") or 0) >= DIP_SWING_MAX_OPEN_CLOSE_GAP:
+            self._set_market(
+                market_key,
+                {
+                    "lastMessage": (
+                        f"近 {symbol_pressure['windowMinutes']} 分钟开仓 {symbol_pressure['openOrders']} / 平仓 {symbol_pressure['closeOrders']}"
+                        f"，结构失衡，先停止继续加仓 · {status_text}"
+                    )
+                },
+            )
             return
         self._place_swap_order(
             client,

@@ -3939,11 +3939,15 @@ function buildOrderJournalInsight(journal, orders) {
   const openCount = filled.length - closeCount;
   const realized = Number(journal?.realizedPnl ?? 0);
   const totalFees = Number(journal?.totalFees ?? 0);
+  const net = Number(journal?.netPnl ?? realized + totalFees);
   if (closeCount === 0 && openCount > 0) {
     return `当前这批单全是开仓，还没看到平仓回报，所以已实现收益还是 0。${totalFees ? ` 当前已累计手续费 ${formatSignedMoney(totalFees)} USDT。` : ""}`;
   }
   if (closeCount > 0 && realized === 0) {
     return `这批单里已经有 ${closeCount} 笔平仓，但还没拿到明确的已实现收益字段。${totalFees ? ` 当前已累计手续费 ${formatSignedMoney(totalFees)} USDT。` : ""}`;
+  }
+  if (closeCount > 0 && realized > 0 && net < 0) {
+    return `当前已实现盈利 ${formatSignedMoney(realized)} USDT，但手续费 ${formatSignedMoney(totalFees)} USDT 已把净结果压到 ${formatSignedMoney(net)} USDT。`;
   }
   if (realized !== 0) {
     return `当前已实现${realized > 0 ? "盈利" : "亏损"} ${formatSignedMoney(realized)} USDT。`;
@@ -4565,7 +4569,7 @@ function renderOrderDetail(order, meta = {}) {
       <div><b>订单号</b><span>${escapeHtml(order.ordId || "--")}</span></div>
       <div><b>Client ID</b><span>${escapeHtml(order.clOrdId || "--")}</span></div>
       <div><b>最近更新时间</b><span>${updatedAtHtml}</span></div>
-      <div><b>手续费</b><span>${escapeHtml(formatOrderValue(order.fee))}</span></div>
+      <div><b>手续费</b><span>${escapeHtml(formatOrderValue(order.fillFee ?? order.fee))}</span></div>
       <div><b>订单标签</b><span>${escapeHtml(order.tag || "--")}</span></div>
       <div><b>执行归因</b><span>${escapeHtml(strategyAttribution)}</span></div>
       <div><b>仅减仓</b><span>${order.reduceOnly ? "是" : "否"}</span></div>
