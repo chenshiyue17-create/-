@@ -107,6 +107,8 @@ DIP_SWING_SCAN_SYMBOL_LIMIT = 24
 DIP_SWING_SCAN_LOCK = threading.RLock()
 DIP_SWING_MARKET_UNIVERSE_CACHE: dict[str, Any] = {"ts": 0.0, "symbols": []}
 DIP_SWING_MARKET_SCAN_CACHE: dict[str, Any] = {"ts": 0.0, "key": "", "rows": []}
+OKX_FEE_RATE_CACHE_LOCK = threading.RLock()
+OKX_FEE_RATE_CACHE: dict[str, Any] = {}
 REMOTE_AUTOMATION_CONFIG_LOCK = threading.RLock()
 REMOTE_AUTOMATION_CONFIG_CACHE: dict[str, Any] = {"ts": 0.0, "url": "", "config": {}}
 ONLY_STRATEGY_PRESET = "dip_swing"
@@ -122,7 +124,7 @@ DIP_SWING_MAX_CHASE_PCT = Decimal("0.18")
 DIP_SWING_MIN_ENTRY_SCORE = 5
 DIP_SWING_MIN_EXIT_SCORE = 4
 DIP_SWING_HARD_EXIT_SCORE = 5
-DIP_SWING_EST_ROUNDTRIP_COST_PCT = Decimal("0.16")
+DIP_SWING_EST_ROUNDTRIP_COST_PCT = Decimal("0.09")
 DIP_SWING_MIN_NET_EDGE_PCT = Decimal("0.08")
 DIP_SWING_MIN_EDGE_COST_RATIO = Decimal("1.9")
 DIP_SWING_MIN_RANGE_COST_RATIO = Decimal("3.0")
@@ -135,11 +137,17 @@ DIP_SWING_MAX_OPEN_CLOSE_GAP = 4
 DIP_SWING_MAX_CONSECUTIVE_OPEN_STREAK = 3
 DIP_SWING_HARD_BREAK_LOSS_PCT = Decimal("0.45")
 DIP_SWING_ENTRY_ORDER_MAX_AGE_SECONDS = 75
+DIP_SWING_EXIT_ORDER_MAX_AGE_SECONDS = 45
 DIP_SWING_POST_ONLY_BUFFER_PCT = Decimal("0.02")
+DIP_SWING_EXIT_POST_ONLY_BUFFER_PCT = Decimal("0.02")
+DIP_SWING_EXIT_PROTECTION_PCT = Decimal("0.08")
 DIP_SWING_TARGET_MIN_MARGIN_RATIO = Decimal("0.003")
 DIP_SWING_TARGET_MAX_MARGIN_RATIO = Decimal("0.012")
 DIP_SWING_MIN_LIQ_BUFFER_PCT = Decimal("18")
 DIP_SWING_MAX_LEVERAGE = Decimal("10")
+OKX_DEFAULT_SWAP_MAKER_FEE_PCT = Decimal("0.02")
+OKX_DEFAULT_SWAP_TAKER_FEE_PCT = Decimal("0.05")
+OKX_DEFAULT_PASSIVE_EXIT_WEIGHT = Decimal("0.70")
 PAPER_SPOT_FEE_RATE = Decimal("0.001")
 PAPER_SWAP_FEE_RATE = Decimal("0.0005")
 
@@ -3898,6 +3906,20 @@ class OkxClient:
                 return {"code": "0", "data": [{"ccy": ccy or "USDT", "totalBal": "0", "ts": str(int(time.time() * 1000))}], "_paperSim": True}
             raise
 
+    def get_trade_fee(
+        self,
+        inst_type: str,
+        *,
+        inst_family: str | None = None,
+        inst_id: str | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"instType": inst_type}
+        if inst_family:
+            params["instFamily"] = inst_family
+        elif inst_id:
+            params["instId"] = inst_id
+        return self._request("GET", "/api/v5/account/trade-fee", params=params)
+
     def get_positions(self, inst_id: str | None = None) -> dict[str, Any]:
         params = {"instId": inst_id} if inst_id else None
         if self._paper_state_authoritative():
@@ -6154,7 +6176,8 @@ def build_dip_swing_adaptive_thresholds(
     atr_pct = average_true_range_pct(candles)
     rebound_lookback_bars = dip_swing_rebound_lookback_bars(fast)
     micro_range_pct = recent_range_pct(candles, window=rebound_lookback_bars)
-    estimated_cost_pct = DIP_SWING_EST_ROUNDTRIP_COST_PCT + min(Decimal("0.12"), volatility_pct * Decimal("0.04"))
+    cost_snapshot = estimate_dip_swing_cost_snapshot(volatility_pct)
+    estimated_cost_pct = safe_decimal(cost_snapshot.get("estimatedCostPct"), decimal_to_str(DIP_SWING_EST_ROUNDTRIP_COST_PCT))
     pullback_threshold_pct = clamp_decimal(
         max(
             estimated_cost_pct * Decimal("2.8"),
@@ -6224,6 +6247,50 @@ def average_quote_volume_usd(candles: list[dict[str, Any]], window: int = 12) ->
     return sum(positive_notionals, Decimal("0")) / Decimal(len(positive_notionals))
 
 
+def normalize_fee_rate_pct(raw: Any, fallback_pct: Decimal) -> Decimal:
+    value = safe_decimal(raw, "0")
+    if value <= 0:
+        return fallback_pct
+    if value < Decimal("1"):
+        return value * Decimal("100")
+    return value
+
+
+def estimate_dip_swing_cost_snapshot(
+    volatility_pct: Decimal,
+    *,
+    funding_rate_pct: Decimal = Decimal("0"),
+    maker_fee_pct: Decimal = OKX_DEFAULT_SWAP_MAKER_FEE_PCT,
+    taker_fee_pct: Decimal = OKX_DEFAULT_SWAP_TAKER_FEE_PCT,
+    passive_exit_weight: Decimal = OKX_DEFAULT_PASSIVE_EXIT_WEIGHT,
+) -> dict[str, Decimal]:
+    maker_fee_pct = max(Decimal("0"), maker_fee_pct)
+    taker_fee_pct = max(maker_fee_pct, taker_fee_pct)
+    passive_exit_weight = clamp_decimal(passive_exit_weight, Decimal("0"), Decimal("1"))
+    blended_exit_fee_pct = (
+        maker_fee_pct * passive_exit_weight
+        + taker_fee_pct * (Decimal("1") - passive_exit_weight)
+    )
+    slippage_pct = min(Decimal("0.08"), max(Decimal("0"), volatility_pct) * Decimal("0.025"))
+    funding_drag_pct = max(Decimal("0"), funding_rate_pct) * Decimal("0.35")
+    roundtrip_fee_pct = maker_fee_pct + blended_exit_fee_pct
+    estimated_cost_pct = roundtrip_fee_pct + slippage_pct + funding_drag_pct
+    protective_exit_floor_pct = max(
+        DIP_SWING_MIN_PROTECTIVE_EXIT_PCT,
+        roundtrip_fee_pct + (slippage_pct * Decimal("0.75")),
+    )
+    return {
+        "makerFeePct": maker_fee_pct,
+        "takerFeePct": taker_fee_pct,
+        "blendedExitFeePct": blended_exit_fee_pct,
+        "roundtripFeePct": roundtrip_fee_pct,
+        "slippagePct": slippage_pct,
+        "fundingDragPct": funding_drag_pct,
+        "estimatedCostPct": estimated_cost_pct,
+        "protectiveExitFloorPct": protective_exit_floor_pct,
+    }
+
+
 def runtime_research_options(automation: dict[str, Any]) -> dict[str, Any]:
     slow = max(int(automation.get("slowEma", 21) or 21), 8)
     return {
@@ -6274,6 +6341,53 @@ def normalized_open_interest_usd(
     if oi_ccy > 0 and last_price > 0:
         return oi_ccy * last_price
     return Decimal("0")
+
+
+def swap_inst_family(inst_id: str, meta: dict[str, Any] | None = None) -> str:
+    if isinstance(meta, dict):
+        family = str(meta.get("instFamily") or "").strip()
+        if family:
+            return family
+    inst = str(inst_id or "").strip()
+    return inst[:-5] if inst.endswith("-SWAP") else inst
+
+
+def cache_okx_swap_fee_rates(
+    client: "OkxClient",
+    inst_id: str,
+    *,
+    meta: dict[str, Any] | None = None,
+    ttl_seconds: float = 600.0,
+) -> dict[str, Decimal]:
+    family = swap_inst_family(inst_id, meta)
+    cache_key = f"{client.base_url}|{1 if client.simulated else 0}|{str(client.api_key or '')}|{family}"
+    now = time.time()
+    with OKX_FEE_RATE_CACHE_LOCK:
+        cached = OKX_FEE_RATE_CACHE.get(cache_key) or {}
+        if cached and now - float(cached.get("ts") or 0.0) < ttl_seconds:
+            return {
+                "makerFeePct": safe_decimal(cached.get("makerFeePct"), decimal_to_str(OKX_DEFAULT_SWAP_MAKER_FEE_PCT)),
+                "takerFeePct": safe_decimal(cached.get("takerFeePct"), decimal_to_str(OKX_DEFAULT_SWAP_TAKER_FEE_PCT)),
+            }
+
+    maker_fee_pct = OKX_DEFAULT_SWAP_MAKER_FEE_PCT
+    taker_fee_pct = OKX_DEFAULT_SWAP_TAKER_FEE_PCT
+    try:
+        response = client.get_trade_fee("SWAP", inst_family=family)
+        row = extract_first_row(response)
+        maker_fee_pct = normalize_fee_rate_pct(row.get("maker"), maker_fee_pct)
+        taker_fee_pct = normalize_fee_rate_pct(row.get("taker"), taker_fee_pct)
+    except Exception:
+        pass
+
+    payload = {
+        "ts": now,
+        "makerFeePct": decimal_to_str(maker_fee_pct),
+        "takerFeePct": decimal_to_str(taker_fee_pct),
+    }
+    with OKX_FEE_RATE_CACHE_LOCK:
+        OKX_FEE_RATE_CACHE[cache_key] = payload
+    return {"makerFeePct": maker_fee_pct, "takerFeePct": taker_fee_pct}
 
 
 def build_dip_swing_factor_bundle(
@@ -7242,6 +7356,23 @@ def build_dip_swing_analysis(
     selected_config["watchlistOverrides"] = {}
     selected_config["spotInstId"] = selected_target.get("spotInstId")
     selected_config["swapInstId"] = selected_target.get("swapInstId")
+    live_fee_rates = cache_okx_swap_fee_rates(client, str(selected_target.get("swapInstId") or ""))
+    maker_fee_pct = safe_decimal(live_fee_rates.get("makerFeePct"), decimal_to_str(OKX_DEFAULT_SWAP_MAKER_FEE_PCT))
+    taker_fee_pct = safe_decimal(live_fee_rates.get("takerFeePct"), decimal_to_str(OKX_DEFAULT_SWAP_TAKER_FEE_PCT))
+    live_cost_snapshot = estimate_dip_swing_cost_snapshot(
+        volatility_pct,
+        funding_rate_pct=max(Decimal("0"), funding_rate_pct),
+        maker_fee_pct=maker_fee_pct,
+        taker_fee_pct=taker_fee_pct,
+    )
+    estimated_cost_pct = safe_decimal(live_cost_snapshot.get("estimatedCostPct"), decimal_to_str(estimated_cost_pct))
+    net_edge_pct = setup_edge_pct - estimated_cost_pct
+    edge_cost_ratio = (setup_edge_pct / estimated_cost_pct) if estimated_cost_pct > 0 else Decimal("0")
+    range_cost_ratio = (volatility_pct / estimated_cost_pct) if estimated_cost_pct > 0 else Decimal("0")
+    atr_cost_ratio = (atr_pct / estimated_cost_pct) if estimated_cost_pct > 0 else Decimal("0")
+    edge_cost_ready = edge_cost_ratio >= DIP_SWING_MIN_EDGE_COST_RATIO
+    range_cost_ready = range_cost_ratio >= DIP_SWING_MIN_RANGE_COST_RATIO
+    atr_cost_ready = atr_cost_ratio >= DIP_SWING_MIN_ATR_COST_RATIO
 
     blockers: list[str] = []
     warnings: list[str] = []
@@ -7276,6 +7407,9 @@ def build_dip_swing_analysis(
         warnings.append(
             f"近场净收益还没覆盖手续费 {format_decimal(abs(safe_decimal(ability_snapshot.get('totalFees'), '0')), 2)}U，继续收紧信号"
         )
+    warnings.append(
+        f"当前费率采用 OKX 实际/回退费率：maker {compact_metric(maker_fee_pct, '0.001')}% / taker {compact_metric(taker_fee_pct, '0.001')}%"
+    )
     if entry_vetoes:
         warnings.append("入场裁判拦截: " + " / ".join(entry_vetoes[:4]))
     if str(selected_signal.get("trend") or "") != "up":
@@ -7325,7 +7459,20 @@ def build_dip_swing_analysis(
     if market_scan_errors:
         warnings.append(f"扩展扫描跳过 {len(market_scan_errors)} 币")
 
-    allow_new_entries = bool(selected_snapshot.get("candidate")) and position_side == "flat" and not blockers
+    entry_ready_live = (
+        str(selected_signal.get("trend") or "") == "up"
+        and bool(selected_signal.get("trendStrengthReady"))
+        and (bool(selected_signal.get("pullbackContext")) or bool(selected_signal.get("bullCross")))
+        and (bool(selected_signal.get("reboundReady")) or bool(selected_signal.get("bullCross")))
+        and bool(selected_signal.get("notOverextended"))
+        and entry_score >= DIP_SWING_MIN_ENTRY_SCORE
+        and edge_cost_ready
+        and range_cost_ready
+        and atr_cost_ready
+        and liquidity_ready
+        and net_edge_pct >= DIP_SWING_MIN_NET_EDGE_PCT
+    )
+    allow_new_entries = entry_ready_live and position_side == "flat" and not blockers
     if blockers:
         decision = "skip"
         decision_label = "先收缩风险"
@@ -7423,7 +7570,7 @@ def build_dip_swing_analysis(
             "市场扫描 + 因子裁判 + 能力驱动放大"
             f" · 自适应回撤 {format_decimal(pullback_threshold_pct, 2)}%"
             f" · 15m 短反 {format_decimal(rebound_threshold_pct, 2)}% ({rebound_lookback_bars} 根)"
-            f" · maker-first · {selected_config.get('swapTdMode', 'isolated')} {selected_config.get('swapLeverage', '2')}x"
+            f" · 开平 maker-first / 风险退场 IOC · {selected_config.get('swapTdMode', 'isolated')} {selected_config.get('swapLeverage', '2')}x"
         ),
         "selectedReturnPct": "",
         "selectedDrawdownPct": "",
@@ -7439,6 +7586,8 @@ def build_dip_swing_analysis(
         "spreadPct": "",
         "basisPct": compact_metric(basis_pct, "0.01"),
         "fundingRatePct": compact_metric(funding_rate_pct, "0.001"),
+        "makerFeePct": compact_metric(maker_fee_pct, "0.001"),
+        "takerFeePct": compact_metric(taker_fee_pct, "0.001"),
         "openInterest": str(open_interest),
         "warnings": warnings,
         "blockers": blockers,
@@ -9269,6 +9418,99 @@ class AutomationEngine:
         label = f"post-only 挂单 · {decimal_to_str(passive_px)}"
         return payload, label
 
+    def _build_passive_swap_exit_order(
+        self,
+        client: OkxClient,
+        inst_id: str,
+        side: str,
+        size: Decimal,
+        td_mode: str,
+    ) -> tuple[dict[str, Any], str]:
+        meta = get_instrument_meta(client, "SWAP", inst_id)
+        tick_size = max(safe_decimal(meta.get("tickSz"), "0.0001"), Decimal("0.0001"))
+        lot_size = max(safe_decimal(meta.get("lotSz") or meta.get("minSz"), "0.0001"), Decimal("0.0001"))
+        min_size = max(safe_decimal(meta.get("minSz") or meta.get("lotSz"), "0.0001"), Decimal("0.0001"))
+        rounded_size = round_down(size, lot_size)
+        if rounded_size <= 0 or rounded_size < min_size:
+            raise OkxApiError(f"永续平仓数量过小，无法在 {inst_id} 发起被动挂单")
+
+        row = extract_first_row(client.get_ticker(inst_id))
+        bid_px = safe_decimal(row.get("bidPx") or row.get("bidPrice"), "0")
+        ask_px = safe_decimal(row.get("askPx") or row.get("askPrice"), "0")
+        last_px = safe_decimal(row.get("last"), "0")
+        buffer_ratio = DIP_SWING_EXIT_POST_ONLY_BUFFER_PCT / Decimal("100")
+
+        if side == "sell":
+            anchor_px = ask_px if ask_px > 0 else (last_px * (Decimal("1") + buffer_ratio) if last_px > 0 else bid_px)
+            passive_px = round_up(anchor_px, tick_size)
+            if bid_px > 0 and passive_px <= bid_px:
+                passive_px = round_up(bid_px + tick_size, tick_size)
+        else:
+            anchor_px = bid_px if bid_px > 0 else (last_px * (Decimal("1") - buffer_ratio) if last_px > 0 else ask_px)
+            passive_px = round_down(anchor_px, tick_size)
+            if ask_px > 0 and passive_px >= ask_px:
+                passive_px = round_down(max(ask_px - tick_size, tick_size), tick_size)
+
+        if passive_px <= 0:
+            raise OkxApiError(f"未拿到 {inst_id} 的有效盘口，无法构造被动平仓挂单")
+
+        payload: dict[str, Any] = {
+            "instId": inst_id,
+            "tdMode": td_mode,
+            "side": side,
+            "ordType": "post_only",
+            "px": decimal_to_str(passive_px),
+            "sz": decimal_to_str(rounded_size),
+            "reduceOnly": True,
+            "clOrdId": build_cl_ord_id("w"),
+        }
+        label = f"post-only 平仓 · {decimal_to_str(passive_px)}"
+        return payload, label
+
+    def _build_protected_swap_exit_order(
+        self,
+        client: OkxClient,
+        inst_id: str,
+        side: str,
+        size: Decimal,
+        td_mode: str,
+    ) -> tuple[dict[str, Any], str]:
+        meta = get_instrument_meta(client, "SWAP", inst_id)
+        tick_size = max(safe_decimal(meta.get("tickSz"), "0.0001"), Decimal("0.0001"))
+        lot_size = max(safe_decimal(meta.get("lotSz") or meta.get("minSz"), "0.0001"), Decimal("0.0001"))
+        min_size = max(safe_decimal(meta.get("minSz") or meta.get("lotSz"), "0.0001"), Decimal("0.0001"))
+        rounded_size = round_down(size, lot_size)
+        if rounded_size <= 0 or rounded_size < min_size:
+            raise OkxApiError(f"永续平仓数量过小，无法在 {inst_id} 发起保护性退出单")
+
+        row = extract_first_row(client.get_ticker(inst_id))
+        bid_px = safe_decimal(row.get("bidPx") or row.get("bidPrice"), "0")
+        ask_px = safe_decimal(row.get("askPx") or row.get("askPrice"), "0")
+        last_px = safe_decimal(row.get("last"), "0")
+        protect_ratio = DIP_SWING_EXIT_PROTECTION_PCT / Decimal("100")
+
+        if side == "sell":
+            reference_px = bid_px if bid_px > 0 else last_px
+            protected_px = round_down(reference_px * (Decimal("1") - protect_ratio), tick_size)
+        else:
+            reference_px = ask_px if ask_px > 0 else last_px
+            protected_px = round_up(reference_px * (Decimal("1") + protect_ratio), tick_size)
+        if protected_px <= 0:
+            raise OkxApiError(f"未拿到 {inst_id} 的有效保护价，无法发起保护性平仓")
+
+        payload: dict[str, Any] = {
+            "instId": inst_id,
+            "tdMode": td_mode,
+            "side": side,
+            "ordType": "ioc",
+            "px": decimal_to_str(protected_px),
+            "sz": decimal_to_str(rounded_size),
+            "reduceOnly": True,
+            "clOrdId": build_cl_ord_id("w"),
+        }
+        label = f"保护价 IOC · {decimal_to_str(protected_px)}"
+        return payload, label
+
     def _build_protected_spot_sell_order(
         self,
         client: OkxClient,
@@ -10281,9 +10523,18 @@ class AutomationEngine:
         lot_size = safe_decimal(meta.get("lotSz"), "1")
         contract_value = safe_decimal(meta.get("ctVal"), decimal_to_str(default_swap_contract_value(inst_id)))
         leverage = safe_decimal(automation.get("swapLeverage"), "1")
+        fee_rates = cache_okx_swap_fee_rates(client, inst_id, meta=meta)
+        maker_fee_pct = safe_decimal(fee_rates.get("makerFeePct"), decimal_to_str(OKX_DEFAULT_SWAP_MAKER_FEE_PCT))
+        taker_fee_pct = safe_decimal(fee_rates.get("takerFeePct"), decimal_to_str(OKX_DEFAULT_SWAP_TAKER_FEE_PCT))
         entry_score = int(signal.get("entryScore") or 0)
         exit_score = int(signal.get("exitScore") or 0)
-        estimated_cost_pct = safe_decimal(signal.get("estimatedCostPct"), decimal_to_str(DIP_SWING_EST_ROUNDTRIP_COST_PCT + min(Decimal("0.12"), volatility_pct * Decimal("0.04"))))
+        cost_snapshot = estimate_dip_swing_cost_snapshot(
+            volatility_pct,
+            funding_rate_pct=max(Decimal("0"), safe_decimal(extract_first_row(client.get_funding_rate(inst_id)).get("fundingRate"), "0") * Decimal("100")),
+            maker_fee_pct=maker_fee_pct,
+            taker_fee_pct=taker_fee_pct,
+        )
+        estimated_cost_pct = safe_decimal(cost_snapshot.get("estimatedCostPct"), decimal_to_str(DIP_SWING_EST_ROUNDTRIP_COST_PCT))
         atr_pct = safe_decimal(signal.get("atrPct"), decimal_to_str(average_true_range_pct(candles)))
         pullback_threshold_pct = safe_decimal(signal.get("pullbackThresholdPct"), decimal_to_str(DIP_SWING_MIN_PULLBACK_PCT))
         rebound_threshold_pct = safe_decimal(signal.get("reboundThresholdPct"), decimal_to_str(DIP_SWING_MIN_REBOUND_PCT))
@@ -10302,7 +10553,7 @@ class AutomationEngine:
         atr_cost_ready = atr_cost_ratio >= DIP_SWING_MIN_ATR_COST_RATIO
         liquidity_ready = avg_quote_volume_usd >= DIP_SWING_MIN_AVG_QUOTE_VOLUME_USD
         fee_exit_floor_pct = max(
-            DIP_SWING_MIN_PROTECTIVE_EXIT_PCT,
+            safe_decimal(cost_snapshot.get("protectiveExitFloorPct"), decimal_to_str(DIP_SWING_MIN_PROTECTIVE_EXIT_PCT)),
             estimated_cost_pct + (DIP_SWING_MIN_NET_EDGE_PCT / Decimal("2")),
         )
         severe_trend_break = bool(signal.get("weakTrendReady")) and (
@@ -10330,6 +10581,10 @@ class AutomationEngine:
             position_side = "short"
         pending_entry_orders = self._working_swap_orders(inst_id, side="buy", reduce_only=False)
         pending_exit_orders = self._working_swap_orders(inst_id, side="sell", reduce_only=True)
+        stale_exit_orders = [
+            order for order in pending_exit_orders
+            if self._order_age_seconds(order) >= DIP_SWING_EXIT_ORDER_MAX_AGE_SECONDS
+        ]
         symbol_pressure = build_execution_symbol_pressure_snapshot(inst_id, limit=160)
         floating_pnl = safe_decimal(open_position.get("upl"), "0")
         floating_pnl_pct = Decimal("0")
@@ -10343,6 +10598,7 @@ class AutomationEngine:
             f"净优势 {compact_metric(net_edge_pct, '0.01')}% / "
             f"优势/成本 {compact_metric(edge_cost_ratio, '0.01')}x / "
             f"ATR/成本 {compact_metric(atr_cost_ratio, '0.01')}x / "
+            f"maker {compact_metric(maker_fee_pct, '0.001')}% / taker {compact_metric(taker_fee_pct, '0.001')}% / "
             f"成交额 {format_decimal(avg_quote_volume_usd, 0)}U / "
             f"开平差 {symbol_pressure['openCloseGap']} / 连开 {symbol_pressure['consecutiveOpenStreak']}"
         )
@@ -10407,8 +10663,8 @@ class AutomationEngine:
         if position_side == "long" and entry_price > 0:
             if liq_buffer > 0 and liq_buffer <= DIP_SWING_MIN_LIQ_BUFFER_PCT:
                 if pending_exit_orders:
-                    self._set_market(market_key, {"lastMessage": f"强平缓冲不足，已有 {len(pending_exit_orders)} 笔退场单在执行"})
-                    return
+                    self._cancel_swap_orders(client, inst_id, pending_exit_orders, "强平缓冲不足，撤掉旧平仓单后紧急退出", market_key=market_key)
+                    pending_exit_orders = []
                 self._place_swap_order(
                     client,
                     inst_id,
@@ -10417,13 +10673,14 @@ class AutomationEngine:
                     automation["swapTdMode"],
                     "强平缓冲不足，主动退场",
                     reduce_only=True,
+                    protected_exit=True,
                     market_key=market_key,
                 )
                 return
             if stop_loss > 0 and last_price <= entry_price * (Decimal("1") - stop_loss / Decimal("100")):
                 if pending_exit_orders:
-                    self._set_market(market_key, {"lastMessage": f"止损触发，已有 {len(pending_exit_orders)} 笔平仓单在执行"})
-                    return
+                    self._cancel_swap_orders(client, inst_id, pending_exit_orders, "止损触发，撤掉旧平仓单后保护退出", market_key=market_key)
+                    pending_exit_orders = []
                 self._place_swap_order(
                     client,
                     inst_id,
@@ -10432,13 +10689,18 @@ class AutomationEngine:
                     automation["swapTdMode"],
                     "波段多单止损",
                     reduce_only=True,
+                    protected_exit=True,
                     market_key=market_key,
                 )
                 return
             if take_profit > 0 and last_price >= entry_price * (Decimal("1") + take_profit / Decimal("100")):
                 if pending_exit_orders:
-                    self._set_market(market_key, {"lastMessage": f"止盈触发，已有 {len(pending_exit_orders)} 笔平仓单在执行"})
-                    return
+                    if stale_exit_orders:
+                        self._cancel_swap_orders(client, inst_id, stale_exit_orders, "止盈挂单超时，重新挂被动平仓", market_key=market_key)
+                        pending_exit_orders = [order for order in pending_exit_orders if order not in stale_exit_orders]
+                    if pending_exit_orders:
+                        self._set_market(market_key, {"lastMessage": f"止盈触发，已有 {len(pending_exit_orders)} 笔被动平仓单在执行"})
+                        return
                 self._place_swap_order(
                     client,
                     inst_id,
@@ -10447,6 +10709,7 @@ class AutomationEngine:
                     automation["swapTdMode"],
                     "波段多单止盈",
                     reduce_only=True,
+                    passive_exit=True,
                     market_key=market_key,
                 )
                 return
@@ -10456,8 +10719,15 @@ class AutomationEngine:
                 should_exit_for_break = severe_trend_break and floating_pnl_pct <= (Decimal("0") - DIP_SWING_HARD_BREAK_LOSS_PCT)
                 if cooldown_ready and (should_exit_for_profit or should_exit_for_break):
                     if pending_exit_orders:
-                        self._set_market(market_key, {"lastMessage": f"趋势破坏，已有 {len(pending_exit_orders)} 笔退场单在执行"})
-                        return
+                        if should_exit_for_break:
+                            self._cancel_swap_orders(client, inst_id, pending_exit_orders, "趋势严重破坏，撤掉旧平仓单后保护退出", market_key=market_key)
+                            pending_exit_orders = []
+                        elif stale_exit_orders:
+                            self._cancel_swap_orders(client, inst_id, stale_exit_orders, "趋势破坏平仓挂单超时，重新挂被动平仓", market_key=market_key)
+                            pending_exit_orders = [order for order in pending_exit_orders if order not in stale_exit_orders]
+                        if pending_exit_orders:
+                            self._set_market(market_key, {"lastMessage": f"趋势破坏，已有 {len(pending_exit_orders)} 笔退场单在执行"})
+                            return
                     self._place_swap_order(
                         client,
                         inst_id,
@@ -10470,6 +10740,8 @@ class AutomationEngine:
                             else "复合趋势严重破坏，主动止损离场"
                         ),
                         reduce_only=True,
+                        passive_exit=should_exit_for_profit and not should_exit_for_break,
+                        protected_exit=should_exit_for_break,
                         market_key=market_key,
                     )
                 else:
@@ -10486,6 +10758,8 @@ class AutomationEngine:
                             },
                         )
                 return
+            if pending_exit_orders:
+                self._cancel_swap_orders(client, inst_id, pending_exit_orders, "结构恢复，撤掉旧平仓挂单", market_key=market_key)
             self._set_market(
                 market_key,
                 {
@@ -11010,6 +11284,8 @@ class AutomationEngine:
         *,
         reduce_only: bool = False,
         passive_entry: bool = False,
+        passive_exit: bool = False,
+        protected_exit: bool = False,
         market_key: str = "swap",
         strategy_tag: str = "",
         strategy_action: str = "",
@@ -11030,6 +11306,39 @@ class AutomationEngine:
                 }
                 execution_mode = "市价回退"
                 self._log("warn", f"{reason} · 永续 {inst_id} 未能构造被动挂单，回退市价: {exc}")
+        elif passive_exit and reduce_only:
+            try:
+                payload, execution_mode = self._build_passive_swap_exit_order(client, inst_id, side, size, td_mode)
+            except Exception as exc:
+                try:
+                    payload, execution_mode = self._build_protected_swap_exit_order(client, inst_id, side, size, td_mode)
+                    execution_mode = f"{execution_mode} 回退"
+                    self._log("warn", f"{reason} · 永续 {inst_id} 未能构造被动平仓，回退保护价 IOC: {exc}")
+                except Exception as fallback_exc:
+                    payload = {
+                        "instId": inst_id,
+                        "tdMode": td_mode,
+                        "side": side,
+                        "ordType": "market",
+                        "sz": decimal_to_str(size),
+                        "clOrdId": build_cl_ord_id("w"),
+                    }
+                    execution_mode = "市价回退"
+                    self._log("warn", f"{reason} · 永续 {inst_id} 被动平仓失败，回退市价: {fallback_exc}")
+        elif protected_exit and reduce_only:
+            try:
+                payload, execution_mode = self._build_protected_swap_exit_order(client, inst_id, side, size, td_mode)
+            except Exception as exc:
+                payload = {
+                    "instId": inst_id,
+                    "tdMode": td_mode,
+                    "side": side,
+                    "ordType": "market",
+                    "sz": decimal_to_str(size),
+                    "clOrdId": build_cl_ord_id("w"),
+                }
+                execution_mode = "市价回退"
+                self._log("warn", f"{reason} · 永续 {inst_id} 保护性退出失败，回退市价: {exc}")
         else:
             payload = {
                 "instId": inst_id,
