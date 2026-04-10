@@ -110,9 +110,12 @@ DIP_SWING_MARKET_SCAN_CACHE: dict[str, Any] = {"ts": 0.0, "key": "", "rows": []}
 REMOTE_AUTOMATION_CONFIG_LOCK = threading.RLock()
 REMOTE_AUTOMATION_CONFIG_CACHE: dict[str, Any] = {"ts": 0.0, "url": "", "config": {}}
 ONLY_STRATEGY_PRESET = "dip_swing"
-DIP_SWING_PULLBACK_PCT = Decimal("0.6")
-DIP_SWING_REBOUND_PCT = Decimal("0.60")
-DIP_SWING_REBOUND_LOOKBACK_BARS = 8
+DIP_SWING_MIN_PULLBACK_PCT = Decimal("0.45")
+DIP_SWING_MAX_PULLBACK_PCT = Decimal("1.60")
+DIP_SWING_MIN_REBOUND_PCT = Decimal("0.25")
+DIP_SWING_MAX_REBOUND_PCT = Decimal("1.20")
+DIP_SWING_MIN_REBOUND_LOOKBACK_BARS = 6
+DIP_SWING_MAX_REBOUND_LOOKBACK_BARS = 12
 DIP_SWING_MIN_EMA_SPREAD_PCT = Decimal("0.03")
 DIP_SWING_MIN_FAST_SLOPE_PCT = Decimal("0.02")
 DIP_SWING_MAX_CHASE_PCT = Decimal("0.18")
@@ -1729,7 +1732,7 @@ def build_market_risk_label(target: dict[str, Any], market_kind: str) -> str:
         )
     if str(target.get("strategyPreset") or "") == "dip_swing":
         return (
-            f"回撤 ≥ {format_decimal(DIP_SWING_PULLBACK_PCT, 1)}% · 15m 短反 ≥ {format_decimal(DIP_SWING_REBOUND_PCT, 2)}% ({DIP_SWING_REBOUND_LOOKBACK_BARS} 根) · "
+            "自适应回撤 / 15m 短反 · "
             f"TP {format_decimal(safe_decimal(target.get('takeProfitPct'), '8'), 1)}% · "
             f"缓冲 ≥ {format_decimal(DIP_SWING_MIN_LIQ_BUFFER_PCT, 0)}% · "
             f"动态仓位 · {format_decimal(safe_decimal(target.get('swapLeverage'), '10'), 0)}x 逐仓"
@@ -4407,7 +4410,7 @@ def strategy_detail_line(config: dict[str, Any], origin_label: str = "") -> str:
             f"只做多 · {config.get('swapTdMode', 'isolated')} {config.get('swapLeverage', '2')}x",
             f"目标止盈 {config.get('takeProfitPct', '8')}%",
             f"止损 {config.get('stopLossPct', '2.5')}%",
-            f"回撤阈值 {format_decimal(DIP_SWING_PULLBACK_PCT, 1)}% · 15m 短反 {format_decimal(DIP_SWING_REBOUND_PCT, 2)}% ({DIP_SWING_REBOUND_LOOKBACK_BARS} 根)",
+            "回撤阈值 / 15m 短反阈值按市场波动、成本和预期净优势自适应",
             f"优势/成本 ≥ {format_decimal(DIP_SWING_MIN_EDGE_COST_RATIO, 1)}x · 波动/成本 ≥ {format_decimal(DIP_SWING_MIN_RANGE_COST_RATIO, 1)}x · ATR/成本 ≥ {format_decimal(DIP_SWING_MIN_ATR_COST_RATIO, 1)}x",
             f"强平缓冲 ≥ {format_decimal(DIP_SWING_MIN_LIQ_BUFFER_PCT, 0)}%",
         ]
@@ -4510,12 +4513,21 @@ def build_pullback_signal(
     fast: int,
     slow: int,
     *,
-    pullback_threshold_pct: Decimal = DIP_SWING_PULLBACK_PCT,
-    rebound_threshold_pct: Decimal = DIP_SWING_REBOUND_PCT,
+    pullback_threshold_pct: Decimal | None = None,
+    rebound_threshold_pct: Decimal | None = None,
 ) -> dict[str, Any]:
     closes = [row["close"] for row in candles]
     if len(closes) < slow + 2:
         raise OkxApiError("K 线样本不足，无法计算波段信号")
+    adaptive_thresholds = build_dip_swing_adaptive_thresholds(candles, fast, slow)
+    pullback_threshold_pct = safe_decimal(
+        pullback_threshold_pct,
+        decimal_to_str(adaptive_thresholds.get("pullbackThresholdPct")),
+    )
+    rebound_threshold_pct = safe_decimal(
+        rebound_threshold_pct,
+        decimal_to_str(adaptive_thresholds.get("reboundThresholdPct")),
+    )
     fast_values = ema(closes, fast)
     slow_values = ema(closes, slow)
     prev_fast = fast_values[-2]
@@ -4528,7 +4540,7 @@ def build_pullback_signal(
     recent_high = max((row["high"] for row in sample), default=last_close)
     pullback_window = candles[-min(len(candles), max(fast * 2, 6)) :]
     pullback_low = min((row["low"] for row in pullback_window), default=last_close)
-    rebound_window = candles[-min(len(candles), max(6, min(fast, DIP_SWING_REBOUND_LOOKBACK_BARS))) :]
+    rebound_window = candles[-min(len(candles), int(adaptive_thresholds["reboundLookbackBars"])) :]
     rebound_low = min((row["low"] for row in rebound_window), default=last_close)
     pullback_pct = pct_gap(recent_high, last_close)
     rebound_pct = pct_gap(last_close, rebound_low)
@@ -4590,9 +4602,16 @@ def build_pullback_signal(
         "slowValue": decimal_to_str(curr_slow),
         "lastClose": decimal_to_str(last_close),
         "recentHigh": decimal_to_str(recent_high),
-        "recentLow": decimal_to_str(recent_low),
+        "recentLow": decimal_to_str(rebound_low),
         "pullbackPct": decimal_to_str(pullback_pct),
         "reboundPct": decimal_to_str(rebound_pct),
+        "pullbackThresholdPct": decimal_to_str(pullback_threshold_pct),
+        "reboundThresholdPct": decimal_to_str(rebound_threshold_pct),
+        "reboundLookbackBars": int(adaptive_thresholds["reboundLookbackBars"]),
+        "microRangePct": decimal_to_str(safe_decimal(adaptive_thresholds.get("microRangePct"), "0")),
+        "volatilityPct": decimal_to_str(safe_decimal(adaptive_thresholds.get("volatilityPct"), "0")),
+        "atrPct": decimal_to_str(safe_decimal(adaptive_thresholds.get("atrPct"), "0")),
+        "estimatedCostPct": decimal_to_str(safe_decimal(adaptive_thresholds.get("estimatedCostPct"), "0")),
         "bullCross": bull_cross,
         "pullbackTouchedFast": pullback_touched_fast,
         "closeAboveFast": close_above_fast,
@@ -6115,6 +6134,56 @@ def recent_range_pct(candles: list[dict[str, Any]], window: int = 24) -> Decimal
     return ((high - low) / last_close) * Decimal("100")
 
 
+def clamp_decimal(value: Decimal, lower: Decimal, upper: Decimal) -> Decimal:
+    return max(lower, min(upper, value))
+
+
+def dip_swing_rebound_lookback_bars(fast: int) -> int:
+    return max(
+        DIP_SWING_MIN_REBOUND_LOOKBACK_BARS,
+        min(DIP_SWING_MAX_REBOUND_LOOKBACK_BARS, int(round(max(6, int(fast or 6)) * 0.67))),
+    )
+
+
+def build_dip_swing_adaptive_thresholds(
+    candles: list[dict[str, Any]],
+    fast: int,
+    slow: int,
+) -> dict[str, Decimal | int]:
+    volatility_pct = recent_range_pct(candles)
+    atr_pct = average_true_range_pct(candles)
+    rebound_lookback_bars = dip_swing_rebound_lookback_bars(fast)
+    micro_range_pct = recent_range_pct(candles, window=rebound_lookback_bars)
+    estimated_cost_pct = DIP_SWING_EST_ROUNDTRIP_COST_PCT + min(Decimal("0.12"), volatility_pct * Decimal("0.04"))
+    pullback_threshold_pct = clamp_decimal(
+        max(
+            estimated_cost_pct * Decimal("2.8"),
+            atr_pct * Decimal("1.35"),
+            micro_range_pct * Decimal("0.80"),
+        ),
+        DIP_SWING_MIN_PULLBACK_PCT,
+        DIP_SWING_MAX_PULLBACK_PCT,
+    )
+    rebound_threshold_pct = clamp_decimal(
+        max(
+            estimated_cost_pct * Decimal("2.0"),
+            atr_pct * Decimal("0.95"),
+            micro_range_pct * Decimal("0.72"),
+        ),
+        DIP_SWING_MIN_REBOUND_PCT,
+        DIP_SWING_MAX_REBOUND_PCT,
+    )
+    return {
+        "volatilityPct": volatility_pct,
+        "atrPct": atr_pct,
+        "estimatedCostPct": estimated_cost_pct,
+        "reboundLookbackBars": rebound_lookback_bars,
+        "microRangePct": micro_range_pct,
+        "pullbackThresholdPct": pullback_threshold_pct,
+        "reboundThresholdPct": rebound_threshold_pct,
+    }
+
+
 def average_true_range_pct(candles: list[dict[str, Any]], window: int = 14) -> Decimal:
     if len(candles) < 2:
         return Decimal("0")
@@ -6299,18 +6368,21 @@ def evaluate_dip_swing_target_snapshot(
     mark_price = safe_decimal(mark_price_row.get("markPx"), "0")
     funding_rate_pct = safe_decimal(funding_row.get("fundingRate"), "0") * Decimal("100")
     basis_pct = pct_gap(last_price, mark_price)
-    volatility_pct = recent_range_pct(candles)
-    atr_pct = average_true_range_pct(candles)
+    volatility_pct = safe_decimal(signal.get("volatilityPct"), decimal_to_str(recent_range_pct(candles)))
+    atr_pct = safe_decimal(signal.get("atrPct"), decimal_to_str(average_true_range_pct(candles)))
     avg_quote_volume_usd = average_quote_volume_usd(candles)
     pullback_pct = safe_decimal(signal.get("pullbackPct"), "0")
     rebound_pct = safe_decimal(signal.get("reboundPct"), "0")
+    pullback_threshold_pct = safe_decimal(signal.get("pullbackThresholdPct"), decimal_to_str(DIP_SWING_MIN_PULLBACK_PCT))
+    rebound_threshold_pct = safe_decimal(signal.get("reboundThresholdPct"), decimal_to_str(DIP_SWING_MIN_REBOUND_PCT))
+    rebound_lookback_bars = int(signal.get("reboundLookbackBars") or dip_swing_rebound_lookback_bars(int(target.get("fastEma", 12) or 12)))
     ema_spread_pct = safe_decimal(signal.get("emaSpreadPct"), "0")
     fast_slope_pct = safe_decimal(signal.get("fastSlopePct"), "0")
     slow_slope_pct = safe_decimal(signal.get("slowSlopePct"), "0")
     price_vs_fast_pct = safe_decimal(signal.get("priceVsFastPct"), "0")
     entry_score = int(signal.get("entryScore") or 0)
     exit_score = int(signal.get("exitScore") or 0)
-    estimated_cost_pct = DIP_SWING_EST_ROUNDTRIP_COST_PCT + min(Decimal("0.12"), volatility_pct * Decimal("0.04"))
+    estimated_cost_pct = safe_decimal(signal.get("estimatedCostPct"), decimal_to_str(DIP_SWING_EST_ROUNDTRIP_COST_PCT + min(Decimal("0.12"), volatility_pct * Decimal("0.04"))))
     setup_edge_pct = max(ema_spread_pct, Decimal("0")) + max(fast_slope_pct, Decimal("0")) + max(rebound_pct, Decimal("0"))
     net_edge_pct = setup_edge_pct - estimated_cost_pct
     edge_cost_ratio = (setup_edge_pct / estimated_cost_pct) if estimated_cost_pct > 0 else Decimal("0")
@@ -6383,6 +6455,9 @@ def evaluate_dip_swing_target_snapshot(
         "avgQuoteVolumeUsd": avg_quote_volume_usd,
         "pullbackPct": pullback_pct,
         "reboundPct": rebound_pct,
+        "pullbackThresholdPct": pullback_threshold_pct,
+        "reboundThresholdPct": rebound_threshold_pct,
+        "reboundLookbackBars": rebound_lookback_bars,
         "emaSpreadPct": ema_spread_pct,
         "fastSlopePct": fast_slope_pct,
         "slowSlopePct": slow_slope_pct,
@@ -7108,6 +7183,9 @@ def build_dip_swing_analysis(
     volatility_pct = safe_decimal(selected_snapshot.get("volatilityPct"), "0")
     pullback_pct = safe_decimal(selected_snapshot.get("pullbackPct"), "0")
     rebound_pct = safe_decimal(selected_snapshot.get("reboundPct"), "0")
+    pullback_threshold_pct = safe_decimal(selected_snapshot.get("pullbackThresholdPct"), decimal_to_str(DIP_SWING_MIN_PULLBACK_PCT))
+    rebound_threshold_pct = safe_decimal(selected_snapshot.get("reboundThresholdPct"), decimal_to_str(DIP_SWING_MIN_REBOUND_PCT))
+    rebound_lookback_bars = int(selected_snapshot.get("reboundLookbackBars") or dip_swing_rebound_lookback_bars(int(selected_target.get("fastEma", 12) or 12)))
     ema_spread_pct = safe_decimal(selected_snapshot.get("emaSpreadPct"), "0")
     fast_slope_pct = safe_decimal(selected_snapshot.get("fastSlopePct"), "0")
     slow_slope_pct = safe_decimal(selected_snapshot.get("slowSlopePct"), "0")
@@ -7207,7 +7285,10 @@ def build_dip_swing_analysis(
     elif not bool(selected_signal.get("pullbackContext")) and not bool(selected_signal.get("bullCross")):
         warnings.append("当前没有新的回踩结构，也没有新的金叉启动")
     elif not bool(selected_signal.get("reboundReady")) and not bool(selected_signal.get("bullCross")):
-        warnings.append(f"回踩出现了，但反弹确认只有 {compact_metric(rebound_pct, '0.1')}%，继续等确认")
+        warnings.append(
+            f"回踩出现了，但 15m 短反只有 {compact_metric(rebound_pct, '0.1')}%"
+            f" / 动态阈值 {compact_metric(rebound_threshold_pct, '0.1')}% ({rebound_lookback_bars} 根)"
+        )
     elif not bool(selected_signal.get("notOverextended")):
         warnings.append(
             f"当前价格高于快线 {compact_metric(price_vs_fast_pct, '0.01')}%，追价成本偏高，放弃开仓"
@@ -7291,8 +7372,8 @@ def build_dip_swing_analysis(
     symbol = selected_symbol
     summary_bits = [
         f"{symbol} 波段",
-        f"回撤 {compact_metric(pullback_pct, '0.1')}%",
-        f"反弹 {compact_metric(rebound_pct, '0.1')}%",
+        f"回撤 {compact_metric(pullback_pct, '0.1')}% / 阈值 {compact_metric(pullback_threshold_pct, '0.1')}%",
+        f"15m 短反 {compact_metric(rebound_pct, '0.1')}% / 阈值 {compact_metric(rebound_threshold_pct, '0.1')}% ({rebound_lookback_bars} 根)",
         f"趋势扩散 {compact_metric(ema_spread_pct, '0.01')}%",
         f"快线斜率 {compact_metric(fast_slope_pct, '0.01')}%",
         f"ATR {compact_metric(atr_pct, '0.01')}%",
@@ -7338,7 +7419,12 @@ def build_dip_swing_analysis(
         "decisionLabel": decision_label,
         "summary": " · ".join(summary_bits),
         "selectedStrategyName": f"{symbol} 波段",
-        "selectedStrategyDetail": strategy_detail_line(selected_config),
+        "selectedStrategyDetail": (
+            "市场扫描 + 因子裁判 + 能力驱动放大"
+            f" · 自适应回撤 {format_decimal(pullback_threshold_pct, 2)}%"
+            f" · 15m 短反 {format_decimal(rebound_threshold_pct, 2)}% ({rebound_lookback_bars} 根)"
+            f" · maker-first · {selected_config.get('swapTdMode', 'isolated')} {selected_config.get('swapLeverage', '2')}x"
+        ),
         "selectedReturnPct": "",
         "selectedDrawdownPct": "",
         "selectedWinRatePct": "",
@@ -7366,6 +7452,9 @@ def build_dip_swing_analysis(
         "marketTopCandidates": top_candidates,
         "pullbackPct": compact_metric(pullback_pct, "0.1"),
         "reboundPct": compact_metric(rebound_pct, "0.1"),
+        "pullbackThresholdPct": compact_metric(pullback_threshold_pct, "0.1"),
+        "reboundThresholdPct": compact_metric(rebound_threshold_pct, "0.1"),
+        "reboundLookbackBars": rebound_lookback_bars,
         "emaSpreadPct": compact_metric(ema_spread_pct, "0.01"),
         "fastSlopePct": compact_metric(fast_slope_pct, "0.01"),
         "slowSlopePct": compact_metric(slow_slope_pct, "0.01"),
@@ -10179,7 +10268,7 @@ class AutomationEngine:
             max(int(automation["slowEma"]) + 30, 80),
         )
         signal = build_pullback_signal(candles, int(automation["fastEma"]), int(automation["slowEma"]))
-        volatility_pct = recent_range_pct(candles)
+        volatility_pct = safe_decimal(signal.get("volatilityPct"), decimal_to_str(recent_range_pct(candles)))
         avg_quote_volume_usd = average_quote_volume_usd(candles)
         positions = client.get_positions(inst_id).get("data", [])
         open_position = next((row for row in positions if safe_decimal(row.get("pos"), "0") != 0), {})
@@ -10194,8 +10283,11 @@ class AutomationEngine:
         leverage = safe_decimal(automation.get("swapLeverage"), "1")
         entry_score = int(signal.get("entryScore") or 0)
         exit_score = int(signal.get("exitScore") or 0)
-        estimated_cost_pct = DIP_SWING_EST_ROUNDTRIP_COST_PCT + min(Decimal("0.12"), volatility_pct * Decimal("0.04"))
-        atr_pct = average_true_range_pct(candles)
+        estimated_cost_pct = safe_decimal(signal.get("estimatedCostPct"), decimal_to_str(DIP_SWING_EST_ROUNDTRIP_COST_PCT + min(Decimal("0.12"), volatility_pct * Decimal("0.04"))))
+        atr_pct = safe_decimal(signal.get("atrPct"), decimal_to_str(average_true_range_pct(candles)))
+        pullback_threshold_pct = safe_decimal(signal.get("pullbackThresholdPct"), decimal_to_str(DIP_SWING_MIN_PULLBACK_PCT))
+        rebound_threshold_pct = safe_decimal(signal.get("reboundThresholdPct"), decimal_to_str(DIP_SWING_MIN_REBOUND_PCT))
+        rebound_lookback_bars = int(signal.get("reboundLookbackBars") or dip_swing_rebound_lookback_bars(int(automation["fastEma"])))
         setup_edge_pct = (
             max(safe_decimal(signal.get("emaSpreadPct"), "0"), Decimal("0"))
             + max(safe_decimal(signal.get("fastSlopePct"), "0"), Decimal("0"))
@@ -10245,8 +10337,8 @@ class AutomationEngine:
             floating_pnl_pct = ((last_price - entry_price) / entry_price) * Decimal("100")
 
         status_text = (
-            f"回撤 {compact_metric(signal.get('pullbackPct'), '0.1')}% / "
-            f"反弹 {compact_metric(signal.get('reboundPct'), '0.1')}% / "
+            f"回撤 {compact_metric(signal.get('pullbackPct'), '0.1')}% / 阈值 {compact_metric(pullback_threshold_pct, '0.1')}% / "
+            f"15m 短反 {compact_metric(signal.get('reboundPct'), '0.1')}% / 阈值 {compact_metric(rebound_threshold_pct, '0.1')}% ({rebound_lookback_bars} 根) / "
             f"入场评分 {entry_score}/8 / "
             f"净优势 {compact_metric(net_edge_pct, '0.01')}% / "
             f"优势/成本 {compact_metric(edge_cost_ratio, '0.01')}x / "
@@ -10441,7 +10533,16 @@ class AutomationEngine:
             elif not bool(signal.get("pullbackContext")) and not bool(signal.get("bullCross")):
                 self._set_market(market_key, {"lastMessage": f"没有新的回踩结构 · {status_text}"})
             elif not bool(signal.get("reboundReady")) and not bool(signal.get("bullCross")):
-                self._set_market(market_key, {"lastMessage": f"回踩后反弹确认不够 · {status_text}"})
+                self._set_market(
+                    market_key,
+                    {
+                        "lastMessage": (
+                            f"回踩后 15m 短反不够，当前 {compact_metric(signal.get('reboundPct'), '0.1')}%"
+                            f" / 动态阈值 {compact_metric(rebound_threshold_pct, '0.1')}% ({rebound_lookback_bars} 根)"
+                            f" · {status_text}"
+                        )
+                    },
+                )
             elif not bool(signal.get("notOverextended")):
                 self._set_market(
                     market_key,
