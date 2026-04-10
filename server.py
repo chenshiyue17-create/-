@@ -103,11 +103,28 @@ BASIS_ARB_PREFERRED_SYMBOLS = (
 BASIS_ARB_SCAN_LOCK = threading.RLock()
 BASIS_ARB_MARKET_UNIVERSE_CACHE: dict[str, Any] = {"ts": 0.0, "symbols": []}
 BASIS_ARB_MARKET_SCAN_CACHE: dict[str, Any] = {"ts": 0.0, "key": "", "rows": []}
+DIP_SWING_SCAN_SYMBOL_LIMIT = 24
+DIP_SWING_SCAN_LOCK = threading.RLock()
+DIP_SWING_MARKET_UNIVERSE_CACHE: dict[str, Any] = {"ts": 0.0, "symbols": []}
+DIP_SWING_MARKET_SCAN_CACHE: dict[str, Any] = {"ts": 0.0, "key": "", "rows": []}
+REMOTE_AUTOMATION_CONFIG_LOCK = threading.RLock()
+REMOTE_AUTOMATION_CONFIG_CACHE: dict[str, Any] = {"ts": 0.0, "url": "", "config": {}}
 ONLY_STRATEGY_PRESET = "dip_swing"
 DIP_SWING_PULLBACK_PCT = Decimal("0.6")
 DIP_SWING_REBOUND_PCT = Decimal("0.10")
+DIP_SWING_MIN_EMA_SPREAD_PCT = Decimal("0.03")
+DIP_SWING_MIN_FAST_SLOPE_PCT = Decimal("0.02")
+DIP_SWING_MAX_CHASE_PCT = Decimal("0.18")
+DIP_SWING_MIN_ENTRY_SCORE = 5
+DIP_SWING_MIN_EXIT_SCORE = 4
+DIP_SWING_EST_ROUNDTRIP_COST_PCT = Decimal("0.16")
+DIP_SWING_MIN_NET_EDGE_PCT = Decimal("0.08")
+DIP_SWING_TARGET_MIN_MARGIN_RATIO = Decimal("0.003")
+DIP_SWING_TARGET_MAX_MARGIN_RATIO = Decimal("0.012")
 DIP_SWING_MIN_LIQ_BUFFER_PCT = Decimal("18")
 DIP_SWING_MAX_LEVERAGE = Decimal("10")
+PAPER_SPOT_FEE_RATE = Decimal("0.001")
+PAPER_SWAP_FEE_RATE = Decimal("0.0005")
 
 
 def _extract_a_records_from_doh(payload: dict[str, Any]) -> list[str]:
@@ -1053,7 +1070,7 @@ def default_automation_config() -> dict[str, Any]:
         "stopLossPct": "1.2",
         "takeProfitPct": "8",
         "maxDailyLossPct": "0.8",
-        "targetBalanceMultiple": "10",
+        "targetBalanceMultiple": "100",
         "arbEntrySpreadPct": "0.18",
         "arbExitSpreadPct": "0.05",
         "arbMinFundingRatePct": "0.005",
@@ -1123,6 +1140,7 @@ def default_market_state() -> dict[str, Any]:
         "lastTradeAt": "",
         "liquidationPrice": "",
         "liquidationBufferPct": "",
+        "contractValue": "",
         "arbStage": "",
         "prepared": False,
     }
@@ -1568,7 +1586,7 @@ def build_market_risk_label(target: dict[str, Any], market_kind: str) -> str:
         )
     if str(target.get("strategyPreset") or "") == "dip_swing":
         return (
-            f"回撤 ≥ {format_decimal(DIP_SWING_PULLBACK_PCT, 1)}% · "
+            f"回撤 ≥ {format_decimal(DIP_SWING_PULLBACK_PCT, 1)}% · 反弹 ≥ {format_decimal(DIP_SWING_REBOUND_PCT, 2)}% · "
             f"TP {format_decimal(safe_decimal(target.get('takeProfitPct'), '8'), 1)}% · "
             f"缓冲 ≥ {format_decimal(DIP_SWING_MIN_LIQ_BUFFER_PCT, 0)}%"
         )
@@ -1864,6 +1882,107 @@ def sanitize_only_dip_swing_runtime_state(state: dict[str, Any], automation: dic
         patched_entry["summary"] = summary
         cleaned_watchlist.append(patched_entry)
     sanitized["watchlist"] = cleaned_watchlist
+    return sanitized
+
+
+def normalize_remote_automation_config_payload(
+    payload: dict[str, Any] | None,
+    fallback: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    candidate = copy.deepcopy((payload or {}).get("config") or {})
+    ok, _, normalized = validate_automation_config(candidate)
+    if ok:
+        return enforce_only_dip_swing_strategy(deep_merge(default_automation_config(), normalized))
+    if fallback:
+        ok, _, normalized_fallback = validate_automation_config(copy.deepcopy(fallback))
+        if ok:
+            return enforce_only_dip_swing_strategy(deep_merge(default_automation_config(), normalized_fallback))
+    return default_automation_config()
+
+
+def load_remote_automation_config_for_proxy(config: dict[str, Any]) -> dict[str, Any]:
+    cache_key = remote_gateway_url(config)
+    now = time.time()
+    with REMOTE_AUTOMATION_CONFIG_LOCK:
+        cached_key = str(REMOTE_AUTOMATION_CONFIG_CACHE.get("url") or "")
+        cached_ts = float(REMOTE_AUTOMATION_CONFIG_CACHE.get("ts") or 0.0)
+        cached_config = REMOTE_AUTOMATION_CONFIG_CACHE.get("config") or {}
+        if cached_key == cache_key and cached_config and now - cached_ts < 10:
+            return copy.deepcopy(cached_config)
+
+    response = remote_gateway_request(
+        config,
+        "GET",
+        "/api/automation/config",
+        timeout=REMOTE_CONFIG_FETCH_TIMEOUT,
+    )
+    payload = response.json() if response.content else {}
+    normalized = normalize_remote_automation_config_payload(payload, AUTOMATION_CONFIG.current())
+    with REMOTE_AUTOMATION_CONFIG_LOCK:
+        REMOTE_AUTOMATION_CONFIG_CACHE["ts"] = now
+        REMOTE_AUTOMATION_CONFIG_CACHE["url"] = cache_key
+        REMOTE_AUTOMATION_CONFIG_CACHE["config"] = copy.deepcopy(normalized)
+    return normalized
+
+
+def enrich_remote_dip_swing_runtime_state(
+    state: dict[str, Any],
+    automation: dict[str, Any],
+    public_config: dict[str, Any],
+) -> dict[str, Any]:
+    effective = enforce_only_dip_swing_strategy(deep_merge(default_automation_config(), automation or {}))
+    sanitized = sanitize_only_dip_swing_runtime_state(state, effective)
+    try:
+        analysis_bundle = build_execution_analysis(effective, build_public_client(public_config))
+        analysis = {
+            key: value
+            for key, value in analysis_bundle.items()
+            if key not in {"selectedConfig", "research"}
+        }
+        sanitized["analysis"] = analysis
+        sanitized["research"] = analysis_bundle.get("research") or {}
+
+        candidate_count = int(analysis.get("candidateCount") or 0)
+        market_candidate_count = int(analysis.get("marketCandidateCount") or 0)
+        market_scan_count = int(analysis.get("marketScanCount") or 0)
+        active_symbols = int(
+            ((sanitized.get("lastPipeline") or {}).get("executionSummary") or {}).get("activeSymbols") or 0
+        )
+        selected_from_market = bool(analysis.get("selectedFromMarketScan"))
+
+        sanitized["statusText"] = (
+            "运行中" if sanitized.get("running") and bool(analysis.get("allowNewEntries")) else
+            (analysis.get("decisionLabel") or "观察中") if sanitized.get("running") else
+            "自动量化已停止"
+        )
+        sanitized["modeText"] = (
+            f"{analysis.get('selectedStrategyName', 'BTC 波段')}"
+            f" · {analysis.get('decisionLabel', '待分析')}"
+            f" · 市场候选 {market_candidate_count}/{market_scan_count}"
+            + (" · 轮动接管" if selected_from_market else "")
+        )
+
+        last_pipeline = copy.deepcopy(sanitized.get("lastPipeline") or {})
+        last_pipeline["summary"] = (
+            f"信号 {analysis.get('decisionLabel', '待分析')} · "
+            f"watchlist 候选 {candidate_count} · "
+            f"市场候选 {market_candidate_count} / 扫描 {market_scan_count} · "
+            f"{active_symbols} 币持仓"
+        )
+        sanitized["lastPipeline"] = last_pipeline
+
+        last_applied = copy.deepcopy(sanitized.get("lastAppliedStrategy") or {})
+        last_applied["title"] = analysis.get("selectedStrategyName") or "BTC 波段"
+        last_applied["detail"] = strategy_detail_line(effective)
+        last_applied["stage"] = "running" if bool(analysis.get("allowNewEntries")) else "synced"
+        last_applied["appliedAt"] = sanitized.get("lastCycleAt") or last_applied.get("appliedAt") or now_local_iso()
+        sanitized["lastAppliedStrategy"] = last_applied
+    except Exception as exc:
+        patched_analysis = copy.deepcopy(sanitized.get("analysis") or {})
+        warnings = list(patched_analysis.get("warnings") or [])
+        warnings.append(f"本地重算波段分析失败，沿用远端状态: {exc}")
+        patched_analysis["warnings"] = warnings[-5:]
+        sanitized["analysis"] = patched_analysis
     return sanitized
 
 
@@ -2284,9 +2403,15 @@ def normalize_execution_order(order: dict[str, Any]) -> dict[str, Any]:
         "state",
         "avgPx",
         "fillPx",
+        "fillPnl",
+        "realizedPnl",
+        "fillFee",
         "px",
         "fee",
         "pnl",
+        "subType",
+        "tradeSubType",
+        "tradeCount",
         "cancelSource",
         "cancelSourceReason",
         "uTime",
@@ -2303,6 +2428,203 @@ def normalize_execution_order(order: dict[str, Any]) -> dict[str, Any]:
         else:
             row["reduceOnly"] = bool(value)
     return row
+
+
+def order_decimal_metric(order: dict[str, Any], *keys: str) -> Decimal:
+    first_value: Decimal | None = None
+    for key in keys:
+        raw = order.get(key)
+        if raw in (None, ""):
+            continue
+        value = safe_decimal(raw, "0")
+        if first_value is None:
+            first_value = value
+        if value != 0:
+            return value
+    return first_value if first_value is not None else Decimal("0")
+
+
+def order_realized_pnl(order: dict[str, Any]) -> Decimal:
+    return order_decimal_metric(order, "realizedPnl", "fillPnl", "pnl")
+
+
+def order_total_fee(order: dict[str, Any]) -> Decimal:
+    return order_decimal_metric(order, "fillFee", "fee")
+
+
+def is_close_like_execution_order(order: dict[str, Any]) -> bool:
+    inst_type = str(order.get("instType") or "").upper()
+    side = str(order.get("side") or "").lower()
+    if bool(order.get("reduceOnly")):
+        return True
+    trade_sub_type = str(order.get("tradeSubType") or order.get("subType") or "").strip()
+    if inst_type == "SPOT":
+        return side == "sell"
+    if trade_sub_type in {"5", "6", "100", "101", "125", "126", "208", "209", "274", "275", "328", "329"}:
+        return True
+    reason = str(order.get("strategyReason") or order.get("lastMessage") or "")
+    return any(token in reason for token in ("平", "止盈", "止损", "退场", "回补", "卖出"))
+
+
+def build_execution_journal_insight(orders: list[dict[str, Any]], summary: dict[str, Any] | None = None) -> str:
+    normalized = [normalize_execution_order(item) for item in orders or []]
+    filled = [item for item in normalized if classify_execution_order_state(item) == "filled"]
+    if not filled:
+        return ""
+    close_count = sum(1 for item in filled if is_close_like_execution_order(item))
+    open_count = len(filled) - close_count
+    realized_value = safe_decimal((summary or {}).get("realizedPnl"), "0")
+    fee_value = safe_decimal((summary or {}).get("totalFees"), "0")
+    if close_count <= 0 and open_count > 0:
+        message = f"当前这批单全是开仓，还没看到平仓回报，所以已实现收益还是 0。"
+        if fee_value != 0:
+            message += f" 当前已累计手续费 {format_decimal(fee_value, 4)} USDT。"
+        return message
+    if close_count > 0 and realized_value == 0:
+        message = f"这批单里已经有 {close_count} 笔平仓，但还没拿到明确的已实现收益字段。"
+        if fee_value != 0:
+            message += f" 当前已累计手续费 {format_decimal(fee_value, 4)} USDT。"
+        return message
+    if realized_value != 0:
+        direction = "盈利" if realized_value > 0 else "亏损"
+        return f"当前已实现{direction} {format_decimal(realized_value, 4)} USDT。"
+    return ""
+
+
+def backfill_paper_execution_metrics(orders: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not orders:
+        return []
+    chronological = [copy.deepcopy(item) for item in orders]
+    chronological.sort(key=lambda row: int(row.get("uTime") or row.get("cTime") or 0))
+    states: dict[str, dict[str, Decimal | str]] = {}
+    enriched_by_key: dict[str, dict[str, Any]] = {}
+
+    for raw in chronological:
+        row = normalize_execution_order(raw)
+        key = str(row.get("ordId") or row.get("clOrdId") or "")
+        if not key:
+            continue
+        if classify_execution_order_state(row) != "filled" or str(row.get("tag") or "") != "paper-sim":
+            enriched_by_key[key] = row
+            continue
+
+        inst_id = str(row.get("instId") or "")
+        inst_type = str(row.get("instType") or ("SWAP" if inst_id.endswith("-SWAP") else "SPOT")).upper()
+        side = str(row.get("side") or "").lower()
+        fill_px = safe_decimal(row.get("fillPx") or row.get("avgPx"), "0")
+        fill_size = safe_decimal(row.get("accFillSz") or row.get("fillSz") or row.get("sz"), "0")
+        reduce_only = bool(row.get("reduceOnly"))
+        if fill_px <= 0 or fill_size <= 0 or side not in {"buy", "sell"}:
+            enriched_by_key[key] = row
+            continue
+
+        state = states.setdefault(
+            inst_id,
+            {
+                "positionSide": "flat",
+                "positionSize": Decimal("0"),
+                "entryPrice": Decimal("0"),
+            },
+        )
+        position_side = str(state.get("positionSide") or "flat")
+        position_size = safe_decimal(state.get("positionSize"), "0")
+        entry_price = safe_decimal(state.get("entryPrice"), "0")
+        realized = order_realized_pnl(row)
+        fee = order_total_fee(row)
+        if inst_type == "SWAP":
+            ct_val = safe_decimal(row.get("contractValue"), decimal_to_str(default_swap_contract_value(inst_id)))
+            if fee == 0:
+                fee = -(fill_size * ct_val * fill_px * PAPER_SWAP_FEE_RATE)
+            if side == "buy":
+                row.setdefault("tradeSubType", "6" if position_side == "short" and position_size > 0 else "3")
+                if realized == 0 and position_side == "short" and position_size > 0:
+                    close_size = min(position_size, fill_size)
+                    realized = (entry_price - fill_px) * close_size * ct_val
+                if position_side == "short":
+                    closed = min(position_size, fill_size)
+                    remaining = max(Decimal("0"), position_size - closed)
+                    if reduce_only or fill_size <= position_size:
+                        state["positionSize"] = remaining
+                        state["positionSide"] = "flat" if remaining <= 0 else "short"
+                        state["entryPrice"] = Decimal("0") if remaining <= 0 else entry_price
+                    else:
+                        opened = fill_size - position_size
+                        state["positionSize"] = opened
+                        state["positionSide"] = "long"
+                        state["entryPrice"] = fill_px if opened > 0 else Decimal("0")
+                else:
+                    next_size = position_size if reduce_only else position_size + fill_size
+                    state["positionSize"] = next_size
+                    state["positionSide"] = "flat" if next_size <= 0 else "long"
+                    if reduce_only or next_size <= 0:
+                        state["entryPrice"] = Decimal("0")
+                    elif position_side == "long" and position_size > 0 and entry_price > 0:
+                        state["entryPrice"] = ((entry_price * position_size) + (fill_px * fill_size)) / next_size
+                    else:
+                        state["entryPrice"] = fill_px
+            else:
+                row.setdefault("tradeSubType", "5" if position_side == "long" and position_size > 0 else "4")
+                if realized == 0 and position_side == "long" and position_size > 0:
+                    close_size = min(position_size, fill_size)
+                    realized = (fill_px - entry_price) * close_size * ct_val
+                if position_side == "long":
+                    closed = min(position_size, fill_size)
+                    remaining = max(Decimal("0"), position_size - closed)
+                    if reduce_only or fill_size <= position_size:
+                        state["positionSize"] = remaining
+                        state["positionSide"] = "flat" if remaining <= 0 else "long"
+                        state["entryPrice"] = Decimal("0") if remaining <= 0 else entry_price
+                    else:
+                        opened = fill_size - position_size
+                        state["positionSize"] = opened
+                        state["positionSide"] = "short"
+                        state["entryPrice"] = fill_px if opened > 0 else Decimal("0")
+                else:
+                    next_size = position_size if reduce_only else position_size + fill_size
+                    state["positionSize"] = next_size
+                    state["positionSide"] = "flat" if next_size <= 0 else "short"
+                    if reduce_only or next_size <= 0:
+                        state["entryPrice"] = Decimal("0")
+                    elif position_side == "short" and position_size > 0 and entry_price > 0:
+                        state["entryPrice"] = ((entry_price * position_size) + (fill_px * fill_size)) / next_size
+                    else:
+                        state["entryPrice"] = fill_px
+        else:
+            if fee == 0:
+                fee = -(fill_size * fill_px * PAPER_SPOT_FEE_RATE)
+            row.setdefault("tradeSubType", "1" if side == "buy" else "2")
+            if side == "buy":
+                next_size = position_size + fill_size
+                if next_size > 0:
+                    if position_size > 0 and entry_price > 0:
+                        state["entryPrice"] = ((entry_price * position_size) + (fill_px * fill_size)) / next_size
+                    else:
+                        state["entryPrice"] = fill_px
+                state["positionSize"] = next_size
+                state["positionSide"] = "flat" if next_size <= 0 else "long"
+            else:
+                close_size = min(position_size, fill_size)
+                if realized == 0 and position_size > 0 and entry_price > 0:
+                    realized = (fill_px - entry_price) * close_size
+                remaining = max(Decimal("0"), position_size - close_size)
+                state["positionSize"] = remaining
+                state["positionSide"] = "flat" if remaining <= 0 else "long"
+                state["entryPrice"] = Decimal("0") if remaining <= 0 else entry_price
+
+        if "fee" not in row or safe_decimal(row.get("fee"), "0") == 0:
+            row["fee"] = decimal_to_str(fee)
+        row["fillFee"] = decimal_to_str(fee)
+        if "pnl" not in row or safe_decimal(row.get("pnl"), "0") == 0:
+            row["pnl"] = decimal_to_str(realized)
+        row["fillPnl"] = decimal_to_str(realized)
+        row["realizedPnl"] = decimal_to_str(realized)
+        enriched_by_key[key] = row
+
+    enriched: list[dict[str, Any]] = []
+    for raw in orders:
+        key = str(raw.get("ordId") or raw.get("clOrdId") or "")
+        enriched.append(copy.deepcopy(enriched_by_key.get(key, normalize_execution_order(raw))))
+    return enriched
 
 
 def classify_execution_order_state(order: dict[str, Any]) -> str:
@@ -2339,7 +2661,7 @@ def execution_tag_family(order: dict[str, Any]) -> str:
 
 
 def build_execution_journal_summary(orders: list[dict[str, Any]]) -> dict[str, Any]:
-    normalized_orders = [normalize_execution_order(item) for item in orders]
+    normalized_orders = backfill_paper_execution_metrics([normalize_execution_order(item) for item in orders])
     total_orders = len(normalized_orders)
     filled_orders = 0
     working_orders = 0
@@ -2360,6 +2682,8 @@ def build_execution_journal_summary(orders: list[dict[str, Any]]) -> dict[str, A
     for order in normalized_orders:
         kind = classify_execution_order_state(order)
         tag_family = execution_tag_family(order)
+        realized_value = order_realized_pnl(order)
+        fee_value = order_total_fee(order)
         if kind == "filled":
             filled_orders += 1
         elif kind == "working":
@@ -2373,12 +2697,12 @@ def build_execution_journal_summary(orders: list[dict[str, Any]]) -> dict[str, A
             if not last_cancel_reason:
                 last_cancel_reason = str(order.get("cancelSourceReason") or order.get("outcome") or "").strip()
 
-        realized_pnl += safe_decimal(order.get("pnl"), "0")
-        total_fees += safe_decimal(order.get("fee"), "0")
+        realized_pnl += realized_value
+        total_fees += fee_value
         if tag_family:
             arb_order_count += 1
-            arb_realized_pnl += safe_decimal(order.get("pnl"), "0")
-            arb_total_fees += safe_decimal(order.get("fee"), "0")
+            arb_realized_pnl += realized_value
+            arb_total_fees += fee_value
             if tag_family == "entry":
                 arb_entry_orders += 1
             elif tag_family == "hedge":
@@ -2420,12 +2744,12 @@ def build_execution_journal_summary(orders: list[dict[str, Any]]) -> dict[str, A
             target["canceledOrders"] = int(target["canceledOrders"]) + 1
         elif kind == "rejected":
             target["rejectedOrders"] = int(target["rejectedOrders"]) + 1
-        target["realizedPnl"] = decimal_to_str(safe_decimal(target.get("realizedPnl"), "0") + safe_decimal(order.get("pnl"), "0"))
-        target["totalFees"] = decimal_to_str(safe_decimal(target.get("totalFees"), "0") + safe_decimal(order.get("fee"), "0"))
+        target["realizedPnl"] = decimal_to_str(safe_decimal(target.get("realizedPnl"), "0") + realized_value)
+        target["totalFees"] = decimal_to_str(safe_decimal(target.get("totalFees"), "0") + fee_value)
         if tag_family:
             target["arbOrderCount"] = int(target.get("arbOrderCount") or 0) + 1
-            target["arbRealizedPnl"] = decimal_to_str(safe_decimal(target.get("arbRealizedPnl"), "0") + safe_decimal(order.get("pnl"), "0"))
-            target["arbTotalFees"] = decimal_to_str(safe_decimal(target.get("arbTotalFees"), "0") + safe_decimal(order.get("fee"), "0"))
+            target["arbRealizedPnl"] = decimal_to_str(safe_decimal(target.get("arbRealizedPnl"), "0") + realized_value)
+            target["arbTotalFees"] = decimal_to_str(safe_decimal(target.get("arbTotalFees"), "0") + fee_value)
             if tag_family == "entry":
                 target["arbEntryOrders"] = int(target.get("arbEntryOrders") or 0) + 1
             elif tag_family == "hedge":
@@ -2446,6 +2770,10 @@ def build_execution_journal_summary(orders: list[dict[str, Any]]) -> dict[str, A
 
     symbols = list(symbol_rows.values())
     symbols.sort(key=lambda row: int(row.get("lastTime") or 0), reverse=True)
+    insight = build_execution_journal_insight(normalized_orders, {
+        "realizedPnl": decimal_to_str(realized_pnl),
+        "totalFees": decimal_to_str(total_fees),
+    })
     return {
         "totalOrders": total_orders,
         "filledOrders": filled_orders,
@@ -2464,6 +2792,7 @@ def build_execution_journal_summary(orders: list[dict[str, Any]]) -> dict[str, A
         "arbRealizedPnl": decimal_to_str(arb_realized_pnl),
         "arbTotalFees": decimal_to_str(arb_total_fees),
         "arbNetPnl": decimal_to_str(arb_realized_pnl + arb_total_fees),
+        "insight": insight,
         "symbols": symbols,
     }
 
@@ -2519,7 +2848,7 @@ def get_stored_local_orders(inst_type: str = "", limit: int = 20) -> list[dict[s
 def get_execution_journal_snapshot(inst_type: str = "", limit: int = 20) -> dict[str, Any]:
     state = LOCAL_ORDER_STORE.current()
     if inst_type:
-        orders = get_stored_local_orders(inst_type, limit=limit)
+        orders = backfill_paper_execution_metrics(get_stored_local_orders(inst_type, limit=limit))
         summary = build_execution_journal_summary(orders)
         return {
             "orders": orders,
@@ -2528,13 +2857,77 @@ def get_execution_journal_snapshot(inst_type: str = "", limit: int = 20) -> dict
             "lastReconciledAt": str(state.get("lastReconciledAt") or ""),
             "lastSource": str(state.get("lastSource") or ""),
         }
+    orders = backfill_paper_execution_metrics(list((state.get("orders") or [])[:limit]))
+    summary = build_execution_journal_summary(orders)
     return {
-        "orders": list((state.get("orders") or [])[:limit]),
-        "summary": copy.deepcopy(state.get("summary") or {}),
-        "symbols": list(state.get("symbols") or []),
+        "orders": orders,
+        "summary": {key: value for key, value in summary.items() if key != "symbols"},
+        "symbols": summary.get("symbols") or [],
         "lastReconciledAt": str(state.get("lastReconciledAt") or ""),
         "lastSource": str(state.get("lastSource") or ""),
     }
+
+
+def aggregate_recent_fills_by_order(fills: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    grouped: dict[str, dict[str, Any]] = {}
+    for raw in fills or []:
+        row = normalize_execution_order(raw)
+        order_id = str(row.get("ordId") or "").strip()
+        if not order_id:
+            continue
+        target = grouped.setdefault(
+            order_id,
+            {
+                "fillPnl": Decimal("0"),
+                "fillFee": Decimal("0"),
+                "fillSz": Decimal("0"),
+                "tradeCount": 0,
+                "subType": "",
+                "fillTime": "0",
+            },
+        )
+        target["fillPnl"] += safe_decimal(row.get("fillPnl"), "0")
+        target["fillFee"] += safe_decimal(row.get("fee"), "0")
+        target["fillSz"] += safe_decimal(row.get("fillSz"), "0")
+        target["tradeCount"] = int(target.get("tradeCount") or 0) + 1
+        fill_time = str(row.get("fillTime") or row.get("uTime") or row.get("cTime") or "0")
+        if int(fill_time or 0) >= int(target.get("fillTime") or 0):
+            target["fillTime"] = fill_time
+            target["subType"] = str(row.get("subType") or "")
+    return grouped
+
+
+def enrich_execution_orders_with_fills(
+    orders: list[dict[str, Any]],
+    fills: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if not orders:
+        return []
+    grouped = aggregate_recent_fills_by_order(fills)
+    if not grouped:
+        return [normalize_execution_order(item) for item in orders]
+    enriched: list[dict[str, Any]] = []
+    for raw in orders:
+        row = normalize_execution_order(raw)
+        order_id = str(row.get("ordId") or "").strip()
+        fill_meta = grouped.get(order_id)
+        if not fill_meta:
+            enriched.append(row)
+            continue
+        pnl_value = decimal_to_str(fill_meta["fillPnl"])
+        fee_value = decimal_to_str(fill_meta["fillFee"])
+        row["fillPnl"] = pnl_value
+        row["fillFee"] = fee_value
+        row["tradeCount"] = str(fill_meta["tradeCount"])
+        row["tradeSubType"] = str(fill_meta.get("subType") or "")
+        if str(row.get("fillTime") or "") in {"", "0"} and str(fill_meta.get("fillTime") or "") not in {"", "0"}:
+            row["fillTime"] = str(fill_meta["fillTime"])
+        if order_realized_pnl(row) == 0 and fill_meta["fillPnl"] != 0:
+            row["realizedPnl"] = pnl_value
+        if order_total_fee(row) == 0 and fill_meta["fillFee"] != 0:
+            row["fee"] = fee_value
+        enriched.append(row)
+    return enriched
 
 
 def derive_orders_from_automation_state(state: dict[str, Any] | None = None) -> list[dict[str, Any]]:
@@ -2586,6 +2979,34 @@ def derive_orders_from_automation_state(state: dict[str, Any] | None = None) -> 
         reverse=True,
     )
     return items[:20]
+
+
+def default_swap_contract_value(inst_id: str) -> Decimal:
+    base = str(inst_id or "").split("-")[0].upper()
+    if base == "BTC":
+        return Decimal("0.01")
+    if base == "ETH":
+        return Decimal("0.1")
+    return Decimal("1")
+
+
+def paper_market_contract_value(market: dict[str, Any] | None) -> Decimal:
+    snapshot = market or {}
+    inst_id = str(snapshot.get("instId") or "")
+    return safe_decimal(snapshot.get("contractValue"), decimal_to_str(default_swap_contract_value(inst_id)))
+
+
+def paper_swap_unrealized_pnl(market: dict[str, Any] | None) -> Decimal:
+    snapshot = market or {}
+    position_side = str(snapshot.get("positionSide") or "flat")
+    position_size = safe_decimal(snapshot.get("positionSize"), "0")
+    entry_price = safe_decimal(snapshot.get("entryPrice"), "0")
+    last_price = safe_decimal(snapshot.get("lastPrice"), "0")
+    ct_val = paper_market_contract_value(snapshot)
+    if position_side == "flat" or position_size <= 0 or entry_price <= 0 or last_price <= 0 or ct_val <= 0:
+        return Decimal("0")
+    direction = Decimal("1") if position_side == "long" else Decimal("-1")
+    return direction * (last_price - entry_price) * position_size * ct_val
 
 
 def get_local_recent_orders(inst_type: str = "", limit: int = 20) -> list[dict[str, Any]]:
@@ -2853,8 +3274,9 @@ class OkxClient:
     def _paper_account_balance(self) -> dict[str, Any]:
         state = self._paper_state()
         automation = AUTOMATION_CONFIG.current()
-        total_eq = self._paper_total_eq()
         spot_market = (state.get("markets") or {}).get("spot") or {}
+        swap_market = (state.get("markets") or {}).get("swap") or {}
+        total_eq = self._paper_total_eq() + paper_swap_unrealized_pnl(swap_market)
         spot_inst = str(automation.get("spotInstId") or "BTC-USDT")
         base_ccy = spot_inst.split("-")[0]
         base_size = safe_decimal(spot_market.get("positionSize"), "0")
@@ -2905,7 +3327,7 @@ class OkxClient:
             "pos": decimal_to_str(signed_pos),
             "avgPx": str(swap_market.get("entryPrice") or ""),
             "posSide": "net",
-            "upl": "0",
+            "upl": decimal_to_str(paper_swap_unrealized_pnl(swap_market)),
         }
         return {"code": "0", "data": [payload]}
 
@@ -2928,28 +3350,76 @@ class OkxClient:
         filled_size = safe_decimal(payload.get("sz"), "0")
         state = self._paper_state()
         markets = state.get("markets") or {}
-        automation = AUTOMATION_CONFIG.current()
+        current_eq_before = self._paper_total_eq()
+        realized_pnl = Decimal("0")
+        order_fee = Decimal("0")
+        trade_sub_type = "1" if side == "buy" else "2"
+        reduce_only = bool(payload.get("reduceOnly"))
 
         if is_swap:
             market_key = "swap"
             current = copy.deepcopy(markets.get("swap") or default_market_state())
             current_side = str(current.get("positionSide") or "flat")
             current_size = safe_decimal(current.get("positionSize"), "0")
-            reduce_only = bool(payload.get("reduceOnly"))
+            current_entry = safe_decimal(current.get("entryPrice"), "0")
+            meta = (self.get_public_instruments("SWAP", inst_id).get("data") or [{}])[0]
+            ct_val = safe_decimal(meta.get("ctVal"), decimal_to_str(default_swap_contract_value(inst_id)))
+            order_fee = -(filled_size * ct_val * fill_px * PAPER_SWAP_FEE_RATE)
+            next_entry = current_entry
             if side == "buy":
                 if current_side == "short":
-                    next_size = max(Decimal("0"), current_size - filled_size)
-                    next_side = "flat" if next_size <= 0 else "short"
+                    close_size = min(current_size, filled_size)
+                    realized_pnl = (current_entry - fill_px) * close_size * ct_val
+                    remaining_size = max(Decimal("0"), current_size - close_size)
+                    if reduce_only or filled_size <= current_size:
+                        next_size = remaining_size
+                        next_side = "flat" if next_size <= 0 else "short"
+                        next_entry = current_entry if next_size > 0 else Decimal("0")
+                        trade_sub_type = "6"
+                    else:
+                        open_size = filled_size - current_size
+                        next_size = open_size
+                        next_side = "long"
+                        next_entry = fill_px
+                        trade_sub_type = "6"
                 else:
                     next_size = current_size if reduce_only else current_size + filled_size
                     next_side = "flat" if next_size <= 0 else "long"
+                    if reduce_only:
+                        next_entry = Decimal("0")
+                    elif current_side == "long" and current_size > 0 and current_entry > 0 and next_size > 0:
+                        next_entry = ((current_entry * current_size) + (fill_px * filled_size)) / next_size
+                    else:
+                        next_entry = fill_px if next_size > 0 else Decimal("0")
+                    trade_sub_type = "3"
             else:
                 if current_side == "long":
-                    next_size = max(Decimal("0"), current_size - filled_size)
-                    next_side = "flat" if next_size <= 0 else "long"
+                    close_size = min(current_size, filled_size)
+                    realized_pnl = (fill_px - current_entry) * close_size * ct_val
+                    remaining_size = max(Decimal("0"), current_size - close_size)
+                    if reduce_only or filled_size <= current_size:
+                        next_size = remaining_size
+                        next_side = "flat" if next_size <= 0 else "long"
+                        next_entry = current_entry if next_size > 0 else Decimal("0")
+                        trade_sub_type = "5"
+                    else:
+                        open_size = filled_size - current_size
+                        next_size = open_size
+                        next_side = "short"
+                        next_entry = fill_px
+                        trade_sub_type = "5"
                 else:
                     next_size = current_size if reduce_only else current_size + filled_size
                     next_side = "flat" if next_size <= 0 else "short"
+                    if reduce_only:
+                        next_entry = Decimal("0")
+                    elif current_side == "short" and current_size > 0 and current_entry > 0 and next_size > 0:
+                        next_entry = ((current_entry * current_size) + (fill_px * filled_size)) / next_size
+                    else:
+                        next_entry = fill_px if next_size > 0 else Decimal("0")
+                    trade_sub_type = "4"
+
+            current_eq_after = current_eq_before + realized_pnl + order_fee
 
             def mutate(current_state: dict[str, Any]) -> None:
                 market = current_state["markets"].setdefault(market_key, default_market_state())
@@ -2959,14 +3429,20 @@ class OkxClient:
                         "instId": inst_id,
                         "positionSide": next_side,
                         "positionSize": decimal_to_str(next_size),
-                        "positionNotional": decimal_to_str(next_size * fill_px),
-                        "entryPrice": "" if next_side == "flat" else decimal_to_str(fill_px),
+                        "positionNotional": decimal_to_str(next_size * fill_px * ct_val),
+                        "entryPrice": "" if next_side == "flat" else decimal_to_str(next_entry),
                         "lastPrice": decimal_to_str(fill_px),
+                        "floatingPnl": "0",
+                        "floatingPnlPct": "0",
                         "lastTradeAt": now_local_iso(),
                         "lastActionAt": now_local_iso(),
                         "lastOrderId": ord_id,
+                        "contractValue": decimal_to_str(ct_val),
                     }
                 )
+                if not current_state.get("sessionStartEq"):
+                    current_state["sessionStartEq"] = decimal_to_str(current_eq_before)
+                current_state["currentEq"] = decimal_to_str(current_eq_after)
 
             AUTOMATION_STATE.update(mutate)
             inst_type = "SWAP"
@@ -2975,14 +3451,28 @@ class OkxClient:
             market_key = "spot"
             current = copy.deepcopy(markets.get("spot") or default_market_state())
             current_size = safe_decimal(current.get("positionSize"), "0")
+            current_entry = safe_decimal(current.get("entryPrice"), "0")
             if side == "buy":
                 quote_budget = filled_size
                 base_fill = (quote_budget / fill_px) if fill_px > 0 else Decimal("0")
                 next_size = current_size + base_fill
                 actual_fill_size = base_fill
+                next_entry = (
+                    ((current_entry * current_size) + (fill_px * base_fill)) / next_size
+                    if current_size > 0 and current_entry > 0 and next_size > 0
+                    else fill_px if next_size > 0 else Decimal("0")
+                )
+                order_fee = -(quote_budget * PAPER_SPOT_FEE_RATE)
+                trade_sub_type = "1"
             else:
                 actual_fill_size = min(current_size, filled_size)
                 next_size = max(Decimal("0"), current_size - actual_fill_size)
+                next_entry = current_entry if next_size > 0 else Decimal("0")
+                realized_pnl = (fill_px - current_entry) * actual_fill_size if current_entry > 0 else Decimal("0")
+                order_fee = -(actual_fill_size * fill_px * PAPER_SPOT_FEE_RATE)
+                trade_sub_type = "2"
+
+            current_eq_after = current_eq_before + realized_pnl + order_fee
 
             def mutate(current_state: dict[str, Any]) -> None:
                 market = current_state["markets"].setdefault(market_key, default_market_state())
@@ -2993,13 +3483,18 @@ class OkxClient:
                         "positionSide": "flat" if next_size <= 0 else "long",
                         "positionSize": decimal_to_str(next_size),
                         "positionNotional": decimal_to_str(next_size * fill_px),
-                        "entryPrice": "" if next_size <= 0 else decimal_to_str(fill_px),
+                        "entryPrice": "" if next_size <= 0 else decimal_to_str(next_entry),
                         "lastPrice": decimal_to_str(fill_px),
+                        "floatingPnl": "0",
+                        "floatingPnlPct": "0",
                         "lastTradeAt": now_local_iso(),
                         "lastActionAt": now_local_iso(),
                         "lastOrderId": ord_id,
                     }
                 )
+                if not current_state.get("sessionStartEq"):
+                    current_state["sessionStartEq"] = decimal_to_str(current_eq_before)
+                current_state["currentEq"] = decimal_to_str(current_eq_after)
 
             AUTOMATION_STATE.update(mutate)
             inst_type = "SPOT"
@@ -3021,9 +3516,14 @@ class OkxClient:
             "avgPx": decimal_to_str(fill_px),
             "fillPx": decimal_to_str(fill_px),
             "px": str(payload.get("px") or ""),
-            "fee": "0",
-            "reduceOnly": bool(payload.get("reduceOnly")),
+            "fee": decimal_to_str(order_fee),
+            "fillFee": decimal_to_str(order_fee),
+            "pnl": decimal_to_str(realized_pnl),
+            "fillPnl": decimal_to_str(realized_pnl),
+            "realizedPnl": decimal_to_str(realized_pnl),
+            "reduceOnly": reduce_only,
             "posSide": pos_side,
+            "tradeSubType": trade_sub_type,
             "uTime": now_ms,
             "cTime": now_ms,
             "tag": "paper-sim",
@@ -3147,6 +3647,20 @@ class OkxClient:
             if self._paper_fallback_allowed():
                 return self._paper_recent_orders()
             raise
+
+    def get_recent_fills(self, inst_type: str, limit: int = 100) -> dict[str, Any]:
+        params = {"instType": inst_type, "limit": limit}
+        if self._paper_state_authoritative():
+            return {"code": "0", "data": [], "_paperSim": True}
+        try:
+            return self._request("GET", "/api/v5/trade/fills-history", params=params)
+        except Exception:
+            try:
+                return self._request("GET", "/api/v5/trade/fills", params=params)
+            except Exception:
+                if self._paper_fallback_allowed():
+                    return {"code": "0", "data": [], "_paperSim": True}
+                raise
 
     def get_ticker(self, inst_id: str) -> dict[str, Any]:
         try:
@@ -3594,11 +4108,12 @@ def strategy_detail_line(config: dict[str, Any], origin_label: str = "") -> str:
     if str(config.get("strategyPreset") or "") == "dip_swing":
         target_multiple = resolve_target_balance_multiple(config)
         parts = [
-            "趋势转强 + 回踩接多",
+            "市场扫描 + 净优势过滤 + 目标驱动仓位",
+            "趋势扩散 + 回踩反弹 + 不追价",
             f"只做多 · {config.get('swapTdMode', 'isolated')} {config.get('swapLeverage', '2')}x",
             f"目标止盈 {config.get('takeProfitPct', '8')}%",
             f"止损 {config.get('stopLossPct', '2.5')}%",
-            f"回撤阈值 {format_decimal(DIP_SWING_PULLBACK_PCT, 1)}%",
+            f"回撤阈值 {format_decimal(DIP_SWING_PULLBACK_PCT, 1)}% · 反弹 {format_decimal(DIP_SWING_REBOUND_PCT, 2)}%",
             f"强平缓冲 ≥ {format_decimal(DIP_SWING_MIN_LIQ_BUFFER_PCT, 0)}%",
         ]
         if target_multiple > Decimal("1"):
@@ -3715,8 +4230,15 @@ def build_pullback_signal(
     sample = candles[-max(slow, 12):]
     recent_high = max((row["high"] for row in sample), default=last_close)
     recent_low = min((row["low"] for row in sample), default=last_close)
+    pullback_window = candles[-min(len(candles), max(fast * 2, 6)) :]
+    pullback_low = min((row["low"] for row in pullback_window), default=last_close)
     pullback_pct = pct_gap(recent_high, last_close)
     rebound_pct = pct_gap(last_close, recent_low)
+    ema_spread_pct = pct_gap(curr_fast, curr_slow)
+    fast_slope_pct = pct_gap(curr_fast, prev_fast)
+    slow_slope_pct = pct_gap(curr_slow, prev_slow)
+    price_vs_fast_pct = pct_gap(last_close, curr_fast)
+    price_vs_slow_pct = pct_gap(last_close, curr_slow)
     if curr_fast > curr_slow:
         trend = "up"
     elif curr_fast < curr_slow:
@@ -3724,12 +4246,42 @@ def build_pullback_signal(
     else:
         trend = "flat"
     bull_cross = prev_fast <= prev_slow and curr_fast > curr_slow
-    bounce_ready = last_close >= prev_close and rebound_pct >= rebound_threshold_pct
-    if trend == "up" and bull_cross:
+    close_above_fast = last_close >= curr_fast
+    close_above_slow = last_close >= curr_slow
+    pullback_touched_fast = pullback_low <= max(curr_fast, prev_fast)
+    rebound_ready = last_close >= prev_close and rebound_pct >= rebound_threshold_pct and close_above_fast
+    not_overextended = price_vs_fast_pct <= DIP_SWING_MAX_CHASE_PCT
+    ema_spread_ready = ema_spread_pct >= DIP_SWING_MIN_EMA_SPREAD_PCT
+    fast_slope_ready = fast_slope_pct >= DIP_SWING_MIN_FAST_SLOPE_PCT
+    slow_slope_ready = slow_slope_pct >= Decimal("0")
+    trend_strength_ready = trend == "up" and ema_spread_ready and fast_slope_ready and slow_slope_ready
+    pullback_context = pullback_pct >= pullback_threshold_pct and pullback_touched_fast
+    bull_cross_context = bull_cross and close_above_fast and close_above_slow
+    entry_checks = {
+        "trend_up": trend == "up",
+        "ema_spread": ema_spread_ready,
+        "fast_slope": fast_slope_ready,
+        "slow_slope": slow_slope_ready,
+        "pullback_context": pullback_context or bull_cross_context,
+        "rebound_ready": rebound_ready or bull_cross_context,
+        "not_overextended": not_overextended,
+        "close_above_slow": close_above_slow,
+    }
+    entry_score = sum(1 for ready in entry_checks.values() if ready)
+    exit_checks = {
+        "trend_down": trend == "down",
+        "close_below_fast": last_close < curr_fast,
+        "close_below_slow": last_close < curr_slow,
+        "fast_slope_negative": fast_slope_pct <= (Decimal("0") - DIP_SWING_MIN_FAST_SLOPE_PCT),
+        "slow_slope_negative": slow_slope_pct < Decimal("0"),
+    }
+    exit_score = sum(1 for ready in exit_checks.values() if ready)
+    weak_trend_ready = exit_score >= DIP_SWING_MIN_EXIT_SCORE
+    if trend_strength_ready and bull_cross_context and not_overextended and entry_score >= DIP_SWING_MIN_ENTRY_SCORE:
         signal = "bull_cross_buy"
-    elif trend == "up" and pullback_pct >= pullback_threshold_pct and bounce_ready:
+    elif trend_strength_ready and pullback_context and rebound_ready and not_overextended and entry_score >= DIP_SWING_MIN_ENTRY_SCORE:
         signal = "pullback_buy"
-    elif trend == "down":
+    elif weak_trend_ready:
         signal = "trend_break"
     else:
         signal = "hold"
@@ -3744,6 +4296,21 @@ def build_pullback_signal(
         "pullbackPct": decimal_to_str(pullback_pct),
         "reboundPct": decimal_to_str(rebound_pct),
         "bullCross": bull_cross,
+        "pullbackTouchedFast": pullback_touched_fast,
+        "closeAboveFast": close_above_fast,
+        "closeAboveSlow": close_above_slow,
+        "trendStrengthReady": trend_strength_ready,
+        "pullbackContext": pullback_context,
+        "reboundReady": rebound_ready,
+        "notOverextended": not_overextended,
+        "emaSpreadPct": decimal_to_str(ema_spread_pct),
+        "fastSlopePct": decimal_to_str(fast_slope_pct),
+        "slowSlopePct": decimal_to_str(slow_slope_pct),
+        "priceVsFastPct": decimal_to_str(price_vs_fast_pct),
+        "priceVsSlowPct": decimal_to_str(price_vs_slow_pct),
+        "entryScore": entry_score,
+        "exitScore": exit_score,
+        "weakTrendReady": weak_trend_ready,
     }
 
 
@@ -5291,6 +5858,239 @@ def build_basis_arb_scan_target(config: dict[str, Any], symbol: str) -> dict[str
     return target
 
 
+def build_dip_swing_scan_target(config: dict[str, Any], symbol: str) -> dict[str, Any]:
+    normalized_symbol = normalize_symbol_token(symbol)
+    target = deep_merge({}, config)
+    symbol_override = sanitize_only_dip_swing_override(
+        copy.deepcopy((config.get("watchlistOverrides") or {}).get(normalized_symbol) or {})
+    )
+    target["watchlistSymbols"] = normalized_symbol
+    target["watchlistSymbol"] = normalized_symbol
+    target["watchlistIndex"] = 0
+    target["watchlistCount"] = 1
+    target["watchlistOverrides"] = {normalized_symbol: copy.deepcopy(symbol_override)} if symbol_override else {}
+    target["watchlistOverride"] = copy.deepcopy(symbol_override)
+    target["spotInstId"] = f"{normalized_symbol}-USDT"
+    target["swapInstId"] = f"{normalized_symbol}-USDT-SWAP"
+    target = deep_merge(target, symbol_override)
+    return target
+
+
+def evaluate_dip_swing_target_snapshot(
+    target: dict[str, Any],
+    swap_ticker: dict[str, Any],
+    mark_price_row: dict[str, Any],
+    funding_row: dict[str, Any],
+    open_interest_row: dict[str, Any],
+    candles: list[dict[str, Any]],
+    positions: list[dict[str, Any]],
+) -> dict[str, Any]:
+    signal = build_pullback_signal(candles, int(target["fastEma"]), int(target["slowEma"]))
+    last_price = safe_decimal(signal.get("lastClose"), "0")
+    mark_price = safe_decimal(mark_price_row.get("markPx"), "0")
+    funding_rate_pct = safe_decimal(funding_row.get("fundingRate"), "0") * Decimal("100")
+    basis_pct = pct_gap(last_price, mark_price)
+    volatility_pct = recent_range_pct(candles)
+    pullback_pct = safe_decimal(signal.get("pullbackPct"), "0")
+    rebound_pct = safe_decimal(signal.get("reboundPct"), "0")
+    ema_spread_pct = safe_decimal(signal.get("emaSpreadPct"), "0")
+    fast_slope_pct = safe_decimal(signal.get("fastSlopePct"), "0")
+    slow_slope_pct = safe_decimal(signal.get("slowSlopePct"), "0")
+    price_vs_fast_pct = safe_decimal(signal.get("priceVsFastPct"), "0")
+    entry_score = int(signal.get("entryScore") or 0)
+    exit_score = int(signal.get("exitScore") or 0)
+    estimated_cost_pct = DIP_SWING_EST_ROUNDTRIP_COST_PCT + min(Decimal("0.12"), volatility_pct * Decimal("0.04"))
+    setup_edge_pct = max(ema_spread_pct, Decimal("0")) + max(fast_slope_pct, Decimal("0")) + max(rebound_pct, Decimal("0"))
+    net_edge_pct = setup_edge_pct - estimated_cost_pct
+    open_position = next((row for row in positions if safe_decimal(row.get("pos"), "0") != 0), {})
+    pos_value = safe_decimal(open_position.get("pos"), "0")
+    position_side = "flat"
+    if pos_value > 0:
+        position_side = "long"
+    elif pos_value < 0:
+        position_side = "short"
+    liq_price = safe_decimal(open_position.get("liqPx"), "0")
+    liq_buffer = liquidation_buffer_pct(last_price, liq_price, position_side)
+    open_interest = (
+        open_interest_row.get("oiUsd")
+        or open_interest_row.get("oi")
+        or open_interest_row.get("oiCcy")
+        or "--"
+    )
+    candidate = (
+        bool(signal.get("trendStrengthReady"))
+        and bool(signal.get("notOverextended"))
+        and (
+            bool(signal.get("bullCross"))
+            or (bool(signal.get("pullbackContext")) and bool(signal.get("reboundReady")))
+        )
+        and entry_score >= DIP_SWING_MIN_ENTRY_SCORE
+        and net_edge_pct >= DIP_SWING_MIN_NET_EDGE_PCT
+        and position_side == "flat"
+    )
+    return {
+        "symbol": str(target.get("watchlistSymbol") or strategy_symbol_label(target)),
+        "target": target,
+        "swapTicker": swap_ticker,
+        "signal": signal,
+        "candles": candles,
+        "lastPrice": last_price,
+        "markPrice": mark_price,
+        "fundingRatePct": funding_rate_pct,
+        "basisPct": basis_pct,
+        "volatilityPct": volatility_pct,
+        "pullbackPct": pullback_pct,
+        "reboundPct": rebound_pct,
+        "emaSpreadPct": ema_spread_pct,
+        "fastSlopePct": fast_slope_pct,
+        "slowSlopePct": slow_slope_pct,
+        "priceVsFastPct": price_vs_fast_pct,
+        "entryScore": entry_score,
+        "exitScore": exit_score,
+        "estimatedCostPct": estimated_cost_pct,
+        "setupEdgePct": setup_edge_pct,
+        "netEdgePct": net_edge_pct,
+        "positionSide": position_side,
+        "liqPrice": liq_price,
+        "liqBufferPct": liq_buffer,
+        "openInterest": open_interest,
+        "candidate": candidate,
+    }
+
+
+def fetch_dip_swing_target_snapshot(client: OkxClient, target: dict[str, Any]) -> dict[str, Any]:
+    inst_id = str(target.get("swapInstId") or "")
+    jobs: dict[str, Any] = {
+        "swapTicker": lambda: extract_first_row(client.get_ticker(inst_id)),
+        "markPrice": lambda: extract_first_row(client.get_mark_price("SWAP", inst_id)),
+        "fundingRate": lambda: extract_first_row(client.get_funding_rate(inst_id)),
+        "openInterest": lambda: extract_first_row(client.get_open_interest("SWAP", inst_id)),
+        "swapCandles": lambda: get_closed_candles(
+            client,
+            inst_id,
+            target["bar"],
+            max(int(target.get("slowEma", 21)) + 30, 80),
+        ),
+        "positions": lambda: client.get_positions(inst_id).get("data", []) if getattr(client, "api_key", "") else [],
+    }
+    fetched: dict[str, Any] = {}
+    errors: list[str] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs)) as executor:
+        future_map = {executor.submit(fn): key for key, fn in jobs.items()}
+        for future in concurrent.futures.as_completed(future_map):
+            key = future_map[future]
+            try:
+                fetched[key] = future.result()
+            except Exception as exc:
+                errors.append(f"{key}: {exc}")
+    if errors:
+        raise OkxApiError(f"{inst_id} 分析失败: {'; '.join(errors)}")
+    return evaluate_dip_swing_target_snapshot(
+        target,
+        fetched["swapTicker"],
+        fetched["markPrice"],
+        fetched["fundingRate"],
+        fetched["openInterest"],
+        fetched["swapCandles"],
+        fetched["positions"],
+    )
+
+
+def list_dip_swing_market_symbols(
+    client: OkxClient,
+    config: dict[str, Any],
+    *,
+    limit: int = DIP_SWING_SCAN_SYMBOL_LIMIT,
+) -> list[str]:
+    watchlist_symbols = normalize_watchlist_symbols(config.get("watchlistSymbols"), config)
+    now = time.time()
+    with DIP_SWING_SCAN_LOCK:
+        cached_symbols = list(DIP_SWING_MARKET_UNIVERSE_CACHE.get("symbols") or [])
+        cached_ts = float(DIP_SWING_MARKET_UNIVERSE_CACHE.get("ts") or 0.0)
+    shared_symbols = cached_symbols
+    if not shared_symbols or now - cached_ts >= 900:
+        swap_rows = (client.get_public_instruments("SWAP").get("data") or [])
+        symbols: list[str] = []
+        seen: set[str] = set()
+        for row in swap_rows:
+            inst_id = str(row.get("instId") or "")
+            if not inst_id.endswith("-USDT-SWAP"):
+                continue
+            state = str(row.get("state") or "live").strip().lower()
+            settle_ccy = str(row.get("settleCcy") or "").strip().upper()
+            if state not in {"", "live"} or settle_ccy not in {"", "USDT"}:
+                continue
+            symbol = normalize_symbol_token(inst_id)
+            if symbol and symbol not in seen:
+                seen.add(symbol)
+                symbols.append(symbol)
+        shared_symbols = symbols
+        with DIP_SWING_SCAN_LOCK:
+            DIP_SWING_MARKET_UNIVERSE_CACHE["ts"] = now
+            DIP_SWING_MARKET_UNIVERSE_CACHE["symbols"] = list(shared_symbols)
+
+    ordered: list[str] = []
+    for symbol in watchlist_symbols:
+        if symbol in shared_symbols and symbol not in ordered:
+            ordered.append(symbol)
+    for symbol in BASIS_ARB_PREFERRED_SYMBOLS:
+        if symbol in shared_symbols and symbol not in ordered:
+            ordered.append(symbol)
+    for symbol in shared_symbols:
+        if symbol not in ordered:
+            ordered.append(symbol)
+        if len(ordered) >= max(limit, len(watchlist_symbols)):
+            break
+    return ordered[: max(limit, len(watchlist_symbols))]
+
+
+def scan_dip_swing_market_snapshots(
+    client: OkxClient,
+    config: dict[str, Any],
+    symbols: list[str],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    normalized_symbols = [normalize_symbol_token(symbol) for symbol in symbols if normalize_symbol_token(symbol)]
+    if not normalized_symbols:
+        return [], []
+    cache_key = json.dumps(
+        {
+            "symbols": normalized_symbols,
+            "bar": str(config.get("bar") or "15m"),
+            "fast": int(config.get("fastEma", 12) or 12),
+            "slow": int(config.get("slowEma", 48) or 48),
+            "tp": decimal_to_str(safe_decimal(config.get("takeProfitPct"), "8")),
+            "sl": decimal_to_str(safe_decimal(config.get("stopLossPct"), "1.2")),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    now = time.time()
+    with DIP_SWING_SCAN_LOCK:
+        cached_key = str(DIP_SWING_MARKET_SCAN_CACHE.get("key") or "")
+        cached_ts = float(DIP_SWING_MARKET_SCAN_CACHE.get("ts") or 0.0)
+        if cached_key == cache_key and now - cached_ts < 20:
+            return copy.deepcopy(DIP_SWING_MARKET_SCAN_CACHE.get("rows") or []), []
+
+    targets = [build_dip_swing_scan_target(config, symbol) for symbol in normalized_symbols]
+    rows: list[dict[str, Any]] = []
+    errors: list[str] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(len(targets), 8))) as executor:
+        future_map = {executor.submit(fetch_dip_swing_target_snapshot, client, target): target for target in targets}
+        for future in concurrent.futures.as_completed(future_map):
+            target = future_map[future]
+            try:
+                rows.append(future.result())
+            except Exception as exc:
+                errors.append(f"{target.get('watchlistSymbol') or target.get('swapInstId')}: {exc}")
+    if errors and not rows:
+        raise OkxApiError(f"波段扩展市场扫描失败: {'; '.join(errors)}")
+    with DIP_SWING_SCAN_LOCK:
+        DIP_SWING_MARKET_SCAN_CACHE["ts"] = now
+        DIP_SWING_MARKET_SCAN_CACHE["key"] = cache_key
+        DIP_SWING_MARKET_SCAN_CACHE["rows"] = copy.deepcopy(rows)
+    return rows, errors
+
+
 def evaluate_basis_arb_target_snapshot(
     target: dict[str, Any],
     spot_ticker: dict[str, Any],
@@ -5777,62 +6577,118 @@ def build_dip_swing_analysis(
     automation: dict[str, Any],
     client: OkxClient,
 ) -> dict[str, Any]:
-    selected_target = resolve_selected_execution_target(automation)
-    inst_id = str(selected_target.get("swapInstId") or automation.get("swapInstId") or "")
-    if not inst_id:
-        raise OkxApiError("波段策略缺少永续交易对")
-    jobs: dict[str, Any] = {
-        "swapTicker": lambda: extract_first_row(client.get_ticker(inst_id)),
-        "markPrice": lambda: extract_first_row(client.get_mark_price("SWAP", inst_id)),
-        "fundingRate": lambda: extract_first_row(client.get_funding_rate(inst_id)),
-        "openInterest": lambda: extract_first_row(client.get_open_interest("SWAP", inst_id)),
-        "swapCandles": lambda: get_closed_candles(
-            client,
-            inst_id,
-            selected_target["bar"],
-            max(int(selected_target.get("slowEma", 21)) + 30, 80),
-        ),
-        "positions": lambda: client.get_positions(inst_id).get("data", []) if getattr(client, "api_key", "") else [],
-    }
-    fetched: dict[str, Any] = {}
+    watchlist_symbols = normalize_watchlist_symbols(automation.get("watchlistSymbols"), automation)
+    watchlist_targets = [build_dip_swing_scan_target(automation, symbol) for symbol in watchlist_symbols]
+    target_snapshots: list[dict[str, Any]] = []
     errors: list[str] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs)) as executor:
-        future_map = {executor.submit(fn): key for key, fn in jobs.items()}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(len(watchlist_targets), 8))) as executor:
+        future_map = {executor.submit(fetch_dip_swing_target_snapshot, client, target): target for target in watchlist_targets}
         for future in concurrent.futures.as_completed(future_map):
-            key = future_map[future]
+            target = future_map[future]
             try:
-                fetched[key] = future.result()
+                target_snapshots.append(future.result())
             except Exception as exc:
-                errors.append(f"{key}: {exc}")
+                errors.append(f"{target.get('watchlistSymbol') or target.get('swapInstId')}: {exc}")
     if errors:
         raise OkxApiError(f"联网分析失败: {'; '.join(errors)}")
 
-    candles = fetched["swapCandles"]
-    signal = build_pullback_signal(candles, int(selected_target["fastEma"]), int(selected_target["slowEma"]))
-    last_price = safe_decimal(signal.get("lastClose"), "0")
-    mark_price = safe_decimal(fetched["markPrice"].get("markPx"), "0")
-    funding_rate_pct = safe_decimal(fetched["fundingRate"].get("fundingRate"), "0") * Decimal("100")
-    basis_pct = pct_gap(last_price, mark_price)
-    pullback_pct = safe_decimal(signal.get("pullbackPct"), "0")
-    rebound_pct = safe_decimal(signal.get("reboundPct"), "0")
+    candidate_snapshots = [row for row in target_snapshots if row.get("candidate")]
+    holding_snapshots = [row for row in target_snapshots if str(row.get("positionSide") or "") == "long"]
+    market_scan_symbols = list_dip_swing_market_symbols(client, automation)
+    extra_scan_symbols = [symbol for symbol in market_scan_symbols if symbol not in set(watchlist_symbols)]
+    extra_market_snapshots, market_scan_errors = scan_dip_swing_market_snapshots(client, automation, extra_scan_symbols)
+    market_snapshots = target_snapshots + extra_market_snapshots
+    market_candidate_snapshots = [row for row in market_snapshots if row.get("candidate")]
+
+    ranking_key = lambda row: (
+        safe_decimal(row.get("netEdgePct"), "-999"),
+        int(row.get("entryScore") or 0),
+        safe_decimal(row.get("emaSpreadPct"), "0"),
+        safe_decimal(row.get("fastSlopePct"), "0"),
+    )
+    if holding_snapshots:
+        selected_snapshot = max(
+            holding_snapshots,
+            key=lambda row: (
+                safe_decimal(row.get("liqBufferPct"), "0"),
+                safe_decimal(row.get("netEdgePct"), "-999"),
+            ),
+        )
+    elif market_candidate_snapshots:
+        selected_snapshot = max(market_candidate_snapshots, key=ranking_key)
+    elif target_snapshots:
+        selected_snapshot = max(target_snapshots, key=ranking_key)
+    else:
+        selected_target = resolve_selected_execution_target(automation)
+        selected_snapshot = {
+            "symbol": strategy_symbol_label(selected_target),
+            "target": selected_target,
+            "signal": {"trend": "flat", "signal": "hold"},
+            "lastPrice": Decimal("0"),
+            "markPrice": Decimal("0"),
+            "fundingRatePct": Decimal("0"),
+            "basisPct": Decimal("0"),
+            "volatilityPct": Decimal("0"),
+            "pullbackPct": Decimal("0"),
+            "reboundPct": Decimal("0"),
+            "emaSpreadPct": Decimal("0"),
+            "fastSlopePct": Decimal("0"),
+            "slowSlopePct": Decimal("0"),
+            "priceVsFastPct": Decimal("0"),
+            "entryScore": 0,
+            "exitScore": 0,
+            "estimatedCostPct": DIP_SWING_EST_ROUNDTRIP_COST_PCT,
+            "setupEdgePct": Decimal("0"),
+            "netEdgePct": Decimal("0"),
+            "positionSide": "flat",
+            "liqPrice": Decimal("0"),
+            "liqBufferPct": Decimal("0"),
+            "openInterest": "--",
+            "candidate": False,
+        }
+
+    selected_target = copy.deepcopy(selected_snapshot.get("target") or resolve_selected_execution_target(automation))
+    selected_symbol = str(selected_snapshot.get("symbol") or strategy_symbol_label(selected_target))
+    selected_from_market = selected_symbol not in set(watchlist_symbols)
+    selected_signal = selected_snapshot.get("signal") or {}
+    last_price = safe_decimal(selected_snapshot.get("lastPrice"), "0")
+    mark_price = safe_decimal(selected_snapshot.get("markPrice"), "0")
+    funding_rate_pct = safe_decimal(selected_snapshot.get("fundingRatePct"), "0")
+    basis_pct = safe_decimal(selected_snapshot.get("basisPct"), "0")
+    volatility_pct = safe_decimal(selected_snapshot.get("volatilityPct"), "0")
+    pullback_pct = safe_decimal(selected_snapshot.get("pullbackPct"), "0")
+    rebound_pct = safe_decimal(selected_snapshot.get("reboundPct"), "0")
+    ema_spread_pct = safe_decimal(selected_snapshot.get("emaSpreadPct"), "0")
+    fast_slope_pct = safe_decimal(selected_snapshot.get("fastSlopePct"), "0")
+    slow_slope_pct = safe_decimal(selected_snapshot.get("slowSlopePct"), "0")
+    price_vs_fast_pct = safe_decimal(selected_snapshot.get("priceVsFastPct"), "0")
+    entry_score = int(selected_snapshot.get("entryScore") or 0)
+    exit_score = int(selected_snapshot.get("exitScore") or 0)
+    estimated_cost_pct = safe_decimal(selected_snapshot.get("estimatedCostPct"), "0")
+    net_edge_pct = safe_decimal(selected_snapshot.get("netEdgePct"), "0")
+    setup_edge_pct = safe_decimal(selected_snapshot.get("setupEdgePct"), "0")
+    position_side = str(selected_snapshot.get("positionSide") or "flat")
+    liq_price = safe_decimal(selected_snapshot.get("liqPrice"), "0")
+    liq_buffer = safe_decimal(selected_snapshot.get("liqBufferPct"), "0")
+    open_interest = selected_snapshot.get("openInterest") or "--"
     leverage = safe_decimal(selected_target.get("swapLeverage"), "1")
     target_multiple = resolve_target_balance_multiple(selected_target)
-    positions = fetched["positions"] or []
-    open_position = next((row for row in positions if safe_decimal(row.get("pos"), "0") != 0), {})
-    pos_value = safe_decimal(open_position.get("pos"), "0")
-    position_side = "flat"
-    if pos_value > 0:
-        position_side = "long"
-    elif pos_value < 0:
-        position_side = "short"
-    liq_price = safe_decimal(open_position.get("liqPx"), "0")
-    liq_buffer = liquidation_buffer_pct(last_price, liq_price, position_side)
-    open_interest = (
-        fetched["openInterest"].get("oiUsd")
-        or fetched["openInterest"].get("oi")
-        or fetched["openInterest"].get("oiCcy")
-        or "--"
-    )
+    candidate_count = len(candidate_snapshots)
+    market_candidate_count = len(market_candidate_snapshots)
+    top_candidates = [
+        {
+            "symbol": str(row.get("symbol") or ""),
+            "netEdgePct": compact_metric(safe_decimal(row.get("netEdgePct"), "0"), "0.01"),
+            "entryScore": int(row.get("entryScore") or 0),
+        }
+        for row in sorted(market_candidate_snapshots, key=ranking_key, reverse=True)[:3]
+    ]
+
+    selected_config = deep_merge({}, selected_target)
+    selected_config["watchlistSymbols"] = selected_symbol
+    selected_config["watchlistOverrides"] = {}
+    selected_config["spotInstId"] = selected_target.get("spotInstId")
+    selected_config["swapInstId"] = selected_target.get("swapInstId")
 
     blockers: list[str] = []
     warnings: list[str] = []
@@ -5842,66 +6698,103 @@ def build_dip_swing_analysis(
         blockers.append(f"当前杠杆 {decimal_to_str(leverage)}x 过高，已限制到 ≤ {decimal_to_str(DIP_SWING_MAX_LEVERAGE)}x")
     if position_side == "long" and liq_buffer > 0 and liq_buffer <= DIP_SWING_MIN_LIQ_BUFFER_PCT:
         blockers.append(f"当前强平缓冲只剩 {compact_metric(liq_buffer, '0.1')}%，不满足安全缓冲")
+    if position_side == "short":
+        blockers.append("检测到空单残留，先清掉再切换到波段策略")
     if funding_rate_pct >= Decimal("0.03"):
         warnings.append("当前多头资金费偏热，抬高持仓成本")
     if basis_pct >= Decimal("0.20"):
         warnings.append("永续高于标记价较多，追高风险升高")
-    if signal["trend"] != "up":
+    if position_side == "long":
+        warnings.append(f"当前正在持有 {selected_symbol}，本轮优先做持仓管理")
+    elif selected_from_market and market_candidate_count > 0:
+        warnings.append(f"watchlist 外出现更优波段目标，当前切到 {selected_symbol}")
+    if str(selected_signal.get("trend") or "") != "up":
         warnings.append("当前趋势未转强，不做波段开多")
-    elif pullback_pct < DIP_SWING_PULLBACK_PCT:
+    elif not bool(selected_signal.get("trendStrengthReady")):
+        warnings.append("EMA 趋势扩散和斜率还不够，复合买点暂不成立")
+    elif not bool(selected_signal.get("pullbackContext")) and not bool(selected_signal.get("bullCross")):
+        warnings.append("当前没有新的回踩结构，也没有新的金叉启动")
+    elif not bool(selected_signal.get("reboundReady")) and not bool(selected_signal.get("bullCross")):
+        warnings.append(f"回踩出现了，但反弹确认只有 {compact_metric(rebound_pct, '0.1')}%，继续等确认")
+    elif not bool(selected_signal.get("notOverextended")):
         warnings.append(
-            f"当前回撤 {compact_metric(pullback_pct, '0.1')}%，还没到波段回踩区 {format_decimal(DIP_SWING_PULLBACK_PCT, 1)}%"
+            f"当前价格高于快线 {compact_metric(price_vs_fast_pct, '0.01')}%，追价成本偏高，放弃开仓"
         )
-    elif signal["signal"] not in {"pullback_buy", "bull_cross_buy"}:
+    elif net_edge_pct < DIP_SWING_MIN_NET_EDGE_PCT:
         warnings.append(
-            f"回撤够了，但反弹确认只有 {compact_metric(rebound_pct, '0.1')}%，继续等确认"
+            f"手续费后净优势只有 {compact_metric(net_edge_pct, '0.01')}%，低于无交易带 {format_decimal(DIP_SWING_MIN_NET_EDGE_PCT, 2)}%"
         )
-    if position_side == "short":
-        blockers.append("检测到空单残留，先清掉再切换到波段策略")
+    if market_candidate_count == 0:
+        warnings.append(f"扩展市场已扫 {len(market_snapshots)} 币，当前没有满足净优势的波段候选")
+    elif top_candidates:
+        warnings.append(
+            "当前候选: " + " / ".join(
+                f"{item['symbol']} 净优势 {item['netEdgePct']}% · 评分 {item['entryScore']}/8"
+                for item in top_candidates
+            )
+        )
+    if market_scan_errors:
+        warnings.append(f"扩展扫描跳过 {len(market_scan_errors)} 币")
 
-    allow_new_entries = (
-        not blockers
-        and position_side == "flat"
-        and signal["trend"] == "up"
-        and signal["signal"] in {"pullback_buy", "bull_cross_buy"}
-    )
+    allow_new_entries = bool(selected_snapshot.get("candidate")) and position_side == "flat" and not blockers
     if blockers:
         decision = "skip"
         decision_label = "先收缩风险"
+    elif position_side == "long":
+        decision = "manage"
+        decision_label = "持仓管理"
     elif allow_new_entries:
         decision = "execute"
         decision_label = "允许波段开多"
-    elif signal["trend"] != "up":
+    elif str(selected_signal.get("trend") or "") != "up":
         decision = "observe"
         decision_label = "趋势未转强"
+    elif not bool(selected_signal.get("trendStrengthReady")):
+        decision = "observe"
+        decision_label = "复合趋势未过线"
+    elif not bool(selected_signal.get("pullbackContext")) and not bool(selected_signal.get("bullCross")):
+        decision = "observe"
+        decision_label = "等待回踩结构"
+    elif not bool(selected_signal.get("reboundReady")) and not bool(selected_signal.get("bullCross")):
+        decision = "observe"
+        decision_label = "等待反弹确认"
+    elif not bool(selected_signal.get("notOverextended")):
+        decision = "observe"
+        decision_label = "放弃追价，等回踩"
+    elif net_edge_pct < DIP_SWING_MIN_NET_EDGE_PCT:
+        decision = "observe"
+        decision_label = "净优势不够，不交易"
     else:
         decision = "observe"
-        decision_label = "等待下一次回踩"
+        decision_label = "等待复合买点"
 
-    symbol = strategy_symbol_label(selected_target)
+    symbol = selected_symbol
     summary_bits = [
         f"{symbol} 波段",
         f"回撤 {compact_metric(pullback_pct, '0.1')}%",
         f"反弹 {compact_metric(rebound_pct, '0.1')}%",
-        f"资金费 {compact_metric(funding_rate_pct, '0.001')}%",
-        f"目标止盈 {selected_target.get('takeProfitPct', '8')}%",
+        f"趋势扩散 {compact_metric(ema_spread_pct, '0.01')}%",
+        f"快线斜率 {compact_metric(fast_slope_pct, '0.01')}%",
+        f"净优势 {compact_metric(net_edge_pct, '0.01')}%",
     ]
     if target_multiple > Decimal("1"):
         summary_bits.append(f"目标余额 {format_decimal(target_multiple, 0)}x")
+    if selected_from_market:
+        summary_bits.append("市场轮动目标")
     if position_side == "long" and liq_buffer > 0:
         summary_bits.append(f"强平缓冲 {compact_metric(liq_buffer, '0.1')}%")
     if blockers:
         summary_bits.append(blockers[0])
+    elif position_side == "long":
+        summary_bits.append("当前已有持仓，优先做结构管理")
     elif allow_new_entries:
         summary_bits.append(
-            "趋势转强、回踩或金叉条件已到，允许逐仓开多"
-            if signal["signal"] == "bull_cross_buy"
-            else "回踩和反弹确认都到位，允许逐仓开多"
+            f"评分 {entry_score}/8，净优势覆盖手续费，允许逐仓开多"
         )
-    elif signal["trend"] != "up":
-        summary_bits.append("趋势还没重新抬头，继续等")
+    elif net_edge_pct < DIP_SWING_MIN_NET_EDGE_PCT:
+        summary_bits.append("信号有了，但净优势不够覆盖交易成本")
     else:
-        summary_bits.append("继续等下一次更好的回踩或更明确的反弹确认")
+        summary_bits.append("继续等下一次更完整、成本收益比更高的结构")
 
     return {
         "statusText": "已联网分析",
@@ -5909,7 +6802,7 @@ def build_dip_swing_analysis(
         "decisionLabel": decision_label,
         "summary": " · ".join(summary_bits),
         "selectedStrategyName": f"{symbol} 波段",
-        "selectedStrategyDetail": strategy_detail_line(selected_target),
+        "selectedStrategyDetail": strategy_detail_line(selected_config),
         "selectedReturnPct": "",
         "selectedDrawdownPct": "",
         "selectedWinRatePct": "",
@@ -5919,17 +6812,32 @@ def build_dip_swing_analysis(
         "lastAnalyzedAt": now_local_iso(),
         "marketRegime": "趋势波段",
         "spotTrend": "",
-        "swapTrend": f"{signal['trend']} / {signal['signal']}",
-        "volatilityPct": compact_metric(recent_range_pct(candles), "0.01"),
+        "swapTrend": f"{selected_signal.get('trend', 'flat')} / {selected_signal.get('signal', 'hold')}",
+        "volatilityPct": compact_metric(volatility_pct, "0.01"),
         "spreadPct": "",
         "basisPct": compact_metric(basis_pct, "0.01"),
         "fundingRatePct": compact_metric(funding_rate_pct, "0.001"),
         "openInterest": str(open_interest),
         "warnings": warnings,
         "blockers": blockers,
-        "selectedConfig": deep_merge({}, selected_target),
+        "selectedConfig": deep_merge({}, selected_config),
+        "selectedWatchlistSymbol": selected_symbol,
+        "selectedFromMarketScan": selected_from_market,
+        "watchlistCount": len(watchlist_symbols),
+        "candidateCount": len(candidate_snapshots),
+        "marketScanCount": len(market_snapshots),
+        "marketCandidateCount": market_candidate_count,
+        "marketTopCandidates": top_candidates,
         "pullbackPct": compact_metric(pullback_pct, "0.1"),
         "reboundPct": compact_metric(rebound_pct, "0.1"),
+        "emaSpreadPct": compact_metric(ema_spread_pct, "0.01"),
+        "fastSlopePct": compact_metric(fast_slope_pct, "0.01"),
+        "slowSlopePct": compact_metric(slow_slope_pct, "0.01"),
+        "entryScore": entry_score,
+        "exitScore": exit_score,
+        "estimatedCostPct": compact_metric(estimated_cost_pct, "0.01"),
+        "setupEdgePct": compact_metric(setup_edge_pct, "0.01"),
+        "netEdgePct": compact_metric(net_edge_pct, "0.01"),
         "liquidationPrice": decimal_to_str(liq_price) if liq_price > 0 else "",
         "liquidationBufferPct": compact_metric(liq_buffer, "0.1") if liq_buffer > 0 else "",
         "research": {
@@ -5937,19 +6845,22 @@ def build_dip_swing_analysis(
             "statusText": "波段模式",
             "mode": "dip_swing",
             "lastRunAt": now_local_iso(),
-            "historyLimit": len(candles),
-            "sampleCount": len(candles),
+            "historyLimit": len(selected_snapshot.get("candles") or []),
+            "sampleCount": len(selected_snapshot.get("candles") or []),
             "summary": {
                 "pullbackPct": compact_metric(pullback_pct, "0.1"),
                 "reboundPct": compact_metric(rebound_pct, "0.1"),
                 "fundingRatePct": compact_metric(funding_rate_pct, "0.001"),
+                "netEdgePct": compact_metric(net_edge_pct, "0.01"),
             },
-            "bestConfig": deep_merge({}, selected_target),
+            "bestConfig": deep_merge({}, selected_config),
             "leaderboard": [],
             "generationSummaries": [],
             "pipeline": {
                 "mode": "dip_swing",
                 "status": decision,
+                "candidateCount": len(candidate_snapshots),
+                "marketCandidateCount": market_candidate_count,
             },
             "markets": {},
             "notes": [],
@@ -7387,20 +8298,117 @@ class AutomationEngine:
         target_multiple = resolve_target_balance_multiple(automation)
         return build_target_balance_snapshot(start_eq, current_eq, target_multiple)
 
-    def _target_scaled_swap_contracts(self, automation: dict[str, Any], lot_size: Decimal) -> Decimal:
+    def _target_execution_plan(
+        self,
+        automation: dict[str, Any],
+        lot_size: Decimal,
+        *,
+        last_price: Decimal,
+        contract_value: Decimal,
+        leverage: Decimal,
+        entry_score: int = 0,
+    ) -> dict[str, Any]:
         base_contracts = safe_decimal(automation.get("swapContracts"), "0")
         rounded_base = round_down(base_contracts, lot_size)
         if rounded_base <= 0:
-            return Decimal("0")
+            return {
+                "plannedContracts": Decimal("0"),
+                "baseContracts": Decimal("0"),
+                "marginBudget": Decimal("0"),
+                "marginUsagePct": Decimal("0"),
+                "phase": "idle",
+                "progressPct": Decimal("0"),
+                "scoreScale": Decimal("1"),
+            }
         target_snapshot = self._target_balance_snapshot(automation)
         target_multiple = resolve_target_balance_multiple(automation)
-        if target_multiple <= Decimal("1") or not bool(self.config_store.current().get("simulated")):
-            return rounded_base
-        current_multiple = safe_decimal(target_snapshot.get("currentMultiple"), "1")
-        if current_multiple <= 0:
-            current_multiple = Decimal("1")
-        aggressive_scale = max(Decimal("1"), target_multiple - min(current_multiple, target_multiple) + Decimal("1"))
-        return round_down(rounded_base * aggressive_scale, lot_size)
+        progress_pct = safe_decimal(target_snapshot.get("progressPct"), "0")
+        state = self.state_store.current()
+        current_eq = safe_decimal(state.get("currentEq"), "0")
+        start_eq = safe_decimal(state.get("sessionStartEq"), "0")
+        max_eq = safe_decimal(state.get("maxObservedEq"), "0")
+        if (
+            target_multiple <= Decimal("1")
+            or not bool(self.config_store.current().get("simulated"))
+            or current_eq <= 0
+            or leverage <= 0
+            or last_price <= 0
+            or contract_value <= 0
+        ):
+            return {
+                "plannedContracts": rounded_base,
+                "baseContracts": rounded_base,
+                "marginBudget": Decimal("0"),
+                "marginUsagePct": Decimal("0"),
+                "phase": "fixed",
+                "progressPct": progress_pct,
+                "scoreScale": Decimal("1"),
+            }
+
+        remaining_pressure = max(Decimal("0"), Decimal("100") - progress_pct) / Decimal("100")
+        margin_ratio = DIP_SWING_TARGET_MIN_MARGIN_RATIO + (
+            (DIP_SWING_TARGET_MAX_MARGIN_RATIO - DIP_SWING_TARGET_MIN_MARGIN_RATIO) * remaining_pressure
+        )
+        if progress_pct >= Decimal("50"):
+            margin_ratio *= Decimal("0.75")
+        if progress_pct >= Decimal("80"):
+            margin_ratio *= Decimal("0.50")
+        if start_eq > 0 and current_eq < start_eq:
+            margin_ratio *= Decimal("0.80")
+        if max_eq > 0 and current_eq < max_eq:
+            setback_pct = ((max_eq - current_eq) / max_eq) * Decimal("100")
+            if setback_pct >= Decimal("1.0"):
+                margin_ratio *= Decimal("0.55")
+            elif setback_pct >= Decimal("0.5"):
+                margin_ratio *= Decimal("0.75")
+
+        score_scale = Decimal("1") + (Decimal(max(0, entry_score - DIP_SWING_MIN_ENTRY_SCORE)) * Decimal("0.08"))
+        margin_ratio = max(
+            DIP_SWING_TARGET_MIN_MARGIN_RATIO,
+            min(DIP_SWING_TARGET_MAX_MARGIN_RATIO, margin_ratio * score_scale),
+        )
+        contract_margin = (last_price * contract_value) / leverage
+        if contract_margin <= 0:
+            budget_contracts = rounded_base
+        else:
+            budget_contracts = round_down((current_eq * margin_ratio) / contract_margin, lot_size)
+        planned_contracts = max(rounded_base, budget_contracts)
+        phase = "attack"
+        if progress_pct >= Decimal("80"):
+            phase = "protect"
+        elif progress_pct >= Decimal("50"):
+            phase = "compound"
+        elif progress_pct >= Decimal("20"):
+            phase = "advance"
+        return {
+            "plannedContracts": planned_contracts,
+            "baseContracts": rounded_base,
+            "marginBudget": current_eq * margin_ratio,
+            "marginUsagePct": margin_ratio * Decimal("100"),
+            "phase": phase,
+            "progressPct": progress_pct,
+            "scoreScale": score_scale,
+        }
+
+    def _target_scaled_swap_contracts(
+        self,
+        automation: dict[str, Any],
+        lot_size: Decimal,
+        *,
+        last_price: Decimal,
+        contract_value: Decimal,
+        leverage: Decimal,
+        entry_score: int = 0,
+    ) -> Decimal:
+        plan = self._target_execution_plan(
+            automation,
+            lot_size,
+            last_price=last_price,
+            contract_value=contract_value,
+            leverage=leverage,
+            entry_score=entry_score,
+        )
+        return safe_decimal(plan.get("plannedContracts"), "0")
 
     def _cooldown_ready(self, market: str, cooldown_seconds: int) -> tuple[bool, str]:
         state = self.snapshot()["markets"].get(market, {})
@@ -8221,26 +9229,51 @@ class AutomationEngine:
                 f"{len(watchlist_entries) or 1} 币组合"
             )
         else:
-            pipeline_summary = (
-                f"信号 {analysis.get('decisionLabel', '待分析')} · "
-                f"{len(watchlist_entries)} 币观察 · "
-                f"{int(execution_summary.get('activeSymbols') or 0)} 币持仓"
-            )
-            mode_text = (
-                f"{analysis.get('selectedStrategyName', strategy_label(effective_automation.get('strategyPreset', 'dual_engine')))}"
-                + (
-                    f" · {len(watchlist_entries)} 币并行"
-                    if len(watchlist_entries) > 1
-                    else ""
+            if str(effective_automation.get("strategyPreset") or "") == "dip_swing":
+                candidate_count = int(analysis.get("candidateCount") or 0)
+                market_scan_count = int(analysis.get("marketScanCount") or 0)
+                market_candidate_count = int(analysis.get("marketCandidateCount") or 0)
+                selected_from_market = bool(analysis.get("selectedFromMarketScan"))
+                pipeline_summary = (
+                    f"信号 {analysis.get('decisionLabel', '待分析')} · "
+                    f"watchlist 候选 {candidate_count} · "
+                    f"市场候选 {market_candidate_count} / 扫描 {market_scan_count} · "
+                    f"{int(execution_summary.get('activeSymbols') or 0)} 币持仓"
                 )
-                + " · "
-                + analysis.get("decisionLabel", "待分析")
-            )
-            last_strategy_detail = (
-                f"{effective_automation.get('bar', '5m')} · EMA "
-                f"{effective_automation.get('fastEma', '-')}/{effective_automation.get('slowEma', '-')}"
-                f" · {len(watchlist_entries) or 1} 币组合"
-            )
+                mode_text = (
+                    f"{analysis.get('selectedStrategyName', strategy_label(effective_automation.get('strategyPreset', 'dip_swing')))}"
+                    f" · {analysis.get('decisionLabel', '待分析')}"
+                    f" · 市场候选 {market_candidate_count}/{market_scan_count}"
+                )
+                if selected_from_market:
+                    mode_text += " · 轮动接管"
+                last_strategy_detail = (
+                    f"{effective_automation.get('bar', '5m')} · EMA "
+                    f"{effective_automation.get('fastEma', '-')}/{effective_automation.get('slowEma', '-')}"
+                    f" · 净优势 {analysis.get('netEdgePct', '--')}%"
+                    f" · 评分 {analysis.get('entryScore', '--')}/8"
+                )
+            else:
+                pipeline_summary = (
+                    f"信号 {analysis.get('decisionLabel', '待分析')} · "
+                    f"{len(watchlist_entries)} 币观察 · "
+                    f"{int(execution_summary.get('activeSymbols') or 0)} 币持仓"
+                )
+                mode_text = (
+                    f"{analysis.get('selectedStrategyName', strategy_label(effective_automation.get('strategyPreset', 'dual_engine')))}"
+                    + (
+                        f" · {len(watchlist_entries)} 币并行"
+                        if len(watchlist_entries) > 1
+                        else ""
+                    )
+                    + " · "
+                    + analysis.get("decisionLabel", "待分析")
+                )
+                last_strategy_detail = (
+                    f"{effective_automation.get('bar', '5m')} · EMA "
+                    f"{effective_automation.get('fastEma', '-')}/{effective_automation.get('slowEma', '-')}"
+                    f" · {len(watchlist_entries) or 1} 币组合"
+                )
         self._update_state(
             lambda current: current.update(
                 {
@@ -8460,8 +9493,19 @@ class AutomationEngine:
         liq_price = safe_decimal(open_position.get("liqPx"), "0")
         liq_buffer = liquidation_buffer_pct(last_price, liq_price, "long" if pos_value > 0 else "short" if pos_value < 0 else "flat")
         lot_size = safe_decimal(meta.get("lotSz"), "1")
+        contract_value = safe_decimal(meta.get("ctVal"), decimal_to_str(default_swap_contract_value(inst_id)))
+        leverage = safe_decimal(automation.get("swapLeverage"), "1")
+        entry_score = int(signal.get("entryScore") or 0)
+        target_plan = self._target_execution_plan(
+            automation,
+            lot_size,
+            last_price=last_price,
+            contract_value=contract_value,
+            leverage=leverage,
+            entry_score=entry_score,
+        )
         target_snapshot = self._target_balance_snapshot(automation)
-        planned_trade_contracts = self._target_scaled_swap_contracts(automation, lot_size)
+        planned_trade_contracts = safe_decimal(target_plan.get("plannedContracts"), "0")
         position_side = "flat"
         if pos_value > 0:
             position_side = "long"
@@ -8471,16 +9515,20 @@ class AutomationEngine:
         floating_pnl_pct = Decimal("0")
         if entry_price > 0 and last_price > 0 and position_side == "long":
             floating_pnl_pct = ((last_price - entry_price) / entry_price) * Decimal("100")
+        exit_score = int(signal.get("exitScore") or 0)
 
         status_text = (
             f"回撤 {compact_metric(signal.get('pullbackPct'), '0.1')}% / "
-            f"反弹 {compact_metric(signal.get('reboundPct'), '0.1')}%"
+            f"反弹 {compact_metric(signal.get('reboundPct'), '0.1')}% / "
+            f"入场评分 {entry_score}/8"
         )
         if liq_buffer > 0:
             status_text += f" / 强平缓冲 {compact_metric(liq_buffer, '0.1')}%"
         if safe_decimal(target_snapshot.get("targetEq"), "0") > 0:
             status_text += (
                 f" / 目标 {compact_metric(target_snapshot.get('progressPct'), '0.1')}%"
+                f" / {target_plan.get('phase', 'fixed')}"
+                f" / 保证金 {format_decimal(safe_decimal(target_plan.get('marginBudget'), '0'), 2)}U"
                 f" / 计划 {decimal_to_str(planned_trade_contracts)} 张"
             )
         self._set_market(
@@ -8563,7 +9611,7 @@ class AutomationEngine:
                 )
                 return
             cooldown_ready, reason = self._cooldown_ready(market_key, int(automation["cooldownSeconds"]))
-            if signal["trend"] != "up":
+            if bool(signal.get("weakTrendReady")):
                 if cooldown_ready:
                     self._place_swap_order(
                         client,
@@ -8571,14 +9619,22 @@ class AutomationEngine:
                         "sell",
                         round_down(abs_pos, lot_size),
                         automation["swapTdMode"],
-                        "趋势转弱，主动平多",
+                        "复合趋势破坏，主动平多",
                         reduce_only=True,
                         market_key=market_key,
                     )
                 else:
-                    self._set_market(market_key, {"lastMessage": f"趋势转弱，但{reason}"})
+                    self._set_market(market_key, {"lastMessage": f"复合趋势破坏，但{reason}"})
                 return
-            self._set_market(market_key, {"lastMessage": f"波段持仓中 · {status_text} · 目标 {automation.get('takeProfitPct', '8')}%"})
+            self._set_market(
+                market_key,
+                {
+                    "lastMessage": (
+                        f"波段持仓中 · {status_text} / 离场评分 {exit_score}/5"
+                        f" · 目标 {automation.get('takeProfitPct', '8')}%"
+                    )
+                },
+            )
             return
 
         trade_contracts = planned_trade_contracts
@@ -8588,8 +9644,24 @@ class AutomationEngine:
         if signal["signal"] not in {"pullback_buy", "bull_cross_buy"}:
             if signal["trend"] != "up":
                 self._set_market(market_key, {"lastMessage": f"趋势未转强 · {status_text}"})
+            elif not bool(signal.get("trendStrengthReady")):
+                self._set_market(market_key, {"lastMessage": f"趋势扩散和斜率还不够 · {status_text}"})
+            elif not bool(signal.get("pullbackContext")) and not bool(signal.get("bullCross")):
+                self._set_market(market_key, {"lastMessage": f"没有新的回踩结构 · {status_text}"})
+            elif not bool(signal.get("reboundReady")) and not bool(signal.get("bullCross")):
+                self._set_market(market_key, {"lastMessage": f"回踩后反弹确认不够 · {status_text}"})
+            elif not bool(signal.get("notOverextended")):
+                self._set_market(
+                    market_key,
+                    {
+                        "lastMessage": (
+                            f"价格高于快线 {compact_metric(signal.get('priceVsFastPct'), '0.01')}%，主动放弃追价"
+                            f" · {status_text}"
+                        )
+                    },
+                )
             else:
-                self._set_market(market_key, {"lastMessage": f"等待下一次更好的回踩 · {status_text}"})
+                self._set_market(market_key, {"lastMessage": f"复合买点还没齐 · {status_text}"})
             return
         if not allow_new_entries:
             self._set_market(market_key, {"lastMessage": f"波段买点出现，但当前联网决策层为“{analysis_label}”，本轮不新开仓"})
@@ -8604,7 +9676,7 @@ class AutomationEngine:
             "buy",
             trade_contracts,
             automation["swapTdMode"],
-            "波段开多",
+            f"波段开多 · {target_plan.get('phase', 'fixed')} · {decimal_to_str(trade_contracts)} 张",
             market_key=market_key,
         )
 
@@ -9176,10 +10248,12 @@ class AppHandler(BaseHTTPRequestHandler):
                     response = remote_gateway_request(config, "GET", self.path)
                     payload = response.json()
                     if path == "/api/focus-snapshot":
+                        remote_automation = load_remote_automation_config_for_proxy(config)
                         if isinstance(payload.get("automationState"), dict):
-                            payload["automationState"] = sanitize_only_dip_swing_runtime_state(
+                            payload["automationState"] = enrich_remote_dip_swing_runtime_state(
                                 payload.get("automationState") or {},
-                                AUTOMATION_CONFIG.current(),
+                                remote_automation,
+                                CONFIG.current(),
                             )
                         payload["minerOverview"] = miner_focus_overview(MINER_CONFIG.current())
                     payload["executionMode"] = "remote"
@@ -9188,11 +10262,26 @@ class AppHandler(BaseHTTPRequestHandler):
                 elif path == "/api/automation/state":
                     response = remote_gateway_request(config, "GET", self.path)
                     payload = response.json()
+                    remote_automation = load_remote_automation_config_for_proxy(config)
                     if isinstance(payload.get("state"), dict):
-                        payload["state"] = sanitize_only_dip_swing_runtime_state(
+                        payload["state"] = enrich_remote_dip_swing_runtime_state(
                             payload.get("state") or {},
-                            AUTOMATION_CONFIG.current(),
+                            remote_automation,
+                            CONFIG.current(),
                         )
+                    json_response(self, payload, status=response.status_code)
+                elif path == "/api/orders/recent":
+                    response = remote_gateway_request(config, "GET", self.path)
+                    payload = response.json()
+                    orders = payload.get("orders") or []
+                    if isinstance(orders, list):
+                        enriched_orders = backfill_paper_execution_metrics(orders)
+                        summary = build_execution_journal_summary(enriched_orders)
+                        payload["orders"] = enriched_orders
+                        payload["journal"] = {key: value for key, value in summary.items() if key != "symbols"}
+                        payload["symbols"] = summary.get("symbols") or payload.get("symbols") or []
+                        payload["lastSource"] = payload.get("lastSource") or payload.get("source") or "remote_proxy"
+                        payload["lastReconciledAt"] = payload.get("lastReconciledAt") or now_local_iso()
                     json_response(self, payload, status=response.status_code)
                 else:
                     response = remote_gateway_request(config, "GET", self.path)
@@ -9281,7 +10370,17 @@ class AppHandler(BaseHTTPRequestHandler):
                         self.path,
                         timeout=REMOTE_CONFIG_FETCH_TIMEOUT,
                     )
-                    relay_requests_response(self, response)
+                    payload = response.json() if response.content else {}
+                    normalized = normalize_remote_automation_config_payload(payload, AUTOMATION_CONFIG.current())
+                    json_response(
+                        self,
+                        {
+                            "ok": bool(payload.get("ok", response.ok)),
+                            "config": normalized,
+                            "remoteConfigLoaded": True,
+                        },
+                        status=response.status_code,
+                    )
                 except Exception as exc:
                     json_response(
                         self,
@@ -9447,7 +10546,9 @@ class AppHandler(BaseHTTPRequestHandler):
                 client = OkxClient(config)
                 if inst_type:
                     result = client.get_recent_orders(inst_type)
+                    fills_result = client.get_recent_fills(inst_type, limit=100)
                     merged_orders = merge_order_feeds(result.get("data", []), stream_orders, cached_orders, limit=20)
+                    merged_orders = enrich_execution_orders_with_fills(merged_orders, fills_result.get("data", []))
                     persist_local_orders(merged_orders, source="rest_multi" if (stream_orders or cached_orders) else "rest")
                     journal = get_execution_journal_snapshot(inst_type, limit=20)
                     json_response(
@@ -9466,6 +10567,7 @@ class AppHandler(BaseHTTPRequestHandler):
                     return
 
                 merged_orders: list[dict[str, Any]] = []
+                recent_fills: list[dict[str, Any]] = []
                 errors: list[str] = []
                 for fallback_type in ("SPOT", "SWAP"):
                     try:
@@ -9473,11 +10575,17 @@ class AppHandler(BaseHTTPRequestHandler):
                         merged_orders.extend(fallback_result.get("data", []))
                     except Exception as fallback_exc:
                         errors.append(f"{fallback_type}: {fallback_exc}")
+                    try:
+                        fills_result = client.get_recent_fills(fallback_type, limit=100)
+                        recent_fills.extend(fills_result.get("data", []))
+                    except Exception as fill_exc:
+                        errors.append(f"{fallback_type} fills: {fill_exc}")
 
                 if not merged_orders and errors:
                     raise OkxApiError("; ".join(errors))
 
                 merged_orders = merge_order_feeds(merged_orders, stream_orders, cached_orders, limit=20)
+                merged_orders = enrich_execution_orders_with_fills(merged_orders, recent_fills)
                 persist_local_orders(merged_orders, source="rest_multi")
                 journal = get_execution_journal_snapshot(inst_type, limit=20)
                 json_response(

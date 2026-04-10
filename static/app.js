@@ -72,7 +72,7 @@ const ONLY_STRATEGY_PRESET = "dip_swing";
 const STRATEGY_PRESETS = {
   dip_swing: {
     label: "波段",
-    description: "逐仓 10x 做趋势内波段，回踩或转强就接，固定 8% 止盈，强平缓冲不足时优先主动离场。",
+    description: "市场扫描 + 净优势过滤 + 目标驱动仓位。逐仓 10x 做趋势内波段，回踩或转强就接，固定 8% 止盈，强平缓冲不足时优先主动离场，目标余额 100x。",
     config: {
       strategyPreset: "dip_swing",
       bar: "15m",
@@ -92,7 +92,7 @@ const STRATEGY_PRESETS = {
       stopLossPct: "1.2",
       takeProfitPct: "8",
       maxDailyLossPct: "0.8",
-      targetBalanceMultiple: "10",
+      targetBalanceMultiple: "100",
       autostart: false,
       allowLiveTrading: false,
       allowLiveAutostart: false,
@@ -2853,7 +2853,7 @@ function collectAutomationConfig() {
     stopLossPct: $("autoStopLossPct").value.trim(),
     takeProfitPct: $("autoTakeProfitPct").value.trim(),
     maxDailyLossPct: $("autoMaxDailyLossPct").value.trim(),
-    targetBalanceMultiple: "10",
+    targetBalanceMultiple: "100",
     autostart: $("autoAutostart").checked,
     allowLiveManualOrders: $("autoAllowLiveManualOrders").checked,
     allowLiveTrading: $("autoAllowLiveTrading").checked,
@@ -3739,6 +3739,10 @@ function buildDerivedOrderJournal(orders, source = "", symbols = []) {
     const stamp = Number(item?.uTime || item?.cTime || item?.fillTime || 0);
     return stamp > latest ? stamp : latest;
   }, 0);
+  const insight = buildOrderJournalInsight({
+    totalFees: list.reduce((sum, item) => sum + toOrderNumber(item?.fillFee ?? item?.fee), 0),
+    realizedPnl: list.reduce((sum, item) => sum + toOrderNumber(item?.realizedPnl ?? item?.fillPnl ?? item?.pnl), 0),
+  }, list);
   return {
     totalOrders: stats.total,
     workingOrders: stats.working,
@@ -3754,10 +3758,42 @@ function buildDerivedOrderJournal(orders, source = "", symbols = []) {
     arbRealizedPnl,
     arbTotalFees,
     arbNetPnl: arbRealizedPnl + arbTotalFees,
+    insight,
     lastSource: source || "",
     lastReconciledAt: latestStamp ? String(latestStamp) : "",
     symbols: Array.isArray(symbols) ? symbols : [],
   };
+}
+
+function isCloseLikeOrder(order) {
+  const instType = String(order?.instType || "").toUpperCase();
+  const side = String(order?.side || "").toLowerCase();
+  const subType = String(order?.tradeSubType || order?.subType || "").trim();
+  const reason = String(order?.strategyReason || order?.lastMessage || "");
+  if (order?.reduceOnly === true || String(order?.reduceOnly || "").toLowerCase() === "true") return true;
+  if (instType === "SPOT") return side === "sell";
+  if (["5", "6", "100", "101", "125", "126", "208", "209", "274", "275", "328", "329"].includes(subType)) return true;
+  return ["平", "止盈", "止损", "退场", "回补", "卖出"].some((token) => reason.includes(token));
+}
+
+function buildOrderJournalInsight(journal, orders) {
+  const list = Array.isArray(orders) ? orders : [];
+  const filled = list.filter((item) => String(item?.state || "") === "filled");
+  if (!filled.length) return "";
+  const closeCount = filled.filter((item) => isCloseLikeOrder(item)).length;
+  const openCount = filled.length - closeCount;
+  const realized = Number(journal?.realizedPnl ?? 0);
+  const totalFees = Number(journal?.totalFees ?? 0);
+  if (closeCount === 0 && openCount > 0) {
+    return `当前这批单全是开仓，还没看到平仓回报，所以已实现收益还是 0。${totalFees ? ` 当前已累计手续费 ${formatSignedMoney(totalFees)} USDT。` : ""}`;
+  }
+  if (closeCount > 0 && realized === 0) {
+    return `这批单里已经有 ${closeCount} 笔平仓，但还没拿到明确的已实现收益字段。${totalFees ? ` 当前已累计手续费 ${formatSignedMoney(totalFees)} USDT。` : ""}`;
+  }
+  if (realized !== 0) {
+    return `当前已实现${realized > 0 ? "盈利" : "亏损"} ${formatSignedMoney(realized)} USDT。`;
+  }
+  return "";
 }
 
 function renderOrderTerminalToolbar(groups, hasVisibleGroups = true) {
@@ -4035,6 +4071,16 @@ function renderOrderTerminalFocus(selectedGroup, meta = {}) {
   const realizedTone = selectedGroup.realizedPnl > 0 ? "positive" : selectedGroup.realizedPnl < 0 ? "negative" : "muted";
   const positionTone = selectedGroup.positionPnl > 0 ? "positive" : selectedGroup.positionPnl < 0 ? "negative" : "muted";
   const estimatedTone = selectedGroup.estimatedPnl > 0 ? "positive" : selectedGroup.estimatedPnl < 0 ? "negative" : "muted";
+  const focusInsight = buildOrderJournalInsight(
+    {
+      realizedPnl: selectedGroup.realizedPnl,
+      totalFees: (selectedGroup.orders || []).reduce(
+        (sum, item) => sum + toOrderNumber(item?.fillFee ?? item?.fee),
+        0
+      ),
+    },
+    selectedGroup.orders || []
+  );
 
   target.className = "order-terminal-focus";
   target.innerHTML = `
@@ -4076,7 +4122,7 @@ function renderOrderTerminalFocus(selectedGroup, meta = {}) {
       <div><b>异常 / 成交率</b><span>${selectedGroup.riskCount} / ${formatPercentValue(selectedGroup.successRate)}</span></div>
       <div><b>套利净收益</b><span>${selectedGroup.arbOrderCount ? `${formatSignedMoney(selectedGroup.arbNetPnl)} USDT` : "--"}</span></div>
       <div><b>套利腿进度</b><span>${selectedGroup.arbOrderCount ? `开腿 ${selectedGroup.arbEntryOrders} · 对冲 ${selectedGroup.arbHedgeOrders} · 退场 ${selectedGroup.arbExitOrders} · 回滚 ${selectedGroup.arbRollbackOrders}` : "当前不是套利腿订单流"}</span></div>
-      <div><b>最近异常</b><span>${escapeHtml(selectedGroup.topCancelReason || "当前没有明显异常撤单")}</span></div>
+      <div><b>${focusInsight ? "收益判断" : "最近异常"}</b><span>${escapeHtml(focusInsight || selectedGroup.topCancelReason || "当前没有明显异常撤单")}</span></div>
     </div>
   `;
 
@@ -4202,6 +4248,7 @@ function renderOrderSummary(data, orders) {
   const arbExitOrders = Number(journal.arbExitOrders ?? 0);
   const arbRollbackOrders = Number(journal.arbRollbackOrders ?? 0);
   const successRate = totalCount ? (filledCount / totalCount) * 100 : stats.successRate;
+  const insight = journal.insight || buildOrderJournalInsight(journal, dashboardState.recentOrdersAll || []);
   $("order-summary-count").textContent = String(totalCount);
   $("order-summary-working").textContent = String(workingCount);
   $("order-summary-filled").textContent = String(filledCount);
@@ -4213,7 +4260,7 @@ function renderOrderSummary(data, orders) {
   if ($("orderSummaryInsight")) {
     $("orderSummaryInsight").innerHTML = riskCount
       ? `<b>最近异常</b><span>${escapeHtml(journal.lastCancelReason || stats.latestCancelReason || stats.topCancelReason || "存在已撤或失败订单，详情区会继续显示交易所原始原因。")} · 账本 ${escapeHtml(journalSource)} · 最近对账 ${escapeHtml(reconciledAt)}${arbOrderCount ? ` · 套利开腿 ${arbEntryOrders} / 对冲 ${arbHedgeOrders} / 退场 ${arbExitOrders} / 回滚 ${arbRollbackOrders}` : ""}</span>`
-      : `<b>当前概览</b><span>${totalCount ? `最近 ${totalCount} 笔里成交 ${filledCount} 笔，当前没有明显异常撤单。账本 ${journalSource}，最近对账 ${reconciledAt}。${arbOrderCount ? `套利开腿 ${arbEntryOrders} / 对冲 ${arbHedgeOrders} / 退场 ${arbExitOrders} / 回滚 ${arbRollbackOrders}。` : ""}` : "订单一进来，这里会直接告诉你成功率、账本来源和最近异常原因。"}</span>`;
+      : `<b>当前概览</b><span>${insight || (totalCount ? `最近 ${totalCount} 笔里成交 ${filledCount} 笔，当前没有明显异常撤单。账本 ${journalSource}，最近对账 ${reconciledAt}。${arbOrderCount ? `套利开腿 ${arbEntryOrders} / 对冲 ${arbHedgeOrders} / 退场 ${arbExitOrders} / 回滚 ${arbRollbackOrders}。` : ""}` : "订单一进来，这里会直接告诉你成功率、账本来源和最近异常原因。")}</span>`;
   }
 }
 
