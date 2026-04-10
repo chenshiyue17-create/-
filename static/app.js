@@ -71,15 +71,15 @@ const ONLY_STRATEGY_PRESET = "dip_swing";
 
 const STRATEGY_PRESETS = {
   dip_swing: {
-    label: "波段",
-    description: "市场扫描 + 净优势过滤 + 目标驱动仓位。逐仓 10x 做趋势内波段，回踩或转强就接，固定 8% 止盈，强平缓冲不足时优先主动离场，目标余额 100x。",
+    label: "利润循环",
+    description: "市场扫描 + 方向轮动 + 成本过滤。逐仓 10x 顺势双向，空仓即开，净赚 1U+ 就平，24 小时持续循环，目标余额 100x。",
     config: {
       strategyPreset: "dip_swing",
-      bar: "15m",
-      fastEma: 12,
-      slowEma: 48,
-      pollSeconds: 8,
-      cooldownSeconds: 45,
+      bar: "1m",
+      fastEma: 6,
+      slowEma: 24,
+      pollSeconds: 5,
+      cooldownSeconds: 0,
       maxOrdersPerDay: 0,
       spotEnabled: false,
       spotQuoteBudget: "0",
@@ -87,11 +87,11 @@ const STRATEGY_PRESETS = {
       swapEnabled: true,
       swapContracts: "0",
       swapTdMode: "isolated",
-      swapStrategyMode: "long_only",
+      swapStrategyMode: "trend_follow",
       swapLeverage: "10",
-      stopLossPct: "1.2",
-      takeProfitPct: "8",
-      maxDailyLossPct: "0.8",
+      stopLossPct: "0",
+      takeProfitPct: "0",
+      maxDailyLossPct: "0",
       targetBalanceMultiple: "100",
       autostart: false,
       allowLiveTrading: false,
@@ -586,7 +586,7 @@ function buildStrategyFormSummary(config = {}) {
     ? normalized.watchlistSymbols.split(",").filter(Boolean)
     : ["BTC"];
   const overrideCount = Object.keys(parseWatchlistOverridesValue(normalized.watchlistOverrides, watchlist)).length;
-  const presetDetail = `${normalized.bar} 波段 · 逐仓 ${normalized.swapLeverage}x · TP ${normalized.takeProfitPct}%`;
+  const presetDetail = `${normalized.bar} 利润循环 · 逐仓 ${normalized.swapLeverage}x · 净赚 1U+ 平仓`;
   return `${preset.label} · ${presetDetail} · ${watchlist.join(" / ")} · ${watchlist.length} 币组合${overrideCount ? ` · ${overrideCount} 币独立覆盖` : ""}`;
 }
 
@@ -607,8 +607,8 @@ function buildDraftPortfolioEntries(config = collectAutomationConfig()) {
     const perSpotCap = Number(target.spotMaxExposure || 0);
     const overrideFields = Object.keys(target.watchlistOverride || {});
     const summaryDetail = [
-      `${target.bar} · 趋势波段`,
-      `逐仓 ${target.swapLeverage}x · 动态仓位 · SL ${target.stopLossPct}% / TP ${target.takeProfitPct}%`,
+      `${target.bar} · 利润循环`,
+      `逐仓 ${target.swapLeverage}x · 动态仓位 · 空仓即开 / 净赚 1U+ 平仓`,
       overrideFields.length ? `独立覆盖 ${overrideFields.length} 项` : "沿用组合参数",
     ].join(" · ");
     return {
@@ -1702,14 +1702,14 @@ function sanitizeAnalysisForSwingOnly(analysis = {}) {
     || hasLegacyNonSwingText(data.summary)
     || hasLegacyNonSwingText(data.marketRegime)
   );
-  data.selectedStrategyName = `${symbol} 波段`;
-  data.selectedStrategyDetail = `趋势转强 + 回踩接多 · 逐仓 ${config.swapLeverage || "10"}x · TP ${config.takeProfitPct || "8"}%`;
+  data.selectedStrategyName = `${symbol} 利润循环`;
+  data.selectedStrategyDetail = `方向轮动 + maker-first · 逐仓 ${config.swapLeverage || "10"}x · 净赚 1U+ 平仓`;
   if (stale) {
     const allowNewEntries = Boolean(data.allowNewEntries);
     data.decision = allowNewEntries ? "execute" : "observe";
-    data.decisionLabel = allowNewEntries ? "允许波段开多" : "等待波段买点";
-    data.summary = "当前只保留波段策略，旧套利分析结果已隐藏。";
-    data.marketRegime = "波段观察";
+    data.decisionLabel = allowNewEntries ? "持续开仓" : "等待本轮方向确认";
+    data.summary = "当前只保留利润循环策略，旧策略分析结果已隐藏。";
+    data.marketRegime = "24h 利润循环";
     data.warnings = [];
     data.blockers = [];
   }
@@ -1720,11 +1720,11 @@ function sanitizeAutomationStateForSwingOnly(state = {}) {
   const sanitized = { ...(state || {}) };
   sanitized.analysis = sanitizeAnalysisForSwingOnly(sanitized.analysis || {});
   if (hasLegacyNonSwingText(sanitized.modeText)) {
-    sanitized.modeText = "波段";
+    sanitized.modeText = "利润循环";
   }
   const pipeline = { ...(sanitized.lastPipeline || {}) };
   if (hasLegacyNonSwingText(pipeline.summary)) {
-    pipeline.summary = `${sanitized.analysis.selectedStrategyName || "波段"} · ${sanitized.analysis.decisionLabel || "等待波段买点"}`;
+    pipeline.summary = `${sanitized.analysis.selectedStrategyName || "利润循环"} · ${sanitized.analysis.decisionLabel || "等待本轮方向确认"}`;
   }
   sanitized.lastPipeline = pipeline;
   return sanitized;
@@ -1782,15 +1782,18 @@ function renderAnalysisState(analysis) {
     data.marketRegime
       ? [
           data.marketRegime,
-          `回撤 ${data.pullbackPct || "--"}%`,
-          `反弹 ${data.reboundPct || "--"}%`,
+          `方向 ${data.plannedSideLabel || "--"}`,
+          `预期净优势 ${data.predictedNetPct || "--"}%`,
+          data.profitTargetUsdt ? `净利目标 ${data.profitTargetUsdt}U` : "",
           data.liquidationBufferPct ? `强平缓冲 ${data.liquidationBufferPct}%` : "",
         ].filter(Boolean).join(" · ")
-      : "等待趋势、回撤、反弹和强平缓冲分析";
+      : "等待方向、净优势和强平缓冲分析";
   $("analysis-refresh").textContent =
     data.lastAnalyzedAt
       ? [
           data.lastAnalyzedAt,
+          data.executionAbilityPhaseLabel ? `能力 ${data.executionAbilityPhaseLabel}` : "",
+          data.executionAbilityNetPnl ? `近场净收益 ${formatSignedMoney(data.executionAbilityNetPnl)}U` : "",
           data.fundingRatePct ? `资金费 ${data.fundingRatePct}%` : "",
           data.basisPct ? `基差 ${data.basisPct}%` : "",
           data.liquidationPrice ? `强平价 ${data.liquidationPrice}` : "",
@@ -1801,7 +1804,7 @@ function renderAnalysisState(analysis) {
   if (data.blockers?.length) reasonBits.push(`阻断: ${data.blockers.join("；")}`);
   else if (data.warnings?.length) reasonBits.push(`提醒: ${data.warnings.join("；")}`);
   $("analysis-reason").textContent =
-    reasonBits.join(" | ") || "这里只保留波段开多、观察和风控解释。";
+    reasonBits.join(" | ") || "这里只保留利润循环、观察和风控解释。";
 
   const pill = $("analysis-pill");
   const dockMain = $("dock-status-main");
@@ -1831,11 +1834,11 @@ function renderAnalysisState(analysis) {
   if (dockSub) {
     const dockSummaryBits = [];
     if (data.marketRegime) dockSummaryBits.push(data.marketRegime);
+    if (data.plannedSideLabel) dockSummaryBits.push(`方向 ${data.plannedSideLabel}`);
+    if (data.predictedNetPct) dockSummaryBits.push(`预期净优势 ${data.predictedNetPct}%`);
     if (data.volatilityPct) dockSummaryBits.push(`波动 ${data.volatilityPct}%`);
-    if (data.pullbackPct) dockSummaryBits.push(`回撤 ${data.pullbackPct}%`);
-    if (data.reboundPct) dockSummaryBits.push(`反弹 ${data.reboundPct}%`);
     if (data.fundingRatePct) dockSummaryBits.push(`资金费 ${data.fundingRatePct}%`);
-    if (data.selectedReturnPct) dockSummaryBits.push(`收益 ${formatPercentValue(data.selectedReturnPct)}`);
+    if (data.executionAbilityNetPnl) dockSummaryBits.push(`近场净收益 ${formatSignedMoney(data.executionAbilityNetPnl)}U`);
     if (data.blockers?.length) dockSummaryBits.push(`阻断 ${data.blockers[0]}`);
     else if (data.warnings?.length) dockSummaryBits.push(`提醒 ${data.warnings[0]}`);
     dockSub.textContent = dockSummaryBits.join(" · ") || "顶部固定显示当前策略、联网判断和执行环境。";
@@ -5172,7 +5175,7 @@ function renderPortfolioWatchlist(entries = []) {
     const swapState = swap.enabled
       ? `${swap.signal || "hold"} · ${swap.positionSide || "flat"} · ${swap.positionSize || "0"}`
       : "未启用";
-    const strategyPill = "波段";
+    const strategyPill = "利润循环";
     return `
       <article class="portfolio-coin-card tone-${toneClass}">
         <div class="portfolio-coin-head">
@@ -5271,7 +5274,7 @@ function renderStrategyPortfolio() {
     : "收益会按组合会话持续更新，不再只靠订单详情猜测";
   $("portfolio-context-main").textContent = activeSummary;
   $("portfolio-context-sub").textContent = running
-    ? `${analysis.selectedStrategyName || "波段"} · ${analysis.decisionLabel || "观察中"} · 回撤 ${analysis.pullbackPct || "--"}% · 反弹 ${analysis.reboundPct || "--"}%${analysis.liquidationBufferPct ? ` · 缓冲 ${analysis.liquidationBufferPct}%` : ""}`
+    ? `${analysis.selectedStrategyName || "利润循环"} · ${analysis.decisionLabel || "观察中"} · 方向 ${analysis.plannedSideLabel || "--"} · 预期净优势 ${analysis.predictedNetPct || "--"}%${analysis.liquidationBufferPct ? ` · 缓冲 ${analysis.liquidationBufferPct}%` : ""}`
     : `${watchlist.length} 个币各自独立决策、独立风控、独立仓位摘要`;
   if ($("portfolio-pipeline-main")) {
     $("portfolio-pipeline-main").textContent = pipeline.summary || (running ? "本轮执行中" : "等待下一轮编排");
@@ -5298,8 +5301,8 @@ function renderStrategyPortfolio() {
     const fallbackRisk = [
       `活跃 ${riskReport.activeMarkets || 0} 市场`,
       `观察 ${riskReport.watchedSymbols || watchlist.length || 0} 币`,
-      `回撤 ${analysis.pullbackPct || "--"}%`,
-      `反弹 ${analysis.reboundPct || "--"}%`,
+      `方向 ${analysis.plannedSideLabel || "--"}`,
+      `预期净优势 ${analysis.predictedNetPct || "--"}%`,
     ];
     if (analysis.liquidationBufferPct) fallbackRisk.push(`强平缓冲 ${analysis.liquidationBufferPct}%`);
     const journalBits = Number(executionJournal.totalOrders || 0)

@@ -112,6 +112,13 @@ OKX_FEE_RATE_CACHE: dict[str, Any] = {}
 REMOTE_AUTOMATION_CONFIG_LOCK = threading.RLock()
 REMOTE_AUTOMATION_CONFIG_CACHE: dict[str, Any] = {"ts": 0.0, "url": "", "config": {}}
 ONLY_STRATEGY_PRESET = "dip_swing"
+ONLY_STRATEGY_LABEL = "利润循环"
+ONLY_STRATEGY_FALLBACK_DECISION = "持续开仓"
+DIP_SWING_NET_TARGET_USDT = Decimal("1")
+DIP_SWING_MIN_NET_HOLD_USDT = Decimal("-999999")
+DIP_SWING_ENTRY_ORDER_MAX_AGE_SECONDS = 30
+DIP_SWING_EXIT_ORDER_MAX_AGE_SECONDS = 20
+DIP_SWING_DIRECTION_LOOKBACK_BARS = 6
 DIP_SWING_MIN_PULLBACK_PCT = Decimal("0.45")
 DIP_SWING_MAX_PULLBACK_PCT = Decimal("1.60")
 DIP_SWING_MIN_REBOUND_PCT = Decimal("0.25")
@@ -136,8 +143,6 @@ DIP_SWING_ORDER_PRESSURE_WINDOW_MINUTES = 240
 DIP_SWING_MAX_OPEN_CLOSE_GAP = 4
 DIP_SWING_MAX_CONSECUTIVE_OPEN_STREAK = 3
 DIP_SWING_HARD_BREAK_LOSS_PCT = Decimal("0.45")
-DIP_SWING_ENTRY_ORDER_MAX_AGE_SECONDS = 75
-DIP_SWING_EXIT_ORDER_MAX_AGE_SECONDS = 45
 DIP_SWING_POST_ONLY_BUFFER_PCT = Decimal("0.02")
 DIP_SWING_EXIT_POST_ONLY_BUFFER_PCT = Decimal("0.02")
 DIP_SWING_EXIT_PROTECTION_PCT = Decimal("0.08")
@@ -1091,11 +1096,11 @@ def default_automation_config() -> dict[str, Any]:
         "swapInstId": "BTC-USDT-SWAP",
         "watchlistSymbols": "BTC",
         "watchlistOverrides": {},
-        "bar": "15m",
-        "fastEma": 12,
-        "slowEma": 48,
-        "pollSeconds": 8,
-        "cooldownSeconds": 45,
+        "bar": "1m",
+        "fastEma": 6,
+        "slowEma": 24,
+        "pollSeconds": 5,
+        "cooldownSeconds": 0,
         "maxOrdersPerDay": 0,
         "spotEnabled": False,
         "spotQuoteBudget": "0",
@@ -1104,10 +1109,10 @@ def default_automation_config() -> dict[str, Any]:
         "swapContracts": "0",
         "swapTdMode": "isolated",
         "swapLeverage": "10",
-        "swapStrategyMode": "long_only",
-        "stopLossPct": "1.2",
-        "takeProfitPct": "8",
-        "maxDailyLossPct": "0.8",
+        "swapStrategyMode": "trend_follow",
+        "stopLossPct": "0",
+        "takeProfitPct": "0",
+        "maxDailyLossPct": "0",
         "targetBalanceMultiple": "100",
         "arbEntrySpreadPct": "0.18",
         "arbExitSpreadPct": "0.05",
@@ -1130,7 +1135,7 @@ def enforce_only_dip_swing_strategy(config: dict[str, Any]) -> dict[str, Any]:
     enforced["spotMaxExposure"] = "0"
     enforced["swapEnabled"] = True
     enforced["swapTdMode"] = "isolated"
-    enforced["swapStrategyMode"] = "long_only"
+    enforced["swapStrategyMode"] = "trend_follow"
     return enforced
 
 
@@ -1305,7 +1310,7 @@ def has_legacy_non_swing_text(value: Any) -> bool:
     return any(marker in text for marker in LEGACY_NON_SWING_MARKERS)
 
 
-def sanitize_only_dip_swing_message(message: Any, *, fallback: str = "等待波段买点确认") -> str:
+def sanitize_only_dip_swing_message(message: Any, *, fallback: str = "等待本轮方向确认") -> str:
     text = str(message or "").strip()
     if not text:
         return ""
@@ -1484,15 +1489,13 @@ def validate_single_automation_target(config: dict[str, Any]) -> str:
             return "高频套利的回补价差必须小于入场价差"
     if str(config.get("strategyPreset") or "") == "dip_swing":
         if not config.get("swapEnabled"):
-            return "波段策略必须启用永续"
-        if str(config.get("swapStrategyMode") or "") != "long_only":
-            return "波段策略只支持 long_only"
+            return f"{ONLY_STRATEGY_LABEL}必须启用永续"
+        if str(config.get("swapStrategyMode") or "") != "trend_follow":
+            return f"{ONLY_STRATEGY_LABEL}只支持 trend_follow"
         if str(config.get("swapTdMode") or "") != "isolated":
-            return "波段策略必须使用 isolated 逐仓"
+            return f"{ONLY_STRATEGY_LABEL}必须使用 isolated 逐仓"
         if safe_decimal(config.get("swapLeverage"), "1") > DIP_SWING_MAX_LEVERAGE:
-            return f"波段策略杠杆不能高于 {decimal_to_str(DIP_SWING_MAX_LEVERAGE)}x"
-        if safe_decimal(config.get("takeProfitPct"), "0") < Decimal("8"):
-            return "波段策略的目标止盈建议至少 8%"
+            return f"{ONLY_STRATEGY_LABEL}杠杆不能高于 {decimal_to_str(DIP_SWING_MAX_LEVERAGE)}x"
     target_multiple = safe_decimal(config.get("targetBalanceMultiple"), "1")
     if target_multiple < Decimal("1") or target_multiple > Decimal("100"):
         return "目标余额倍数需在 1 到 100 之间"
@@ -1740,8 +1743,7 @@ def build_market_risk_label(target: dict[str, Any], market_kind: str) -> str:
         )
     if str(target.get("strategyPreset") or "") == "dip_swing":
         return (
-            "自适应回撤 / 15m 短反 · "
-            f"TP {format_decimal(safe_decimal(target.get('takeProfitPct'), '8'), 1)}% · "
+            f"净赚 {format_decimal(DIP_SWING_NET_TARGET_USDT, 0)}U+ 就平 · "
             f"缓冲 ≥ {format_decimal(DIP_SWING_MIN_LIQ_BUFFER_PCT, 0)}% · "
             f"动态仓位 · {format_decimal(safe_decimal(target.get('swapLeverage'), '10'), 0)}x 逐仓"
         )
@@ -1949,14 +1951,14 @@ def sanitize_only_dip_swing_analysis(analysis: dict[str, Any], automation: dict[
         or has_legacy_non_swing_text(sanitized.get("marketRegime"))
     )
 
-    sanitized["selectedStrategyName"] = f"{primary_symbol} 波段"
+    sanitized["selectedStrategyName"] = f"{primary_symbol} {ONLY_STRATEGY_LABEL}"
     sanitized["selectedStrategyDetail"] = strategy_detail_line(effective)
     if stale:
         allow_new_entries = bool(sanitized.get("allowNewEntries"))
         sanitized["decision"] = "execute" if allow_new_entries else "observe"
-        sanitized["decisionLabel"] = "允许波段开多" if allow_new_entries else "等待波段买点"
-        sanitized["summary"] = "当前只保留波段策略，旧套利分析结果已隐藏。"
-        sanitized["marketRegime"] = "波段观察"
+        sanitized["decisionLabel"] = "持续开仓" if allow_new_entries else "等待本轮方向确认"
+        sanitized["summary"] = "当前只保留利润循环策略，旧策略分析结果已隐藏。"
+        sanitized["marketRegime"] = "24h 利润循环"
         sanitized["warnings"] = []
         sanitized["blockers"] = []
     return sanitized
@@ -1968,10 +1970,10 @@ def sanitize_only_dip_swing_runtime_state(state: dict[str, Any], automation: dic
     sanitized["analysis"] = sanitize_only_dip_swing_analysis(sanitized.get("analysis") or {}, effective)
 
     if has_legacy_non_swing_text(sanitized.get("modeText")):
-        sanitized["modeText"] = "波段"
+        sanitized["modeText"] = ONLY_STRATEGY_LABEL
     if has_legacy_non_swing_text(sanitized.get("statusText")):
         sanitized["statusText"] = (
-            "自动量化已启动，策略会按轮询周期检查波段信号并执行风控。"
+            "自动量化已启动，策略会按轮询周期维持利润循环并执行风控。"
             if sanitized.get("running")
             else "自动量化已停止"
         )
@@ -1979,15 +1981,15 @@ def sanitize_only_dip_swing_runtime_state(state: dict[str, Any], automation: dic
     last_pipeline = copy.deepcopy(sanitized.get("lastPipeline") or {})
     if has_legacy_non_swing_text(last_pipeline.get("summary")):
         last_pipeline["summary"] = (
-            f"{sanitized['analysis'].get('selectedStrategyName', '波段')} · "
-            f"{sanitized['analysis'].get('decisionLabel', '等待波段买点')}"
+            f"{sanitized['analysis'].get('selectedStrategyName', ONLY_STRATEGY_LABEL)} · "
+            f"{sanitized['analysis'].get('decisionLabel', '等待本轮方向确认')}"
         )
     sanitized["lastPipeline"] = last_pipeline
 
     research = copy.deepcopy(sanitized.get("research") or {})
     if str(research.get("mode") or "").strip() == "basis_arb":
         research["mode"] = "dip_swing"
-        research["statusText"] = "波段分析模式"
+        research["statusText"] = f"{ONLY_STRATEGY_LABEL}模式"
         best_config = deep_merge(default_automation_config(), research.get("bestConfig") or {})
         research["bestConfig"] = enforce_only_dip_swing_strategy(best_config)
     sanitized["research"] = research
@@ -2031,8 +2033,8 @@ def sanitize_only_dip_swing_runtime_state(state: dict[str, Any], automation: dic
         summary = copy.deepcopy(patched_entry.get("summary") or {})
         summary["arbStage"] = ""
         summary["arbStageText"] = ""
-        summary["status"] = "持仓中" if summary.get("activeLegs") else "观察中"
-        summary["detail"] = sanitize_only_dip_swing_message(summary.get("detail"), fallback="等待波段买点确认")
+        summary["status"] = "循环持仓中" if summary.get("activeLegs") else "等待开仓"
+        summary["detail"] = sanitize_only_dip_swing_message(summary.get("detail"), fallback="等待本轮方向确认")
         patched_entry["summary"] = summary
         cleaned_watchlist.append(patched_entry)
     sanitized["watchlist"] = cleaned_watchlist
@@ -2110,7 +2112,7 @@ def enrich_remote_dip_swing_runtime_state(
             "自动量化已停止"
         )
         sanitized["modeText"] = (
-            f"{analysis.get('selectedStrategyName', 'BTC 波段')}"
+            f"{analysis.get('selectedStrategyName', f'BTC {ONLY_STRATEGY_LABEL}')}"
             f" · {analysis.get('decisionLabel', '待分析')}"
             f" · 市场候选 {market_candidate_count}/{market_scan_count}"
             + (" · 轮动接管" if selected_from_market else "")
@@ -2126,7 +2128,7 @@ def enrich_remote_dip_swing_runtime_state(
         sanitized["lastPipeline"] = last_pipeline
 
         last_applied = copy.deepcopy(sanitized.get("lastAppliedStrategy") or {})
-        last_applied["title"] = analysis.get("selectedStrategyName") or "BTC 波段"
+        last_applied["title"] = analysis.get("selectedStrategyName") or f"BTC {ONLY_STRATEGY_LABEL}"
         last_applied["detail"] = strategy_detail_line(effective)
         last_applied["stage"] = "running" if bool(analysis.get("allowNewEntries")) else "synced"
         last_applied["appliedAt"] = sanitized.get("lastCycleAt") or last_applied.get("appliedAt") or now_local_iso()
@@ -2134,7 +2136,7 @@ def enrich_remote_dip_swing_runtime_state(
     except Exception as exc:
         patched_analysis = copy.deepcopy(sanitized.get("analysis") or {})
         warnings = list(patched_analysis.get("warnings") or [])
-        warnings.append(f"本地重算波段分析失败，沿用远端状态: {exc}")
+        warnings.append(f"本地重算{ONLY_STRATEGY_LABEL}分析失败，沿用远端状态: {exc}")
         patched_analysis["warnings"] = warnings[-5:]
         sanitized["analysis"] = patched_analysis
     return sanitized
@@ -4345,7 +4347,7 @@ def validate_automation_config(config: dict[str, Any]) -> tuple[bool, str, dict[
 
 
 def strategy_label(preset: str) -> str:
-    return "波段"
+    return ONLY_STRATEGY_LABEL
 
 
 def strategy_symbol_label(config: dict[str, Any]) -> str:
@@ -4361,7 +4363,7 @@ def strategy_symbol_label(config: dict[str, Any]) -> str:
 
 def strategy_scope_label(config: dict[str, Any]) -> str:
     if str(config.get("strategyPreset") or "") == "dip_swing":
-        return "逐仓永续波段"
+        return "逐仓永续利润循环"
     scopes: list[str] = []
     if config.get("spotEnabled"):
         scopes.append("现货")
@@ -4372,7 +4374,7 @@ def strategy_scope_label(config: dict[str, Any]) -> str:
 
 def strategy_mode_label(config: dict[str, Any]) -> str:
     if str(config.get("strategyPreset") or "") == "dip_swing":
-        return "趋势转强 / 回踩接多"
+        return "空仓即开 / 净利 1U 平仓"
     if not config.get("swapEnabled"):
         return "现货执行"
     mode = str(config.get("swapStrategyMode", "trend_follow"))
@@ -4385,7 +4387,7 @@ def strategy_mode_label(config: dict[str, Any]) -> str:
 
 def strategy_mode_badge(config: dict[str, Any]) -> str:
     if str(config.get("strategyPreset") or "") == "dip_swing":
-        return "波段"
+        return ONLY_STRATEGY_LABEL
     if not config.get("swapEnabled"):
         return "现货"
     mode = str(config.get("swapStrategyMode", "trend_follow"))
@@ -4399,7 +4401,7 @@ def strategy_mode_badge(config: dict[str, Any]) -> str:
 def strategy_short_name(config: dict[str, Any], rank: int | None = None) -> str:
     prefix = f"S{rank:02d} " if rank else ""
     symbol = strategy_symbol_label(config)
-    preset = "波段"
+    preset = ONLY_STRATEGY_LABEL
     leverage = f"{int(safe_decimal(config.get('swapLeverage'), '1'))}x" if config.get("swapEnabled") else ""
     tail = " ".join(part for part in (strategy_mode_badge(config), leverage) if part)
     return f"{prefix}{symbol} {preset} {config.get('bar', '5m')} EMA{config['fastEma']}/{config['slowEma']}{(' ' + tail) if tail else ''}"
@@ -4427,14 +4429,12 @@ def strategy_detail_line(config: dict[str, Any], origin_label: str = "") -> str:
     if str(config.get("strategyPreset") or "") == "dip_swing":
         target_multiple = resolve_target_balance_multiple(config)
         parts = [
-            "市场扫描 + 因子裁判 + 能力驱动放大",
-            "趋势扩散 + 回踩反弹 + 不追价 + maker-first",
-            f"只做多 · {config.get('swapTdMode', 'isolated')} {config.get('swapLeverage', '2')}x",
-            f"目标止盈 {config.get('takeProfitPct', '8')}%",
-            f"止损 {config.get('stopLossPct', '2.5')}%",
-            "回撤阈值 / 15m 短反阈值按市场波动、成本和预期净优势自适应",
+            "市场扫描 + 方向轮动 + 因子裁判",
+            "空仓即开 · 净赚 1U+ 就平 · 24 小时循环",
+            f"顺势双向 · {config.get('swapTdMode', 'isolated')} {config.get('swapLeverage', '2')}x",
+            "开仓 maker-first / 平仓 IOC",
             f"优势/成本 ≥ {format_decimal(DIP_SWING_MIN_EDGE_COST_RATIO, 1)}x · 波动/成本 ≥ {format_decimal(DIP_SWING_MIN_RANGE_COST_RATIO, 1)}x · ATR/成本 ≥ {format_decimal(DIP_SWING_MIN_ATR_COST_RATIO, 1)}x",
-            f"强平缓冲 ≥ {format_decimal(DIP_SWING_MIN_LIQ_BUFFER_PCT, 0)}%",
+            f"强平缓冲 ≥ {format_decimal(DIP_SWING_MIN_LIQ_BUFFER_PCT, 0)}% · 动态仓位",
         ]
         if target_multiple > Decimal("1"):
             parts.append(f"目标余额 {format_decimal(target_multiple, 0)}x")
@@ -4540,7 +4540,7 @@ def build_pullback_signal(
 ) -> dict[str, Any]:
     closes = [row["close"] for row in candles]
     if len(closes) < slow + 2:
-        raise OkxApiError("K 线样本不足，无法计算波段信号")
+        raise OkxApiError("K 线样本不足，无法计算利润循环信号")
     adaptive_thresholds = build_dip_swing_adaptive_thresholds(candles, fast, slow)
     pullback_threshold_pct = safe_decimal(
         pullback_threshold_pct,
@@ -4650,6 +4650,56 @@ def build_pullback_signal(
         "entryScore": entry_score,
         "exitScore": exit_score,
         "weakTrendReady": weak_trend_ready,
+    }
+
+
+def profit_loop_trade_side(signal: dict[str, Any], candles: list[dict[str, Any]]) -> str:
+    trend = str(signal.get("trend") or "flat").strip().lower()
+    fast_slope_pct = safe_decimal(signal.get("fastSlopePct"), "0")
+    slow_slope_pct = safe_decimal(signal.get("slowSlopePct"), "0")
+    last_close = safe_decimal(signal.get("lastClose"), "0")
+    prev_close = candles[-2]["close"] if len(candles) >= 2 else last_close
+    if trend == "up" and fast_slope_pct >= 0 and slow_slope_pct >= 0:
+        return "buy"
+    if trend == "down" and fast_slope_pct <= 0 and slow_slope_pct <= 0:
+        return "sell"
+    return "buy" if last_close >= prev_close else "sell"
+
+
+def profit_loop_trade_side_label(side: str) -> str:
+    return "做多" if str(side or "").strip().lower() == "buy" else "做空"
+
+
+def estimate_profit_loop_position_net_pnl(
+    *,
+    position_side: str,
+    position_size: Decimal,
+    entry_price: Decimal,
+    last_price: Decimal,
+    contract_value: Decimal,
+    floating_pnl: Decimal,
+    maker_fee_pct: Decimal,
+    taker_fee_pct: Decimal,
+) -> dict[str, Decimal]:
+    if str(position_side or "").strip().lower() not in {"long", "short"} or position_size <= 0:
+        return {
+            "entryNotional": Decimal("0"),
+            "exitNotional": Decimal("0"),
+            "entryFeeEstimate": Decimal("0"),
+            "exitFeeEstimate": Decimal("0"),
+            "netClosePnl": Decimal("0"),
+        }
+    entry_notional = max(position_size * entry_price * contract_value, Decimal("0"))
+    exit_notional = max(position_size * last_price * contract_value, Decimal("0"))
+    entry_fee_estimate = entry_notional * maker_fee_pct / Decimal("100")
+    exit_fee_estimate = exit_notional * taker_fee_pct / Decimal("100")
+    net_close_pnl = floating_pnl - entry_fee_estimate - exit_fee_estimate
+    return {
+        "entryNotional": entry_notional,
+        "exitNotional": exit_notional,
+        "entryFeeEstimate": entry_fee_estimate,
+        "exitFeeEstimate": exit_fee_estimate,
+        "netClosePnl": net_close_pnl,
     }
 
 
@@ -6413,11 +6463,11 @@ def build_dip_swing_factor_bundle(
     }
     vetoes: list[str] = []
     if not entry_factors["trendUp"]:
-        vetoes.append("趋势未转强")
+        vetoes.append("方向还没真正扩散出来")
     elif not entry_factors["trendStrength"]:
         vetoes.append("趋势扩散和斜率不够")
     if not entry_factors["pullbackContext"]:
-        vetoes.append("没有新的回踩或启动结构")
+        vetoes.append("没有新的启动结构")
     if not entry_factors["reboundReady"]:
         vetoes.append("反弹确认不够")
     if not entry_factors["notOverextended"]:
@@ -6536,11 +6586,14 @@ def evaluate_dip_swing_target_snapshot(
     )
     open_position = next((row for row in positions if safe_decimal(row.get("pos"), "0") != 0), {})
     pos_value = safe_decimal(open_position.get("pos"), "0")
+    position_size = abs(pos_value)
     position_side = "flat"
     if pos_value > 0:
         position_side = "long"
     elif pos_value < 0:
         position_side = "short"
+    entry_price = safe_decimal(open_position.get("avgPx"), "0")
+    floating_pnl = safe_decimal(open_position.get("upl"), "0")
     liq_price = safe_decimal(open_position.get("liqPx"), "0")
     liq_buffer = liquidation_buffer_pct(last_price, liq_price, position_side)
     open_interest = (
@@ -6593,6 +6646,9 @@ def evaluate_dip_swing_target_snapshot(
         "executionQualityScore": execution_quality_score,
         "factorBundle": factor_bundle,
         "positionSide": position_side,
+        "positionSize": position_size,
+        "entryPrice": entry_price,
+        "floatingPnl": floating_pnl,
         "liqPrice": liq_price,
         "liqBufferPct": liq_buffer,
         "openInterest": open_interest,
@@ -6636,6 +6692,40 @@ def fetch_dip_swing_target_snapshot(client: OkxClient, target: dict[str, Any]) -
         fetched["swapCandles"],
         fetched["positions"],
     )
+
+
+def build_profit_loop_snapshot_metrics(snapshot: dict[str, Any]) -> dict[str, Any]:
+    signal = snapshot.get("signal") or {}
+    candles = snapshot.get("candles") or []
+    side = profit_loop_trade_side(signal, candles) if candles else "buy"
+    ema_spread_pct = abs(safe_decimal(snapshot.get("emaSpreadPct"), "0"))
+    fast_slope_pct = abs(safe_decimal(snapshot.get("fastSlopePct"), "0"))
+    slow_slope_pct = abs(safe_decimal(snapshot.get("slowSlopePct"), "0"))
+    atr_pct = safe_decimal(snapshot.get("atrPct"), "0")
+    volatility_pct = safe_decimal(snapshot.get("volatilityPct"), "0")
+    estimated_cost_pct = safe_decimal(snapshot.get("estimatedCostPct"), "0")
+    liquidity_score = safe_decimal(snapshot.get("liquidityScore"), "0")
+    execution_quality_score = safe_decimal(snapshot.get("executionQualityScore"), "0")
+    basis_penalty = abs(safe_decimal(snapshot.get("basisPct"), "0")) * Decimal("0.5")
+    predicted_move_pct = max(
+        atr_pct * Decimal("0.55"),
+        ema_spread_pct + fast_slope_pct + (slow_slope_pct / Decimal("2")),
+        volatility_pct * Decimal("0.35"),
+    )
+    predicted_net_pct = predicted_move_pct - estimated_cost_pct
+    loop_quality_score = (
+        execution_quality_score
+        + (predicted_net_pct * Decimal("16"))
+        + liquidity_score
+        - basis_penalty
+    )
+    return {
+        "plannedSide": side,
+        "plannedSideLabel": profit_loop_trade_side_label(side),
+        "predictedMovePct": predicted_move_pct,
+        "predictedNetPct": predicted_net_pct,
+        "loopQualityScore": loop_quality_score,
+    }
 
 
 def list_dip_swing_market_symbols(
@@ -6725,7 +6815,7 @@ def scan_dip_swing_market_snapshots(
             except Exception as exc:
                 errors.append(f"{target.get('watchlistSymbol') or target.get('swapInstId')}: {exc}")
     if errors and not rows:
-        raise OkxApiError(f"波段扩展市场扫描失败: {'; '.join(errors)}")
+        raise OkxApiError(f"{ONLY_STRATEGY_LABEL}扩展市场扫描失败: {'; '.join(errors)}")
     with DIP_SWING_SCAN_LOCK:
         DIP_SWING_MARKET_SCAN_CACHE["ts"] = now
         DIP_SWING_MARKET_SCAN_CACHE["key"] = cache_key
@@ -7227,30 +7317,35 @@ def build_dip_swing_analysis(
                 errors.append(f"{target.get('watchlistSymbol') or target.get('swapInstId')}: {exc}")
     if errors:
         raise OkxApiError(f"联网分析失败: {'; '.join(errors)}")
-
-    candidate_snapshots = [row for row in target_snapshots if row.get("candidate")]
-    holding_snapshots = [row for row in target_snapshots if str(row.get("positionSide") or "") == "long"]
+    for row in target_snapshots:
+        row["profitLoop"] = build_profit_loop_snapshot_metrics(row)
+    holding_snapshots = [row for row in target_snapshots if str(row.get("positionSide") or "") in {"long", "short"}]
     market_scan_symbols = list_dip_swing_market_symbols(client, automation)
     extra_scan_symbols = [symbol for symbol in market_scan_symbols if symbol not in set(watchlist_symbols)]
     extra_market_snapshots, market_scan_errors = scan_dip_swing_market_snapshots(client, automation, extra_scan_symbols)
+    for row in extra_market_snapshots:
+        row["profitLoop"] = build_profit_loop_snapshot_metrics(row)
     market_snapshots = target_snapshots + extra_market_snapshots
-    market_candidate_snapshots = [row for row in market_snapshots if row.get("candidate")]
+    market_candidate_snapshots = [
+        row
+        for row in market_snapshots
+        if safe_decimal((row.get("profitLoop") or {}).get("predictedNetPct"), "0") > Decimal("0")
+    ]
 
     ranking_key = lambda row: (
-        safe_decimal(row.get("executionQualityScore"), "-999"),
-        safe_decimal(row.get("netEdgePct"), "-999"),
-        safe_decimal(row.get("edgeCostRatio"), "0"),
-        safe_decimal(row.get("atrCostRatio"), "0"),
+        safe_decimal((row.get("profitLoop") or {}).get("loopQualityScore"), "-999"),
+        safe_decimal((row.get("profitLoop") or {}).get("predictedNetPct"), "-999"),
+        safe_decimal((row.get("profitLoop") or {}).get("predictedMovePct"), "-999"),
         safe_decimal(row.get("avgQuoteVolumeUsd"), "0"),
         safe_decimal(row.get("openInterestUsd"), "0"),
-        int(row.get("entryScore") or 0),
+        safe_decimal(row.get("executionQualityScore"), "-999"),
     )
     if holding_snapshots:
         selected_snapshot = max(
             holding_snapshots,
             key=lambda row: (
                 safe_decimal(row.get("liqBufferPct"), "0"),
-                safe_decimal(row.get("netEdgePct"), "-999"),
+                safe_decimal((row.get("profitLoop") or {}).get("loopQualityScore"), "-999"),
             ),
         )
     elif market_candidate_snapshots:
@@ -7280,10 +7375,20 @@ def build_dip_swing_analysis(
             "setupEdgePct": Decimal("0"),
             "netEdgePct": Decimal("0"),
             "positionSide": "flat",
+            "positionSize": Decimal("0"),
+            "entryPrice": Decimal("0"),
+            "floatingPnl": Decimal("0"),
             "liqPrice": Decimal("0"),
             "liqBufferPct": Decimal("0"),
             "openInterest": "--",
             "candidate": False,
+            "profitLoop": {
+                "plannedSide": "buy",
+                "plannedSideLabel": profit_loop_trade_side_label("buy"),
+                "predictedMovePct": Decimal("0"),
+                "predictedNetPct": Decimal("0"),
+                "loopQualityScore": Decimal("0"),
+            },
         }
 
     selected_target = copy.deepcopy(selected_snapshot.get("target") or resolve_selected_execution_target(automation))
@@ -7323,6 +7428,9 @@ def build_dip_swing_analysis(
     factor_bundle = copy.deepcopy(selected_snapshot.get("factorBundle") or {})
     entry_vetoes = list(factor_bundle.get("entryVetoes") or [])
     position_side = str(selected_snapshot.get("positionSide") or "flat")
+    position_size = safe_decimal(selected_snapshot.get("positionSize"), "0")
+    entry_price = safe_decimal(selected_snapshot.get("entryPrice"), "0")
+    floating_pnl = safe_decimal(selected_snapshot.get("floatingPnl"), "0")
     liq_price = safe_decimal(selected_snapshot.get("liqPrice"), "0")
     liq_buffer = safe_decimal(selected_snapshot.get("liqBufferPct"), "0")
     open_interest = selected_snapshot.get("openInterest") or "--"
@@ -7338,14 +7446,22 @@ def build_dip_swing_analysis(
         state=AUTOMATION_STATE.current(),
         target_snapshot=target_balance,
     )
-    candidate_count = len(candidate_snapshots)
+    loop_metrics = copy.deepcopy(selected_snapshot.get("profitLoop") or {})
+    planned_side = str(loop_metrics.get("plannedSide") or "buy")
+    planned_side_label = str(loop_metrics.get("plannedSideLabel") or profit_loop_trade_side_label(planned_side))
+    predicted_move_pct = safe_decimal(loop_metrics.get("predictedMovePct"), "0")
+    predicted_net_pct = safe_decimal(loop_metrics.get("predictedNetPct"), "0")
+    loop_quality_score = safe_decimal(loop_metrics.get("loopQualityScore"), "0")
+    candidate_count = len(
+        [row for row in target_snapshots if safe_decimal((row.get("profitLoop") or {}).get("predictedNetPct"), "0") > Decimal("0")]
+    )
     market_candidate_count = len(market_candidate_snapshots)
     top_candidates = [
         {
             "symbol": str(row.get("symbol") or ""),
-            "netEdgePct": compact_metric(safe_decimal(row.get("netEdgePct"), "0"), "0.01"),
-            "entryScore": int(row.get("entryScore") or 0),
-            "qualityScore": compact_metric(safe_decimal(row.get("executionQualityScore"), "0"), "0.1"),
+            "plannedSideLabel": str((row.get("profitLoop") or {}).get("plannedSideLabel") or profit_loop_trade_side_label("buy")),
+            "predictedNetPct": compact_metric(safe_decimal((row.get("profitLoop") or {}).get("predictedNetPct"), "0"), "0.01"),
+            "qualityScore": compact_metric(safe_decimal((row.get("profitLoop") or {}).get("loopQualityScore"), "0"), "0.1"),
             "atrPct": compact_metric(safe_decimal(row.get("atrPct"), "0"), "0.01"),
         }
         for row in sorted(market_candidate_snapshots, key=ranking_key, reverse=True)[:3]
@@ -7373,33 +7489,47 @@ def build_dip_swing_analysis(
     edge_cost_ready = edge_cost_ratio >= DIP_SWING_MIN_EDGE_COST_RATIO
     range_cost_ready = range_cost_ratio >= DIP_SWING_MIN_RANGE_COST_RATIO
     atr_cost_ready = atr_cost_ratio >= DIP_SWING_MIN_ATR_COST_RATIO
+    swap_meta = get_instrument_meta(client, "SWAP", str(selected_target.get("swapInstId") or ""))
+    contract_value = safe_decimal(swap_meta.get("ctVal"), decimal_to_str(default_swap_contract_value(str(selected_target.get("swapInstId") or ""))))
+    net_close_snapshot = estimate_profit_loop_position_net_pnl(
+        position_side=position_side,
+        position_size=position_size,
+        entry_price=entry_price,
+        last_price=last_price,
+        contract_value=contract_value,
+        floating_pnl=floating_pnl,
+        maker_fee_pct=maker_fee_pct,
+        taker_fee_pct=taker_fee_pct,
+    )
+    net_close_pnl = safe_decimal(net_close_snapshot.get("netClosePnl"), "0")
 
     blockers: list[str] = []
     warnings: list[str] = []
     if str(selected_target.get("swapTdMode") or "") != "isolated":
-        blockers.append("波段策略要求逐仓，避免把整账户拖进强平")
+        blockers.append(f"{ONLY_STRATEGY_LABEL}要求逐仓，避免把整账户拖进强平")
     if leverage > DIP_SWING_MAX_LEVERAGE:
         blockers.append(f"当前杠杆 {decimal_to_str(leverage)}x 过高，已限制到 ≤ {decimal_to_str(DIP_SWING_MAX_LEVERAGE)}x")
-    if position_side == "long" and liq_buffer > 0 and liq_buffer <= DIP_SWING_MIN_LIQ_BUFFER_PCT:
+    if position_side in {"long", "short"} and liq_buffer > 0 and liq_buffer <= DIP_SWING_MIN_LIQ_BUFFER_PCT:
         blockers.append(f"当前强平缓冲只剩 {compact_metric(liq_buffer, '0.1')}%，不满足安全缓冲")
-    if position_side == "short":
-        blockers.append("检测到空单残留，先清掉再切换到波段策略")
     if funding_rate_pct >= Decimal("0.03"):
         warnings.append("当前多头资金费偏热，抬高持仓成本")
     if basis_pct >= Decimal("0.20"):
         warnings.append("永续高于标记价较多，追高风险升高")
-    if position_side == "long":
-        warnings.append(f"当前正在持有 {selected_symbol}，本轮优先做持仓管理")
-    elif selected_from_market and market_candidate_count > 0:
-        warnings.append(f"watchlist 外出现更优波段目标，当前切到 {selected_symbol}")
+    if position_side in {"long", "short"}:
+        warnings.append(
+            f"当前持有 {selected_symbol}{'多单' if position_side == 'long' else '空单'}"
+            f" · 当前净结果估算 {format_decimal(net_close_pnl, 2)}U / 目标 {format_decimal(DIP_SWING_NET_TARGET_USDT, 0)}U"
+        )
+    elif selected_from_market:
+        warnings.append(f"watchlist 外出现更优循环目标，当前切到 {selected_symbol}")
     if target_multiple > Decimal("1"):
         if int(ability_snapshot.get("closeOrders") or 0) <= 0:
             warnings.append(
-                f"100x 是项目目标，不会直接放大仓位；当前还没拿到足够的平仓样本，先按 {ability_snapshot.get('phaseLabel', '守仓')} 仓位执行"
+                f"{format_decimal(target_multiple, 0)}x 是项目目标，不会直接把一个数字乘到仓位上；当前还没拿到足够的平仓样本，先按 {ability_snapshot.get('phaseLabel', '守仓')} 仓位执行"
             )
         else:
             warnings.append(
-                f"100x 是项目目标，不会直接放大仓位；当前按真实能力 {ability_snapshot.get('phaseLabel', '守仓')} 执行"
+                f"{format_decimal(target_multiple, 0)}x 是项目目标，不会直接把一个数字乘到仓位上；当前按真实能力 {ability_snapshot.get('phaseLabel', '守仓')} 执行"
                 f" · 近场净收益 {format_decimal(safe_decimal(ability_snapshot.get('netPnl'), '0'), 2)}U"
                 f" · 平仓胜率 {compact_metric(ability_snapshot.get('closeWinRatePct'), '0.1')}%"
             )
@@ -7411,121 +7541,48 @@ def build_dip_swing_analysis(
         f"当前费率采用 OKX 实际/回退费率：maker {compact_metric(maker_fee_pct, '0.001')}% / taker {compact_metric(taker_fee_pct, '0.001')}%"
     )
     if entry_vetoes:
-        warnings.append("入场裁判拦截: " + " / ".join(entry_vetoes[:4]))
-    if str(selected_signal.get("trend") or "") != "up":
-        warnings.append("当前趋势未转强，不做波段开多")
-    elif not bool(selected_signal.get("trendStrengthReady")):
-        warnings.append("EMA 趋势扩散和斜率还不够，复合买点暂不成立")
-    elif not bool(selected_signal.get("pullbackContext")) and not bool(selected_signal.get("bullCross")):
-        warnings.append("当前没有新的回踩结构，也没有新的金叉启动")
-    elif not bool(selected_signal.get("reboundReady")) and not bool(selected_signal.get("bullCross")):
+        warnings.append("结构裁判快照: " + " / ".join(entry_vetoes[:4]))
+    warnings.append(
+        f"当前方向 {planned_side_label} · 预期波动 {compact_metric(predicted_move_pct, '0.01')}% / 预期净优势 {compact_metric(predicted_net_pct, '0.01')}%"
+    )
+    if not liquidity_ready:
         warnings.append(
-            f"回踩出现了，但 15m 短反只有 {compact_metric(rebound_pct, '0.1')}%"
-            f" / 动态阈值 {compact_metric(rebound_threshold_pct, '0.1')}% ({rebound_lookback_bars} 根)"
-        )
-    elif not bool(selected_signal.get("notOverextended")):
-        warnings.append(
-            f"当前价格高于快线 {compact_metric(price_vs_fast_pct, '0.01')}%，追价成本偏高，放弃开仓"
-        )
-    elif not edge_cost_ready:
-        warnings.append(
-            f"结构优势/成本比只有 {compact_metric(edge_cost_ratio, '0.01')}x，低于 {format_decimal(DIP_SWING_MIN_EDGE_COST_RATIO, 1)}x"
-        )
-    elif not range_cost_ready:
-        warnings.append(
-            f"最近波动只有成本的 {compact_metric(range_cost_ratio, '0.01')}x，容易被手续费磨损，继续空仓"
-        )
-    elif not atr_cost_ready:
-        warnings.append(
-            f"ATR 只有成本的 {compact_metric(atr_cost_ratio, '0.01')}x，波动不够支撑一笔完整波段"
-        )
-    elif not liquidity_ready:
-        warnings.append(
-            f"近端成交额 {format_decimal(avg_quote_volume_usd, 0)}U / 持仓量 {format_decimal(open_interest_usd, 0)}U，流动性不够厚"
-        )
-    elif net_edge_pct < DIP_SWING_MIN_NET_EDGE_PCT:
-        warnings.append(
-            f"手续费后净优势只有 {compact_metric(net_edge_pct, '0.01')}%，低于无交易带 {format_decimal(DIP_SWING_MIN_NET_EDGE_PCT, 2)}%"
+            f"近端成交额 {format_decimal(avg_quote_volume_usd, 0)}U / 持仓量 {format_decimal(open_interest_usd, 0)}U，流动性一般"
         )
     if market_candidate_count == 0:
-        warnings.append(f"扩展市场已扫 {len(market_snapshots)} 币，当前没有满足净优势的波段候选")
+        warnings.append(f"扩展市场已扫 {len(market_snapshots)} 币，当前没有明显正净优势候选，仍会按最高质量标的循环执行")
     elif top_candidates:
         warnings.append(
             "当前候选: " + " / ".join(
-                f"{item['symbol']} 质量 {item['qualityScore']} · 净优势 {item['netEdgePct']}% · ATR {item['atrPct']}% · 评分 {item['entryScore']}/8"
+                f"{item['symbol']} {item['plannedSideLabel']} · 质量 {item['qualityScore']} · 预期净优势 {item['predictedNetPct']}% · ATR {item['atrPct']}%"
                 for item in top_candidates
             )
         )
     if market_scan_errors:
         warnings.append(f"扩展扫描跳过 {len(market_scan_errors)} 币")
 
-    entry_ready_live = (
-        str(selected_signal.get("trend") or "") == "up"
-        and bool(selected_signal.get("trendStrengthReady"))
-        and (bool(selected_signal.get("pullbackContext")) or bool(selected_signal.get("bullCross")))
-        and (bool(selected_signal.get("reboundReady")) or bool(selected_signal.get("bullCross")))
-        and bool(selected_signal.get("notOverextended"))
-        and entry_score >= DIP_SWING_MIN_ENTRY_SCORE
-        and edge_cost_ready
-        and range_cost_ready
-        and atr_cost_ready
-        and liquidity_ready
-        and net_edge_pct >= DIP_SWING_MIN_NET_EDGE_PCT
-    )
-    allow_new_entries = entry_ready_live and position_side == "flat" and not blockers
+    allow_new_entries = position_side == "flat" and not blockers
     if blockers:
         decision = "skip"
         decision_label = "先收缩风险"
-    elif position_side == "long":
+    elif position_side in {"long", "short"}:
         decision = "manage"
-        decision_label = "持仓管理"
+        decision_label = "达到净利，准备平仓" if net_close_pnl >= DIP_SWING_NET_TARGET_USDT else "盯净利 1U 平仓"
     elif allow_new_entries:
         decision = "execute"
-        decision_label = "允许波段开多"
-    elif str(selected_signal.get("trend") or "") != "up":
-        decision = "observe"
-        decision_label = "趋势未转强"
-    elif not bool(selected_signal.get("trendStrengthReady")):
-        decision = "observe"
-        decision_label = "复合趋势未过线"
-    elif not bool(selected_signal.get("pullbackContext")) and not bool(selected_signal.get("bullCross")):
-        decision = "observe"
-        decision_label = "等待回踩结构"
-    elif not bool(selected_signal.get("reboundReady")) and not bool(selected_signal.get("bullCross")):
-        decision = "observe"
-        decision_label = "等待反弹确认"
-    elif not bool(selected_signal.get("notOverextended")):
-        decision = "observe"
-        decision_label = "放弃追价，等回踩"
-    elif not edge_cost_ready:
-        decision = "observe"
-        decision_label = "结构优势/成本比不够"
-    elif not range_cost_ready:
-        decision = "observe"
-        decision_label = "波动太窄，容易磨损"
-    elif not atr_cost_ready:
-        decision = "observe"
-        decision_label = "真实波幅不够"
-    elif not liquidity_ready:
-        decision = "observe"
-        decision_label = "流动性不够厚"
-    elif net_edge_pct < DIP_SWING_MIN_NET_EDGE_PCT:
-        decision = "observe"
-        decision_label = "净优势不够，不交易"
+        decision_label = "持续开仓"
     else:
         decision = "observe"
-        decision_label = "等待复合买点"
+        decision_label = ONLY_STRATEGY_FALLBACK_DECISION
 
     symbol = selected_symbol
     summary_bits = [
-        f"{symbol} 波段",
-        f"回撤 {compact_metric(pullback_pct, '0.1')}% / 阈值 {compact_metric(pullback_threshold_pct, '0.1')}%",
-        f"15m 短反 {compact_metric(rebound_pct, '0.1')}% / 阈值 {compact_metric(rebound_threshold_pct, '0.1')}% ({rebound_lookback_bars} 根)",
-        f"趋势扩散 {compact_metric(ema_spread_pct, '0.01')}%",
-        f"快线斜率 {compact_metric(fast_slope_pct, '0.01')}%",
-        f"ATR {compact_metric(atr_pct, '0.01')}%",
-        f"净优势 {compact_metric(net_edge_pct, '0.01')}%",
-        f"优势/成本 {compact_metric(edge_cost_ratio, '0.01')}x",
+        f"{symbol} {ONLY_STRATEGY_LABEL}",
+        f"方向 {planned_side_label}",
+        f"预期波动 {compact_metric(predicted_move_pct, '0.01')}%",
+        f"预期净优势 {compact_metric(predicted_net_pct, '0.01')}%",
+        f"maker {compact_metric(maker_fee_pct, '0.001')}% / taker {compact_metric(taker_fee_pct, '0.001')}%",
+        f"净利目标 {format_decimal(DIP_SWING_NET_TARGET_USDT, 0)}U",
     ]
     if target_multiple > Decimal("1"):
         summary_bits.append(f"目标余额 {format_decimal(target_multiple, 0)}x")
@@ -7537,40 +7594,28 @@ def build_dip_swing_analysis(
             summary_bits.append("先证明赚钱能力，再放大仓位")
     if selected_from_market:
         summary_bits.append("市场轮动目标")
-    if position_side == "long" and liq_buffer > 0:
+    if position_side in {"long", "short"} and liq_buffer > 0:
         summary_bits.append(f"强平缓冲 {compact_metric(liq_buffer, '0.1')}%")
     if blockers:
         summary_bits.append(blockers[0])
-    elif position_side == "long":
-        summary_bits.append("当前已有持仓，优先做结构管理")
+    elif position_side in {"long", "short"}:
+        summary_bits.append(f"当前净结果估算 {format_decimal(net_close_pnl, 2)}U，达到 {format_decimal(DIP_SWING_NET_TARGET_USDT, 0)}U 就平")
     elif allow_new_entries:
-        summary_bits.append(
-            f"评分 {entry_score}/8，净优势覆盖手续费，允许逐仓开多"
-        )
-    elif not edge_cost_ready:
-        summary_bits.append("结构优势/成本比不够，先不为了手续费去博小波动")
-    elif not range_cost_ready:
-        summary_bits.append("波动区间太窄，单子大概率被手续费磨掉")
-    elif not atr_cost_ready:
-        summary_bits.append("真实波幅不够，走不出完整波段")
-    elif not liquidity_ready:
-        summary_bits.append("成交深度不够厚，先不拿自己给市场喂手续费")
-    elif net_edge_pct < DIP_SWING_MIN_NET_EDGE_PCT:
-        summary_bits.append("信号有了，但净优势不够覆盖交易成本")
+        summary_bits.append("空仓即开，保持 24 小时循环")
     else:
-        summary_bits.append("继续等下一次更完整、成本收益比更高的结构")
+        summary_bits.append("继续保持循环")
 
     return {
         "statusText": "已联网分析",
         "decision": decision,
         "decisionLabel": decision_label,
         "summary": " · ".join(summary_bits),
-        "selectedStrategyName": f"{symbol} 波段",
+        "selectedStrategyName": f"{symbol} {ONLY_STRATEGY_LABEL}",
         "selectedStrategyDetail": (
-            "市场扫描 + 因子裁判 + 能力驱动放大"
-            f" · 自适应回撤 {format_decimal(pullback_threshold_pct, 2)}%"
-            f" · 15m 短反 {format_decimal(rebound_threshold_pct, 2)}% ({rebound_lookback_bars} 根)"
-            f" · 开平 maker-first / 风险退场 IOC · {selected_config.get('swapTdMode', 'isolated')} {selected_config.get('swapLeverage', '2')}x"
+            "市场扫描 + 方向轮动 + 能力驱动仓位"
+            f" · 空仓即开 {planned_side_label}"
+            f" · 净赚 {format_decimal(DIP_SWING_NET_TARGET_USDT, 0)}U+ 就平"
+            f" · 开仓 maker-first / 平仓 IOC · {selected_config.get('swapTdMode', 'isolated')} {selected_config.get('swapLeverage', '2')}x"
         ),
         "selectedReturnPct": "",
         "selectedDrawdownPct": "",
@@ -7579,9 +7624,9 @@ def build_dip_swing_analysis(
         "allowNewEntries": allow_new_entries,
         "optimizerRefreshed": False,
         "lastAnalyzedAt": now_local_iso(),
-        "marketRegime": "趋势波段",
+        "marketRegime": "24h 利润循环",
         "spotTrend": "",
-        "swapTrend": f"{selected_signal.get('trend', 'flat')} / {selected_signal.get('signal', 'hold')}",
+        "swapTrend": f"{selected_signal.get('trend', 'flat')} / {planned_side_label}",
         "volatilityPct": compact_metric(volatility_pct, "0.01"),
         "spreadPct": "",
         "basisPct": compact_metric(basis_pct, "0.01"),
@@ -7595,10 +7640,16 @@ def build_dip_swing_analysis(
         "selectedWatchlistSymbol": selected_symbol,
         "selectedFromMarketScan": selected_from_market,
         "watchlistCount": len(watchlist_symbols),
-        "candidateCount": len(candidate_snapshots),
+        "candidateCount": candidate_count,
         "marketScanCount": len(market_snapshots),
         "marketCandidateCount": market_candidate_count,
         "marketTopCandidates": top_candidates,
+        "plannedSide": planned_side,
+        "plannedSideLabel": planned_side_label,
+        "predictedMovePct": compact_metric(predicted_move_pct, "0.01"),
+        "predictedNetPct": compact_metric(predicted_net_pct, "0.01"),
+        "profitTargetUsdt": format_decimal(DIP_SWING_NET_TARGET_USDT, 0),
+        "loopQualityScore": compact_metric(loop_quality_score, "0.1"),
         "pullbackPct": compact_metric(pullback_pct, "0.1"),
         "reboundPct": compact_metric(rebound_pct, "0.1"),
         "pullbackThresholdPct": compact_metric(pullback_threshold_pct, "0.1"),
@@ -7629,26 +7680,27 @@ def build_dip_swing_analysis(
         "executionAbilityNetPnl": compact_metric(ability_snapshot.get("netPnl"), "0.01"),
         "executionAbilityCloseOrders": int(ability_snapshot.get("closeOrders") or 0),
         "executionAbilityWinRatePct": compact_metric(ability_snapshot.get("closeWinRatePct"), "0.1"),
+        "estimatedNetClosePnl": compact_metric(net_close_pnl, "0.01"),
         "research": {
             "running": False,
-            "statusText": "波段模式",
-            "mode": "dip_swing",
+            "statusText": f"{ONLY_STRATEGY_LABEL}模式",
+            "mode": "profit_loop",
             "lastRunAt": now_local_iso(),
             "historyLimit": len(selected_snapshot.get("candles") or []),
             "sampleCount": len(selected_snapshot.get("candles") or []),
             "summary": {
-                "pullbackPct": compact_metric(pullback_pct, "0.1"),
-                "reboundPct": compact_metric(rebound_pct, "0.1"),
+                "plannedSide": planned_side_label,
+                "predictedMovePct": compact_metric(predicted_move_pct, "0.01"),
+                "predictedNetPct": compact_metric(predicted_net_pct, "0.01"),
                 "fundingRatePct": compact_metric(funding_rate_pct, "0.001"),
-                "netEdgePct": compact_metric(net_edge_pct, "0.01"),
             },
             "bestConfig": deep_merge({}, selected_config),
             "leaderboard": [],
             "generationSummaries": [],
             "pipeline": {
-                "mode": "dip_swing",
+                "mode": "profit_loop",
                 "status": decision,
-                "candidateCount": len(candidate_snapshots),
+                "candidateCount": candidate_count,
                 "marketCandidateCount": market_candidate_count,
             },
             "markets": {},
@@ -10510,6 +10562,8 @@ class AutomationEngine:
             max(int(automation["slowEma"]) + 30, 80),
         )
         signal = build_pullback_signal(candles, int(automation["fastEma"]), int(automation["slowEma"]))
+        desired_side = profit_loop_trade_side(signal, candles)
+        desired_side_label = profit_loop_trade_side_label(desired_side)
         volatility_pct = safe_decimal(signal.get("volatilityPct"), decimal_to_str(recent_range_pct(candles)))
         avg_quote_volume_usd = average_quote_volume_usd(candles)
         positions = client.get_positions(inst_id).get("data", [])
@@ -10527,7 +10581,6 @@ class AutomationEngine:
         maker_fee_pct = safe_decimal(fee_rates.get("makerFeePct"), decimal_to_str(OKX_DEFAULT_SWAP_MAKER_FEE_PCT))
         taker_fee_pct = safe_decimal(fee_rates.get("takerFeePct"), decimal_to_str(OKX_DEFAULT_SWAP_TAKER_FEE_PCT))
         entry_score = int(signal.get("entryScore") or 0)
-        exit_score = int(signal.get("exitScore") or 0)
         cost_snapshot = estimate_dip_swing_cost_snapshot(
             volatility_pct,
             funding_rate_pct=max(Decimal("0"), safe_decimal(extract_first_row(client.get_funding_rate(inst_id)).get("fundingRate"), "0") * Decimal("100")),
@@ -10536,9 +10589,6 @@ class AutomationEngine:
         )
         estimated_cost_pct = safe_decimal(cost_snapshot.get("estimatedCostPct"), decimal_to_str(DIP_SWING_EST_ROUNDTRIP_COST_PCT))
         atr_pct = safe_decimal(signal.get("atrPct"), decimal_to_str(average_true_range_pct(candles)))
-        pullback_threshold_pct = safe_decimal(signal.get("pullbackThresholdPct"), decimal_to_str(DIP_SWING_MIN_PULLBACK_PCT))
-        rebound_threshold_pct = safe_decimal(signal.get("reboundThresholdPct"), decimal_to_str(DIP_SWING_MIN_REBOUND_PCT))
-        rebound_lookback_bars = int(signal.get("reboundLookbackBars") or dip_swing_rebound_lookback_bars(int(automation["fastEma"])))
         setup_edge_pct = (
             max(safe_decimal(signal.get("emaSpreadPct"), "0"), Decimal("0"))
             + max(safe_decimal(signal.get("fastSlopePct"), "0"), Decimal("0"))
@@ -10580,7 +10630,9 @@ class AutomationEngine:
         elif pos_value < 0:
             position_side = "short"
         pending_entry_orders = self._working_swap_orders(inst_id, side="buy", reduce_only=False)
+        pending_entry_orders += self._working_swap_orders(inst_id, side="sell", reduce_only=False)
         pending_exit_orders = self._working_swap_orders(inst_id, side="sell", reduce_only=True)
+        pending_exit_orders += self._working_swap_orders(inst_id, side="buy", reduce_only=True)
         stale_exit_orders = [
             order for order in pending_exit_orders
             if self._order_age_seconds(order) >= DIP_SWING_EXIT_ORDER_MAX_AGE_SECONDS
@@ -10590,14 +10642,27 @@ class AutomationEngine:
         floating_pnl_pct = Decimal("0")
         if entry_price > 0 and last_price > 0 and position_side == "long":
             floating_pnl_pct = ((last_price - entry_price) / entry_price) * Decimal("100")
+        elif entry_price > 0 and last_price > 0 and position_side == "short":
+            floating_pnl_pct = ((entry_price - last_price) / entry_price) * Decimal("100")
+        net_close_snapshot = estimate_profit_loop_position_net_pnl(
+            position_side=position_side,
+            position_size=abs_pos,
+            entry_price=entry_price,
+            last_price=last_price,
+            contract_value=contract_value,
+            floating_pnl=floating_pnl,
+            maker_fee_pct=maker_fee_pct,
+            taker_fee_pct=taker_fee_pct,
+        )
+        net_close_pnl = safe_decimal(net_close_snapshot.get("netClosePnl"), "0")
+        profit_target_reached = net_close_pnl >= DIP_SWING_NET_TARGET_USDT
 
         status_text = (
-            f"回撤 {compact_metric(signal.get('pullbackPct'), '0.1')}% / 阈值 {compact_metric(pullback_threshold_pct, '0.1')}% / "
-            f"15m 短反 {compact_metric(signal.get('reboundPct'), '0.1')}% / 阈值 {compact_metric(rebound_threshold_pct, '0.1')}% ({rebound_lookback_bars} 根) / "
-            f"入场评分 {entry_score}/8 / "
-            f"净优势 {compact_metric(net_edge_pct, '0.01')}% / "
-            f"优势/成本 {compact_metric(edge_cost_ratio, '0.01')}x / "
-            f"ATR/成本 {compact_metric(atr_cost_ratio, '0.01')}x / "
+            f"方向 {desired_side_label} / "
+            f"净利目标 {format_decimal(DIP_SWING_NET_TARGET_USDT, 0)}U / "
+            f"当前净结果 {format_decimal(net_close_pnl, 2)}U / "
+            f"预期净优势 {compact_metric(net_edge_pct, '0.01')}% / "
+            f"ATR {compact_metric(atr_pct, '0.01')}% / "
             f"maker {compact_metric(maker_fee_pct, '0.001')}% / taker {compact_metric(taker_fee_pct, '0.001')}% / "
             f"成交额 {format_decimal(avg_quote_volume_usd, 0)}U / "
             f"开平差 {symbol_pressure['openCloseGap']} / 连开 {symbol_pressure['consecutiveOpenStreak']}"
@@ -10623,12 +10688,12 @@ class AutomationEngine:
             {
                 "enabled": True,
                 "instId": inst_id,
-                "signal": signal["signal"],
-                "trend": signal["trend"],
+                "signal": f"profit_loop_{desired_side}",
+                "trend": "profit_loop",
                 "lastPrice": signal["lastClose"],
                 "positionSide": position_side,
                 "positionSize": decimal_to_str(abs_pos),
-                "positionNotional": decimal_to_str(abs_pos * last_price),
+                "positionNotional": decimal_to_str(abs_pos * last_price * contract_value),
                 "entryPrice": decimal_to_str(entry_price) if entry_price > 0 else "",
                 "floatingPnl": decimal_to_str(floating_pnl),
                 "floatingPnlPct": decimal_to_str(floating_pnl_pct),
@@ -10639,36 +10704,23 @@ class AutomationEngine:
                 "riskLabel": build_market_risk_label(automation, "swap"),
                 "liquidationPrice": decimal_to_str(liq_price) if liq_price > 0 else "",
                 "liquidationBufferPct": decimal_to_str(liq_buffer) if liq_buffer > 0 else "",
-                "lastMessage": f"波段监控 · {status_text}",
+                "lastMessage": f"{ONLY_STRATEGY_LABEL}监控 · {status_text}",
             },
         )
 
-        if position_side == "short":
-            close_size = round_down(abs_pos, lot_size)
-            if close_size > 0:
-                self._place_swap_order(
-                    client,
-                    inst_id,
-                    "buy",
-                    close_size,
-                    automation["swapTdMode"],
-                    "切换波段策略，先平空单",
-                    reduce_only=True,
-                    market_key=market_key,
-                )
-            return
-
-        stop_loss = safe_decimal(automation.get("stopLossPct"), "0")
-        take_profit = safe_decimal(automation.get("takeProfitPct"), "0")
-        if position_side == "long" and entry_price > 0:
+        if position_side in {"long", "short"}:
+            if pending_entry_orders:
+                self._cancel_swap_orders(client, inst_id, pending_entry_orders, "已有持仓，撤掉未成交开仓单", market_key=market_key)
+                pending_entry_orders = []
             if liq_buffer > 0 and liq_buffer <= DIP_SWING_MIN_LIQ_BUFFER_PCT:
                 if pending_exit_orders:
                     self._cancel_swap_orders(client, inst_id, pending_exit_orders, "强平缓冲不足，撤掉旧平仓单后紧急退出", market_key=market_key)
                     pending_exit_orders = []
+                close_side = "sell" if position_side == "long" else "buy"
                 self._place_swap_order(
                     client,
                     inst_id,
-                    "sell",
+                    close_side,
                     round_down(abs_pos, lot_size),
                     automation["swapTdMode"],
                     "强平缓冲不足，主动退场",
@@ -10677,96 +10729,40 @@ class AutomationEngine:
                     market_key=market_key,
                 )
                 return
-            if stop_loss > 0 and last_price <= entry_price * (Decimal("1") - stop_loss / Decimal("100")):
+            if profit_target_reached:
                 if pending_exit_orders:
-                    self._cancel_swap_orders(client, inst_id, pending_exit_orders, "止损触发，撤掉旧平仓单后保护退出", market_key=market_key)
-                    pending_exit_orders = []
+                    if stale_exit_orders:
+                        self._cancel_swap_orders(client, inst_id, stale_exit_orders, "净利平仓挂单超时，重新发起保护退出", market_key=market_key)
+                        pending_exit_orders = [order for order in pending_exit_orders if order not in stale_exit_orders]
+                    if pending_exit_orders:
+                        self._set_market(
+                            market_key,
+                            {
+                                "lastMessage": (
+                                    f"{ONLY_STRATEGY_LABEL}已达到净利目标，已有 {len(pending_exit_orders)} 笔平仓单在执行 · {status_text}"
+                                )
+                            },
+                        )
+                        return
+                close_side = "sell" if position_side == "long" else "buy"
                 self._place_swap_order(
                     client,
                     inst_id,
-                    "sell",
+                    close_side,
                     round_down(abs_pos, lot_size),
                     automation["swapTdMode"],
-                    "波段多单止损",
+                    f"{ONLY_STRATEGY_LABEL}净赚 {format_decimal(DIP_SWING_NET_TARGET_USDT, 0)}U+ 平仓",
                     reduce_only=True,
                     protected_exit=True,
                     market_key=market_key,
                 )
                 return
-            if take_profit > 0 and last_price >= entry_price * (Decimal("1") + take_profit / Decimal("100")):
-                if pending_exit_orders:
-                    if stale_exit_orders:
-                        self._cancel_swap_orders(client, inst_id, stale_exit_orders, "止盈挂单超时，重新挂被动平仓", market_key=market_key)
-                        pending_exit_orders = [order for order in pending_exit_orders if order not in stale_exit_orders]
-                    if pending_exit_orders:
-                        self._set_market(market_key, {"lastMessage": f"止盈触发，已有 {len(pending_exit_orders)} 笔被动平仓单在执行"})
-                        return
-                self._place_swap_order(
-                    client,
-                    inst_id,
-                    "sell",
-                    round_down(abs_pos, lot_size),
-                    automation["swapTdMode"],
-                    "波段多单止盈",
-                    reduce_only=True,
-                    passive_exit=True,
-                    market_key=market_key,
-                )
-                return
-            cooldown_ready, reason = self._cooldown_ready(market_key, int(automation["cooldownSeconds"]))
-            if bool(signal.get("weakTrendReady")):
-                should_exit_for_profit = floating_pnl_pct >= fee_exit_floor_pct
-                should_exit_for_break = severe_trend_break and floating_pnl_pct <= (Decimal("0") - DIP_SWING_HARD_BREAK_LOSS_PCT)
-                if cooldown_ready and (should_exit_for_profit or should_exit_for_break):
-                    if pending_exit_orders:
-                        if should_exit_for_break:
-                            self._cancel_swap_orders(client, inst_id, pending_exit_orders, "趋势严重破坏，撤掉旧平仓单后保护退出", market_key=market_key)
-                            pending_exit_orders = []
-                        elif stale_exit_orders:
-                            self._cancel_swap_orders(client, inst_id, stale_exit_orders, "趋势破坏平仓挂单超时，重新挂被动平仓", market_key=market_key)
-                            pending_exit_orders = [order for order in pending_exit_orders if order not in stale_exit_orders]
-                        if pending_exit_orders:
-                            self._set_market(market_key, {"lastMessage": f"趋势破坏，已有 {len(pending_exit_orders)} 笔退场单在执行"})
-                            return
-                    self._place_swap_order(
-                        client,
-                        inst_id,
-                        "sell",
-                        round_down(abs_pos, lot_size),
-                        automation["swapTdMode"],
-                        (
-                            "复合趋势破坏且已跑出手续费区，主动平多"
-                            if should_exit_for_profit
-                            else "复合趋势严重破坏，主动止损离场"
-                        ),
-                        reduce_only=True,
-                        passive_exit=should_exit_for_profit and not should_exit_for_break,
-                        protected_exit=should_exit_for_break,
-                        market_key=market_key,
-                    )
-                else:
-                    if not cooldown_ready:
-                        self._set_market(market_key, {"lastMessage": f"复合趋势破坏，但{reason}"})
-                    else:
-                        self._set_market(
-                            market_key,
-                            {
-                                "lastMessage": (
-                                    f"趋势转弱，但当前盈亏 {compact_metric(floating_pnl_pct, '0.01')}% 还没跑出手续费区"
-                                    f" {format_decimal(fee_exit_floor_pct, 2)}%，继续观察结构"
-                                )
-                            },
-                        )
-                return
             if pending_exit_orders:
-                self._cancel_swap_orders(client, inst_id, pending_exit_orders, "结构恢复，撤掉旧平仓挂单", market_key=market_key)
+                self._cancel_swap_orders(client, inst_id, pending_exit_orders, "净利目标未到，撤掉旧平仓单继续持有", market_key=market_key)
             self._set_market(
                 market_key,
                 {
-                    "lastMessage": (
-                        f"波段持仓中 · {status_text} / 离场评分 {exit_score}/5"
-                        f" · 目标 {automation.get('takeProfitPct', '8')}%"
-                    )
+                    "lastMessage": f"{ONLY_STRATEGY_LABEL}持仓中 · {status_text}",
                 },
             )
             return
@@ -10775,18 +10771,25 @@ class AutomationEngine:
         if trade_contracts <= 0:
             self._set_market(market_key, {"lastMessage": "当前保证金预算不足以触发最小下单单位，继续观察"})
             return
-        entry_signal_ready = signal["signal"] in {"pullback_buy", "bull_cross_buy"}
+        entry_signal_ready = True
         if pending_entry_orders:
             stale_entry_orders = [
                 order for order in pending_entry_orders
                 if self._order_age_seconds(order) >= DIP_SWING_ENTRY_ORDER_MAX_AGE_SECONDS
             ]
-            if position_side != "flat" or not entry_signal_ready:
+            wrong_side_orders = [
+                order for order in pending_entry_orders
+                if str(order.get("side") or "").lower() != desired_side
+            ]
+            if position_side != "flat" or wrong_side_orders:
+                self._cancel_swap_orders(client, inst_id, pending_entry_orders, "方向变化，撤掉旧开仓单", market_key=market_key)
+                pending_entry_orders = []
+            elif not entry_signal_ready:
                 self._cancel_swap_orders(client, inst_id, pending_entry_orders, "买点失效，撤掉被动挂单", market_key=market_key)
                 pending_entry_orders = []
             elif stale_entry_orders:
                 self._cancel_swap_orders(client, inst_id, stale_entry_orders, "被动挂单超时，准备重挂", market_key=market_key)
-                pending_entry_orders = []
+                pending_entry_orders = [order for order in pending_entry_orders if order not in stale_entry_orders]
             else:
                 oldest_age = max(self._order_age_seconds(order) for order in pending_entry_orders)
                 self._set_market(
@@ -10799,85 +10802,20 @@ class AutomationEngine:
                     },
                 )
                 return
-        if not entry_signal_ready:
-            if signal["trend"] != "up":
-                self._set_market(market_key, {"lastMessage": f"趋势未转强 · {status_text}"})
-            elif not bool(signal.get("trendStrengthReady")):
-                self._set_market(market_key, {"lastMessage": f"趋势扩散和斜率还不够 · {status_text}"})
-            elif not bool(signal.get("pullbackContext")) and not bool(signal.get("bullCross")):
-                self._set_market(market_key, {"lastMessage": f"没有新的回踩结构 · {status_text}"})
-            elif not bool(signal.get("reboundReady")) and not bool(signal.get("bullCross")):
-                self._set_market(
-                    market_key,
-                    {
-                        "lastMessage": (
-                            f"回踩后 15m 短反不够，当前 {compact_metric(signal.get('reboundPct'), '0.1')}%"
-                            f" / 动态阈值 {compact_metric(rebound_threshold_pct, '0.1')}% ({rebound_lookback_bars} 根)"
-                            f" · {status_text}"
-                        )
-                    },
-                )
-            elif not bool(signal.get("notOverextended")):
-                self._set_market(
-                    market_key,
-                    {
-                        "lastMessage": (
-                            f"价格高于快线 {compact_metric(signal.get('priceVsFastPct'), '0.01')}%，主动放弃追价"
-                            f" · {status_text}"
-                        )
-                    },
-                )
-            else:
-                self._set_market(market_key, {"lastMessage": f"复合买点还没齐 · {status_text}"})
-            return
-        if not edge_cost_ready:
-            self._set_market(market_key, {"lastMessage": f"结构优势/成本比不够，放弃这笔单 · {status_text}"})
-            return
-        if not range_cost_ready:
-            self._set_market(market_key, {"lastMessage": f"波动区间太窄，宁可不做也不喂手续费 · {status_text}"})
-            return
-        if not atr_cost_ready:
-            self._set_market(market_key, {"lastMessage": f"真实波幅不够，走不出完整波段 · {status_text}"})
-            return
-        if not liquidity_ready:
-            self._set_market(market_key, {"lastMessage": f"近端成交额不够厚，跳过这笔单 · {status_text}"})
-            return
         if not allow_new_entries:
-            self._set_market(market_key, {"lastMessage": f"波段买点出现，但当前联网决策层为“{analysis_label}”，本轮不新开仓"})
+            self._set_market(market_key, {"lastMessage": f"{ONLY_STRATEGY_LABEL}准备开仓，但当前联网决策层为“{analysis_label}”，本轮不新开仓"})
             return
         cooldown_ready, reason = self._cooldown_ready(market_key, int(automation["cooldownSeconds"]))
         if not cooldown_ready:
-            self._set_market(market_key, {"lastMessage": f"波段买点出现，但{reason}"})
-            return
-        if int(symbol_pressure.get("consecutiveOpenStreak") or 0) >= DIP_SWING_MAX_CONSECUTIVE_OPEN_STREAK:
-            self._set_market(
-                market_key,
-                {
-                    "lastMessage": (
-                        f"近 {symbol_pressure['windowMinutes']} 分钟已经连续开仓 {symbol_pressure['consecutiveOpenStreak']} 笔"
-                        f"，先等平仓闭环，避免继续被手续费磨损 · {status_text}"
-                    )
-                },
-            )
-            return
-        if int(symbol_pressure.get("openCloseGap") or 0) >= DIP_SWING_MAX_OPEN_CLOSE_GAP:
-            self._set_market(
-                market_key,
-                {
-                    "lastMessage": (
-                        f"近 {symbol_pressure['windowMinutes']} 分钟开仓 {symbol_pressure['openOrders']} / 平仓 {symbol_pressure['closeOrders']}"
-                        f"，结构失衡，先停止继续加仓 · {status_text}"
-                    )
-                },
-            )
+            self._set_market(market_key, {"lastMessage": f"{ONLY_STRATEGY_LABEL}准备开仓，但{reason}"})
             return
         self._place_swap_order(
             client,
             inst_id,
-            "buy",
+            desired_side,
             trade_contracts,
             automation["swapTdMode"],
-            f"波段开多 · {target_plan.get('phaseLabel', target_execution_phase_label(target_plan.get('phase', 'fixed')))} · 动态仓位 {decimal_to_str(trade_contracts)} 张",
+            f"{ONLY_STRATEGY_LABEL}开仓 · {desired_side_label} · 动态仓位 {decimal_to_str(trade_contracts)} 张",
             passive_entry=True,
             market_key=market_key,
         )

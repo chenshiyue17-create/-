@@ -128,8 +128,18 @@
               <span class="pill" id="dock-equity-meta">等待样本</span>
             </div>
             <div class="dock-equity-hero">
-              <span class="dock-equity-label">当前收益</span>
-              <strong class="dock-equity-main" id="dock-pnl-main">--</strong>
+              <div class="dock-equity-metrics">
+                <div class="dock-equity-metric">
+                  <span class="dock-equity-label">当前收益</span>
+                  <strong class="dock-equity-main" id="dock-pnl-main">--</strong>
+                  <small class="dock-equity-caption" id="dock-pnl-caption">权益变化</small>
+                </div>
+                <div class="dock-equity-metric">
+                  <span class="dock-equity-label">净结果</span>
+                  <strong class="dock-equity-main" id="dock-net-main">--</strong>
+                  <small class="dock-equity-caption" id="dock-net-caption">已实现 + 手续费</small>
+                </div>
+              </div>
               <small class="dock-equity-sub" id="dock-pnl-sub">等待会话收益</small>
             </div>
             <div class="dock-curve-shell curve-scroll-shell" id="dock-curve-shell">
@@ -293,7 +303,7 @@
             </div>
             <div class="guard-card analysis-card">
               <div class="block-head">
-                <h3>波段决策层</h3>
+                <h3>利润循环决策层</h3>
                 <span class="pill" id="analysis-pill">待分析</span>
               </div>
               <div class="guard-list">
@@ -303,11 +313,11 @@
                 </div>
                 <div class="guard-item">
                   <b>当前模式</b>
-                  <span id="analysis-strategy">只保留波段策略，等待本轮开多判断</span>
+                  <span id="analysis-strategy">只保留利润循环策略，等待本轮方向判断</span>
                 </div>
                 <div class="guard-item">
-                  <b>波段状态</b>
-                  <span id="analysis-market">等待趋势、回撤、反弹和强平缓冲分析</span>
+                  <b>循环状态</b>
+                  <span id="analysis-market">等待方向、净优势和强平缓冲分析</span>
                 </div>
                 <div class="guard-item">
                   <b>行情上下文</b>
@@ -315,7 +325,7 @@
                 </div>
                 <div class="guard-item">
                   <b>原因解释</b>
-                  <span id="analysis-reason">这里只保留波段开多、观察和风控解释。</span>
+                  <span id="analysis-reason">这里只保留利润循环、观察和风控解释。</span>
                 </div>
               </div>
             </div>
@@ -464,11 +474,11 @@
             <div class="preset-copy">
               <span class="quick-label">策略模式</span>
               <input id="autoStrategyPreset" type="hidden" value="dip_swing" />
-              <strong id="active-strategy-label">波段</strong>
-              <p id="active-strategy-description">只保留波段策略。市场扫描 + 净优势过滤 + 目标驱动仓位，逐仓 10x 做趋势内波段，目标余额 100x。</p>
+              <strong id="active-strategy-label">利润循环</strong>
+              <p id="active-strategy-description">只保留利润循环策略。市场扫描 + 方向轮动 + 成本过滤，逐仓 10x 顺势双向，空仓即开，净赚 1U+ 就平，目标余额 100x。</p>
             </div>
             <div class="chip-group" id="strategy-preset-group">
-              <button class="chip active" type="button" data-strategy-preset="dip_swing">波段</button>
+              <button class="chip active" type="button" data-strategy-preset="dip_swing">利润循环</button>
             </div>
           </div>
           <div class="research-surface">
