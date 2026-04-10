@@ -3075,6 +3075,15 @@ function formatOrderTime(value) {
   });
 }
 
+function renderOrderTimeStackText(text) {
+  const raw = String(text || "").trim();
+  if (!raw || raw === "--") return "--";
+  const parts = raw.split(" ");
+  const date = parts[0] || "--";
+  const clock = parts.slice(1).join(" ") || "";
+  return `<span class="order-time-stack"><span>${escapeHtml(date)}</span>${clock ? `<span>${escapeHtml(clock)}</span>` : ""}</span>`;
+}
+
 function formatOrderValue(value) {
   if (value === undefined || value === null || value === "") return "--";
   const num = Number(value);
@@ -3095,6 +3104,70 @@ function toOrderNumber(value) {
 
 function isSwapOrder(order) {
   return String(order?.instType || "").toUpperCase() === "SWAP" || String(order?.instId || "").endsWith("-SWAP");
+}
+
+function getDefaultOrderContractValue(instId) {
+  const base = String(instId || "").trim().toUpperCase().split("-")[0] || "";
+  if (base === "BTC") return 0.01;
+  if (base === "ETH") return 0.1;
+  return 1;
+}
+
+function getOrderLeverageContext(order) {
+  if (!isSwapOrder(order)) {
+    return {
+      value: 1,
+      valueText: "现货",
+      scopeText: "现货不使用合约杠杆",
+    };
+  }
+  const leverage = toOrderNumber(order?.lever);
+  if (leverage > 0) {
+    return {
+      value: leverage,
+      valueText: `${formatOrderValue(leverage)}x`,
+      scopeText: "交易所返回的实际杠杆",
+    };
+  }
+  return {
+    value: 0,
+    valueText: "--",
+    scopeText: "当前订单没有返回杠杆字段",
+  };
+}
+
+function buildOrderMarginContext(order) {
+  const tdModeRaw = String(order?.tdMode || "").trim();
+  const tdModeLabel = tdModeRaw === "isolated" ? "逐仓" : tdModeRaw === "cross" ? "全仓" : (tdModeRaw || "--");
+  const price = toOrderNumber(order?.avgPx || order?.fillPx || order?.px);
+  const size = toOrderNumber(order?.accFillSz || order?.fillSz || order?.sz);
+  if (!isSwapOrder(order)) {
+    const notional = price > 0 && size > 0 ? price * size : 0;
+    return {
+      modeLabel: tdModeLabel,
+      marginText: "--",
+      marginScopeText: "现货订单不按保证金口径展示",
+      notionalText: notional > 0 ? formatMoney(notional) : "--",
+      notionalScopeText: "按成交均价估算成交额",
+      contractValueText: "--",
+      leverageText: "现货",
+    };
+  }
+
+  const leverage = toOrderNumber(order?.lever);
+  const contractValue = toOrderNumber(order?.contractValue) || getDefaultOrderContractValue(order?.instId);
+  const notional = price > 0 && size > 0 && contractValue > 0 ? price * size * contractValue : 0;
+  const margin = notional > 0 && leverage > 0 ? notional / leverage : 0;
+  const contractValueText = contractValue > 0 ? `${formatOrderValue(contractValue)} ${getOrderSymbol(order)}/张` : "--";
+  return {
+    modeLabel: tdModeLabel,
+    marginText: margin > 0 ? formatMoney(margin) : "--",
+    marginScopeText: margin > 0 ? "按成交均价、张数、合约面值、杠杆估算" : "当前字段不足，无法估算保证金",
+    notionalText: notional > 0 ? formatMoney(notional) : "--",
+    notionalScopeText: "按成交均价估算名义仓位",
+    contractValueText,
+    leverageText: leverage > 0 ? `${formatOrderValue(leverage)}x` : "--",
+  };
 }
 
 function getOrderCurrentPrice(order, account = dashboardState.account || {}) {
@@ -3352,6 +3425,42 @@ function buildOrderPnlContext(order, meta = {}) {
     currentPriceText: currentPrice > 0 ? formatOrderValue(currentPrice) : "--",
     detailText: "这笔订单还没有足够上下文去判断收益。",
     noteText: "如果你希望看到精确已实现收益，需要这笔单的平仓回报或完整成本口径。",
+  };
+}
+
+function buildOrderNetPnlContext(order, pnl) {
+  const fee = toOrderNumber(order?.fillFee ?? order?.fee);
+  const explicitPnlFields = ["realizedPnl", "fillPnl", "pnl"];
+  for (const key of explicitPnlFields) {
+    if (order?.[key] !== undefined && order?.[key] !== null && order?.[key] !== "") {
+      const realized = toOrderNumber(order[key]);
+      const net = realized + fee;
+      return {
+        title: "净结果",
+        valueText: `${net >= 0 ? "+" : ""}${formatMoney(net)}`,
+        toneClass: net > 0 ? "pnl-positive" : net < 0 ? "pnl-negative" : "pnl-muted",
+        scopeText: "已实现收益 + 手续费",
+        detailText: `收益 ${formatSignedMoney(realized)} USDT，手续费 ${formatSignedMoney(fee)} USDT，合并后 ${formatSignedMoney(net)} USDT。`,
+      };
+    }
+  }
+  if (pnl && (pnl.scopeText || "").includes("浮")) {
+    const estimated = toOrderNumber(String(pnl.valueText || "").replace(/[^\d.+-]/g, ""));
+    const net = estimated + fee;
+    return {
+      title: "净结果",
+      valueText: `${net >= 0 ? "+" : ""}${formatMoney(net)}`,
+      toneClass: net > 0 ? "pnl-positive" : net < 0 ? "pnl-negative" : "pnl-muted",
+      scopeText: "浮动收益 + 手续费估算",
+      detailText: `当前收益 ${formatSignedMoney(estimated)} USDT，手续费 ${formatSignedMoney(fee)} USDT。`,
+    };
+  }
+  return {
+    title: "净结果",
+    valueText: fee ? `${formatSignedMoney(fee)}` : "--",
+    toneClass: fee < 0 ? "pnl-negative" : "pnl-muted",
+    scopeText: fee ? "当前仅拿到手续费" : "等待完整收益口径",
+    detailText: fee ? `当前已知手续费 ${formatSignedMoney(fee)} USDT。` : "还没有足够字段来计算净结果。",
   };
 }
 
@@ -4340,6 +4449,8 @@ function renderOrderDetail(order, meta = {}) {
   const tone = getOrderTone(order.state);
   const createdAt = formatOrderTime(order.cTime);
   const updatedAt = formatOrderTime(order.uTime || order.fillTime || order.cTime);
+  const createdAtHtml = renderOrderTimeStackText(createdAt);
+  const updatedAtHtml = renderOrderTimeStackText(updatedAt);
   const targetPrice = order.ordType === "market" ? "市价" : formatOrderValue(order.px);
   const avgPrice = formatOrderValue(order.avgPx || order.fillPx);
   const requestSize = formatOrderValue(order.sz);
@@ -4348,8 +4459,10 @@ function renderOrderDetail(order, meta = {}) {
   const lifecycleRole = getOrderLifecycleRole(order);
   const eventTimeLabel = getOrderEventTimeLabel(order);
   const eventTimeText = getOrderEventTimeText(order);
+  const eventTimeHtml = renderOrderTimeStackText(eventTimeText);
   const relatedCloseOrder = findRelatedCloseOrder(order, dashboardState.recentOrdersAll || []);
   const relatedCloseTimeText = relatedCloseOrder ? getOrderEventTimeText(relatedCloseOrder) : "--";
+  const relatedCloseTimeHtml = renderOrderTimeStackText(relatedCloseTimeText);
   const relatedCloseRole = relatedCloseOrder ? getOrderLifecycleRole(relatedCloseOrder) : null;
   const relatedCloseSummary = relatedCloseOrder
     ? `${relatedCloseRole?.label || "平仓"} · ${relatedCloseOrder.ordId || relatedCloseOrder.clOrdId || "--"}`
@@ -4359,6 +4472,9 @@ function renderOrderDetail(order, meta = {}) {
         ? "最近订单里还没识别到对应平仓单"
         : "当前仍在持仓，或最近订单里还没出现离场单";
   const pnl = buildOrderPnlContext(order, meta);
+  const netPnl = buildOrderNetPnlContext(order, pnl);
+  const leverageContext = getOrderLeverageContext(order);
+  const marginContext = buildOrderMarginContext(order);
   const cancelReason = getOrderCancelReason(order);
   const cancelReasonShort = summarizeOrderCancelReason(cancelReason);
   const arbPhase = getOrderArbPhase(order);
@@ -4380,6 +4496,23 @@ function renderOrderDetail(order, meta = {}) {
       </div>
       <span class="order-state-pill ${tone}">${escapeHtml(getOrderStateLabel(order.state))}</span>
     </div>
+    <div class="order-detail-summary">
+      <div class="order-summary-primary">
+        <span>${escapeHtml(lifecycle.title)}</span>
+        <strong class="${escapeHtml(lifecycle.toneClass)}">${escapeHtml(lifecycle.valueText)}</strong>
+        <small>${escapeHtml(lifecycle.scopeText)}</small>
+      </div>
+      <div class="order-summary-primary">
+        <span>${escapeHtml(pnl.title)}</span>
+        <strong class="${escapeHtml(pnl.toneClass)}">${escapeHtml(pnl.valueText)}</strong>
+        <small>${escapeHtml(pnl.scopeText)}</small>
+      </div>
+      <div class="order-summary-primary">
+        <span>${escapeHtml(netPnl.title)}</span>
+        <strong class="${escapeHtml(netPnl.toneClass)}">${escapeHtml(netPnl.valueText)}</strong>
+        <small>${escapeHtml(netPnl.scopeText)}</small>
+      </div>
+    </div>
     <div class="order-detail-hero">
       <div class="order-hero-card">
         <span>委托价格</span>
@@ -4394,13 +4527,41 @@ function renderOrderDetail(order, meta = {}) {
         <strong>${escapeHtml(avgPrice)}</strong>
       </div>
       <div class="order-hero-card">
-        <span>${escapeHtml(lifecycle.title)}</span>
-        <strong class="${escapeHtml(lifecycle.toneClass)}">${escapeHtml(lifecycle.valueText)}</strong>
+        <span>杠杆倍率</span>
+        <strong>${escapeHtml(leverageContext.valueText)}</strong>
+      </div>
+      <div class="order-hero-card">
+        <span>保证金占用</span>
+        <strong>${escapeHtml(marginContext.marginText)}</strong>
+      </div>
+      <div class="order-hero-card">
+        <span>${escapeHtml(eventTimeLabel)}</span>
+        <strong class="order-time-metric">${eventTimeHtml}</strong>
+      </div>
+    </div>
+    <div class="order-detail-timeline">
+      <div class="order-timeline-card">
+        <span>创建</span>
+        <strong>${createdAtHtml}</strong>
+      </div>
+      <div class="order-timeline-card">
+        <span>${escapeHtml(eventTimeLabel)}</span>
+        <strong>${eventTimeHtml}</strong>
+      </div>
+      <div class="order-timeline-card">
+        <span>对应平仓</span>
+        <strong>${relatedCloseTimeHtml}</strong>
       </div>
     </div>
     <div class="order-detail-grid">
       <div><b>委托数量</b><span>${escapeHtml(requestSize)}</span></div>
-      <div><b>保证金 / 模式</b><span>${escapeHtml(order.tdMode || "--")}</span></div>
+      <div><b>杠杆倍率</b><span>${escapeHtml(leverageContext.valueText)}</span></div>
+      <div><b>保证金模式</b><span>${escapeHtml(marginContext.modeLabel)}</span></div>
+      <div><b>保证金占用</b><span>${escapeHtml(marginContext.marginText)}</span></div>
+      <div><b>保证金说明</b><span>${escapeHtml(marginContext.marginScopeText)}</span></div>
+      <div><b>名义仓位</b><span>${escapeHtml(marginContext.notionalText)}</span></div>
+      <div><b>仓位口径</b><span>${escapeHtml(marginContext.notionalScopeText)}</span></div>
+      <div><b>合约面值</b><span>${escapeHtml(marginContext.contractValueText)}</span></div>
       <div><b>订单角色</b><span>${escapeHtml(lifecycleRole.label)}</span></div>
       <div><b>当前状态</b><span>${escapeHtml(lifecycle.scopeText)}</span></div>
       <div><b>收益金额</b><span class="${escapeHtml(pnl.toneClass)}">${escapeHtml(pnl.valueText)}</span></div>
@@ -4408,10 +4569,7 @@ function renderOrderDetail(order, meta = {}) {
       <div><b>当前价格 / 标记价</b><span>${escapeHtml(pnl.currentPriceText)}</span></div>
       <div><b>订单号</b><span>${escapeHtml(order.ordId || "--")}</span></div>
       <div><b>Client ID</b><span>${escapeHtml(order.clOrdId || "--")}</span></div>
-      <div><b>创建时间</b><span>${escapeHtml(createdAt)}</span></div>
-      <div><b>最近更新时间</b><span>${escapeHtml(updatedAt)}</span></div>
-      <div><b>${escapeHtml(eventTimeLabel)}</b><span>${escapeHtml(eventTimeText)}</span></div>
-      <div><b>对应平仓时间</b><span>${escapeHtml(relatedCloseTimeText)}</span></div>
+      <div><b>最近更新时间</b><span>${updatedAtHtml}</span></div>
       <div><b>手续费</b><span>${escapeHtml(formatOrderValue(order.fee))}</span></div>
       <div><b>订单标签</b><span>${escapeHtml(order.tag || "--")}</span></div>
       <div><b>执行归因</b><span>${escapeHtml(strategyAttribution)}</span></div>
@@ -4421,6 +4579,7 @@ function renderOrderDetail(order, meta = {}) {
       <div><b>取消来源</b><span>${escapeHtml(order.cancelSource || "--")}</span></div>
       <div><b>仓位判断</b><span>${escapeHtml(lifecycle.detailText)}</span></div>
       <div><b>收益判断</b><span>${escapeHtml(pnl.detailText)}</span></div>
+      <div><b>净结果说明</b><span>${escapeHtml(netPnl.detailText)}</span></div>
       <div class="span-wide"><b>平仓关联</b><span>${escapeHtml(relatedCloseSummary)}</span></div>
       <div class="span-wide"><b>状态说明</b><span>${escapeHtml(lifecycle.noteText)}</span></div>
       <div class="span-wide"><b>收益说明</b><span>${escapeHtml(pnl.noteText)}</span></div>
