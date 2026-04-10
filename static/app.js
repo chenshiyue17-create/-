@@ -214,6 +214,7 @@ const dashboardState = {
   accountDetailsLoadedOnce: false,
   accountSummaryLoadedOnce: false,
   ordersLoadedOnce: false,
+  equityDisplayCache: null,
 };
 
 function formatSignedMoney(value) {
@@ -221,6 +222,20 @@ function formatSignedMoney(value) {
   if (!Number.isFinite(num)) return "--";
   const sign = num > 0 ? "+" : "";
   return `${sign}${formatMoney(num)}`;
+}
+
+function extractAbilityNetPnl(analysis = {}) {
+  const direct = Number(analysis.executionAbilityNetPnl ?? analysis.recentNetPnl ?? NaN);
+  if (Number.isFinite(direct)) return direct;
+  const textBits = [];
+  if (typeof analysis.summary === "string") textBits.push(analysis.summary);
+  if (Array.isArray(analysis.warnings)) textBits.push(...analysis.warnings);
+  if (Array.isArray(analysis.blockers)) textBits.push(...analysis.blockers);
+  const joined = textBits.join(" ");
+  const match = joined.match(/近场净收益\s*([+-]?\d+(?:\.\d+)?)U/i);
+  if (!match) return NaN;
+  const parsed = Number(match[1]);
+  return Number.isFinite(parsed) ? parsed : NaN;
 }
 
 function formatStrategyMode(mode) {
@@ -1715,6 +1730,44 @@ function sanitizeAutomationStateForSwingOnly(state = {}) {
   return sanitized;
 }
 
+function mergeAutomationRuntimeState(previous = {}, incoming = {}) {
+  const prev = previous && typeof previous === "object" ? previous : {};
+  const next = incoming && typeof incoming === "object" ? incoming : {};
+  if (!Object.keys(next).length) {
+    return { ...prev };
+  }
+  return {
+    ...prev,
+    ...next,
+    analysis: {
+      ...(prev.analysis || {}),
+      ...(next.analysis || {}),
+    },
+    research: {
+      ...(prev.research || {}),
+      ...(next.research || {}),
+    },
+    lastPipeline: {
+      ...(prev.lastPipeline || {}),
+      ...(next.lastPipeline || {}),
+    },
+    executionJournal: next.executionJournal || prev.executionJournal || null,
+    markets: {
+      ...(prev.markets || {}),
+      ...(next.markets || {}),
+    },
+    watchlist: Array.isArray(next.watchlist) && next.watchlist.length
+      ? next.watchlist
+      : (prev.watchlist || []),
+    equityCurve: Array.isArray(next.equityCurve) && next.equityCurve.length
+      ? next.equityCurve
+      : (prev.equityCurve || []),
+    logs: Array.isArray(next.logs) && next.logs.length
+      ? next.logs
+      : (prev.logs || []),
+  };
+}
+
 function renderAnalysisState(analysis) {
   const data = sanitizeAnalysisForSwingOnly(analysis || {});
   $("analysis-decision").textContent =
@@ -1887,6 +1940,9 @@ function renderDeskOverview() {
   const modeText = $("simulated").value === "true" ? "模拟盘" : "实盘";
   const modePresentation = deriveDeskModePresentation(automation, modeText);
   const dockPnlMain = $("dock-pnl-main");
+  const dockNetMain = $("dock-net-main");
+  const dockPnlCaption = $("dock-pnl-caption");
+  const dockNetCaption = $("dock-net-caption");
   const dockPnlSub = $("dock-pnl-sub");
   const minerDailyUsd = Number(minerProgress.dailyUsd || 0);
   const railBalanceMain = $("rail-balance-main");
@@ -1906,26 +1962,102 @@ function renderDeskOverview() {
   const balanceTargetProgressPct = stateTargetEq > 0
     ? stateTargetProgressPct
     : (balanceTargetEq > 0 ? (totalEq / balanceTargetEq) * 100 : 0);
+  const executionJournal = automation.executionJournal || dashboardState.orderJournal || {};
+  const analysis = automation.analysis || {};
+  const realizedNet = Number(executionJournal.realizedPnl ?? 0);
+  const feeNet = Number(executionJournal.totalFees ?? 0);
+  const netResult = Number(executionJournal.netPnl ?? (realizedNet + feeNet));
+  const netResultReady = Number.isFinite(netResult) && (
+    Math.abs(netResult) > 1e-9
+    || Math.abs(realizedNet) > 1e-9
+    || Math.abs(feeNet) > 1e-9
+    || Number(executionJournal.totalOrders || 0) > 0
+  );
+  const analysisNetResult = extractAbilityNetPnl(analysis);
+  const analysisNetReady = Number.isFinite(analysisNetResult)
+    && (
+      Math.abs(analysisNetResult) > 1e-9
+      || Number(analysis.executionAbilityCloseOrders || analysis.closeOrders || 0) > 0
+    );
+  const effectiveNetResult = netResultReady ? netResult : (analysisNetReady ? analysisNetResult : NaN);
+  const hasSessionPnl = startEq > 0 && Number.isFinite(pnlPct) && Number.isFinite(pnlAmount);
+  const cache = dashboardState.equityDisplayCache || {};
+  const displayPnlPct = hasSessionPnl
+    ? pnlPct
+    : (Number.isFinite(cache.pnlPct) ? cache.pnlPct : null);
+  const displayPnlAmount = hasSessionPnl
+    ? pnlAmount
+    : (Number.isFinite(cache.pnlAmount) ? cache.pnlAmount : null);
+  const displayTotalEq = totalEq > 0
+    ? totalEq
+    : (Number.isFinite(cache.totalEq) ? cache.totalEq : 0);
+  const displayNetResult = Number.isFinite(effectiveNetResult)
+    ? effectiveNetResult
+    : (Number.isFinite(cache.netResult) ? cache.netResult : null);
+  const displayRealizedNet = netResultReady
+    ? realizedNet
+    : (Number.isFinite(cache.realizedNet) ? cache.realizedNet : 0);
+  const displayFeeNet = netResultReady
+    ? feeNet
+    : (Number.isFinite(cache.feeNet) ? cache.feeNet : 0);
+  if (hasSessionPnl || Number.isFinite(effectiveNetResult) || totalEq > 0) {
+    dashboardState.equityDisplayCache = {
+      pnlPct: hasSessionPnl ? pnlPct : cache.pnlPct,
+      pnlAmount: hasSessionPnl ? pnlAmount : cache.pnlAmount,
+      totalEq: totalEq > 0 ? totalEq : cache.totalEq,
+      netResult: Number.isFinite(effectiveNetResult) ? effectiveNetResult : cache.netResult,
+      realizedNet: netResultReady ? realizedNet : cache.realizedNet,
+      feeNet: netResultReady ? feeNet : cache.feeNet,
+    };
+  }
 
-  $("desk-total-equity").textContent = totalEq > 0 ? `${formatMoney(totalEq)} USDT` : "--";
+  $("desk-total-equity").textContent = displayTotalEq > 0 ? `${formatMoney(displayTotalEq)} USDT` : "--";
   $("desk-total-equity-sub").textContent =
     balanceBreakdown || (summary.adjEq ? `调整后权益 ${formatMoney(summary.adjEq)} USDT` : "等待账户快照");
 
   $("desk-session-pnl").textContent =
-    startEq > 0 ? `${formatPercentValue(pnlPct)}` : "--";
+    Number.isFinite(displayPnlPct) ? `${formatPercentValue(displayPnlPct)}` : "--";
   $("desk-session-pnl").style.color =
-    pnlAmount > 0 ? "var(--success)" : pnlAmount < 0 ? "var(--danger)" : "var(--text)";
+    (displayPnlAmount || 0) > 0 ? "var(--success)" : (displayPnlAmount || 0) < 0 ? "var(--danger)" : "var(--text)";
   $("desk-session-pnl-sub").textContent =
-    startEq > 0 ? `约 ${pnlAmount >= 0 ? "+" : ""}${formatMoney(pnlAmount)} USDT` : "从本次自动化会话开始统计";
+    Number.isFinite(displayPnlAmount)
+      ? `约 ${displayPnlAmount >= 0 ? "+" : ""}${formatMoney(displayPnlAmount)} USDT`
+      : "从本次自动化会话开始统计";
   if (dockPnlMain) {
-    dockPnlMain.textContent = startEq > 0 ? formatPercentValue(pnlPct) : "--";
+    dockPnlMain.textContent = Number.isFinite(displayPnlPct) ? formatPercentValue(displayPnlPct) : "--";
     dockPnlMain.style.color =
-      pnlAmount > 0 ? "var(--success)" : pnlAmount < 0 ? "var(--danger)" : "var(--text)";
+      (displayPnlAmount || 0) > 0 ? "var(--success)" : (displayPnlAmount || 0) < 0 ? "var(--danger)" : "var(--text)";
+  }
+  if (dockPnlCaption) {
+    dockPnlCaption.textContent = Number.isFinite(displayPnlAmount)
+      ? `约 ${displayPnlAmount >= 0 ? "+" : ""}${formatMoney(displayPnlAmount)} USDT`
+      : "权益变化";
+  }
+  if (dockNetMain) {
+    dockNetMain.textContent = Number.isFinite(displayNetResult)
+      ? `${displayNetResult >= 0 ? "+" : ""}${formatMoney(displayNetResult)}`
+      : "--";
+    dockNetMain.style.color =
+      (displayNetResult || 0) > 0 ? "var(--success)" : (displayNetResult || 0) < 0 ? "var(--danger)" : "var(--text)";
+  }
+  if (dockNetCaption) {
+    dockNetCaption.textContent = netResultReady
+      ? `已实现 ${formatSignedMoney(displayRealizedNet)} · 手续费 ${formatSignedMoney(displayFeeNet)}`
+      : (analysisNetReady
+        ? `近场净收益 ${formatSignedMoney(analysisNetResult)} · 分析层估算`
+        : "已实现 + 手续费")
+      ;
+  }
+  if (dockNetCaption && !Number.isFinite(displayNetResult)) {
+    dockNetCaption.textContent = "已实现 + 手续费";
   }
   if (dockPnlSub) {
-    dockPnlSub.textContent = startEq > 0
-      ? `约 ${pnlAmount >= 0 ? "+" : ""}${formatMoney(pnlAmount)} USDT · 总权益 ${formatMoney(totalEq)} USDT`
-      : (balanceBreakdown || (totalEq > 0 ? `总权益 ${formatMoney(totalEq)} USDT` : "等待会话收益"));
+    dockPnlSub.textContent = Number.isFinite(displayPnlPct)
+      ? `${Number.isFinite(displayNetResult) ? `净结果 ${displayNetResult >= 0 ? "+" : ""}${formatMoney(displayNetResult)} USDT · ` : ""}总权益 ${formatMoney(displayTotalEq)} USDT`
+      : (balanceBreakdown || (displayTotalEq > 0 ? `总权益 ${formatMoney(displayTotalEq)} USDT` : "等待会话收益"));
+    if (!Number.isFinite(displayPnlPct) && analysisNetReady && displayTotalEq > 0) {
+      dockPnlSub.textContent = `净结果 ${analysisNetResult >= 0 ? "+" : ""}${formatMoney(analysisNetResult)} USDT · 总权益 ${formatMoney(displayTotalEq)} USDT`;
+    }
   }
 
   $("desk-drawdown-main").textContent = formatPercentValue(drawdown);
@@ -5270,23 +5402,24 @@ async function loadMinerConfig() {
 }
 
 function renderAutomationState(state) {
-  dashboardState.automation = sanitizeAutomationStateForSwingOnly(state || {});
-  if (state?.executionJournal) {
-    dashboardState.orderJournal = state.executionJournal;
-    dashboardState.orderJournalSymbols = Array.isArray(state.executionJournal.symbols) ? state.executionJournal.symbols : [];
+  const mergedState = mergeAutomationRuntimeState(dashboardState.automation || {}, state || {});
+  dashboardState.automation = sanitizeAutomationStateForSwingOnly(mergedState);
+  if (mergedState?.executionJournal) {
+    dashboardState.orderJournal = mergedState.executionJournal;
+    dashboardState.orderJournalSymbols = Array.isArray(mergedState.executionJournal.symbols) ? mergedState.executionJournal.symbols : [];
   }
-  renderResearchState(state?.research || {});
-  renderAnalysisState(state?.analysis || {});
-  const running = Boolean(state?.running);
+  renderResearchState(mergedState?.research || {});
+  renderAnalysisState(mergedState?.analysis || {});
+  const running = Boolean(mergedState?.running);
   $("bot-dot").style.background = running ? "var(--success)" : "#59636f";
-  $("bot-status").textContent = state?.statusText || "未启动";
-  $("bot-mode").textContent = state?.modeText || "等待配置";
-  $("bot-last-cycle").textContent = state?.lastCycleAt || "-";
-  $("bot-order-count").textContent = state?.orderCountToday ?? 0;
-  $("bot-drawdown").textContent = `${state?.dailyDrawdownPct || "0"}%`;
-  renderBotMarket("bot-spot-state", state?.markets?.spot, state?.watchlist || [], "spot");
-  renderBotMarket("bot-swap-state", state?.markets?.swap, state?.watchlist || [], "swap");
-  renderLogs(state?.logs || []);
+  $("bot-status").textContent = mergedState?.statusText || "未启动";
+  $("bot-mode").textContent = mergedState?.modeText || "等待配置";
+  $("bot-last-cycle").textContent = mergedState?.lastCycleAt || "-";
+  $("bot-order-count").textContent = mergedState?.orderCountToday ?? 0;
+  $("bot-drawdown").textContent = `${mergedState?.dailyDrawdownPct || "0"}%`;
+  renderBotMarket("bot-spot-state", mergedState?.markets?.spot, mergedState?.watchlist || [], "spot");
+  renderBotMarket("bot-swap-state", mergedState?.markets?.swap, mergedState?.watchlist || [], "swap");
+  renderLogs(mergedState?.logs || []);
   renderDeskOverview();
   renderRailStrategyControls();
   renderStrategyPortfolio();

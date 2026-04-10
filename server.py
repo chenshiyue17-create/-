@@ -111,7 +111,8 @@ REMOTE_AUTOMATION_CONFIG_LOCK = threading.RLock()
 REMOTE_AUTOMATION_CONFIG_CACHE: dict[str, Any] = {"ts": 0.0, "url": "", "config": {}}
 ONLY_STRATEGY_PRESET = "dip_swing"
 DIP_SWING_PULLBACK_PCT = Decimal("0.6")
-DIP_SWING_REBOUND_PCT = Decimal("0.10")
+DIP_SWING_REBOUND_PCT = Decimal("0.60")
+DIP_SWING_REBOUND_LOOKBACK_BARS = 8
 DIP_SWING_MIN_EMA_SPREAD_PCT = Decimal("0.03")
 DIP_SWING_MIN_FAST_SLOPE_PCT = Decimal("0.02")
 DIP_SWING_MAX_CHASE_PCT = Decimal("0.18")
@@ -1728,7 +1729,7 @@ def build_market_risk_label(target: dict[str, Any], market_kind: str) -> str:
         )
     if str(target.get("strategyPreset") or "") == "dip_swing":
         return (
-            f"回撤 ≥ {format_decimal(DIP_SWING_PULLBACK_PCT, 1)}% · 反弹 ≥ {format_decimal(DIP_SWING_REBOUND_PCT, 2)}% · "
+            f"回撤 ≥ {format_decimal(DIP_SWING_PULLBACK_PCT, 1)}% · 15m 短反 ≥ {format_decimal(DIP_SWING_REBOUND_PCT, 2)}% ({DIP_SWING_REBOUND_LOOKBACK_BARS} 根) · "
             f"TP {format_decimal(safe_decimal(target.get('takeProfitPct'), '8'), 1)}% · "
             f"缓冲 ≥ {format_decimal(DIP_SWING_MIN_LIQ_BUFFER_PCT, 0)}% · "
             f"动态仓位 · {format_decimal(safe_decimal(target.get('swapLeverage'), '10'), 0)}x 逐仓"
@@ -4406,7 +4407,7 @@ def strategy_detail_line(config: dict[str, Any], origin_label: str = "") -> str:
             f"只做多 · {config.get('swapTdMode', 'isolated')} {config.get('swapLeverage', '2')}x",
             f"目标止盈 {config.get('takeProfitPct', '8')}%",
             f"止损 {config.get('stopLossPct', '2.5')}%",
-            f"回撤阈值 {format_decimal(DIP_SWING_PULLBACK_PCT, 1)}% · 反弹 {format_decimal(DIP_SWING_REBOUND_PCT, 2)}%",
+            f"回撤阈值 {format_decimal(DIP_SWING_PULLBACK_PCT, 1)}% · 15m 短反 {format_decimal(DIP_SWING_REBOUND_PCT, 2)}% ({DIP_SWING_REBOUND_LOOKBACK_BARS} 根)",
             f"优势/成本 ≥ {format_decimal(DIP_SWING_MIN_EDGE_COST_RATIO, 1)}x · 波动/成本 ≥ {format_decimal(DIP_SWING_MIN_RANGE_COST_RATIO, 1)}x · ATR/成本 ≥ {format_decimal(DIP_SWING_MIN_ATR_COST_RATIO, 1)}x",
             f"强平缓冲 ≥ {format_decimal(DIP_SWING_MIN_LIQ_BUFFER_PCT, 0)}%",
         ]
@@ -4525,11 +4526,12 @@ def build_pullback_signal(
     prev_close = closes[-2]
     sample = candles[-max(slow, 12):]
     recent_high = max((row["high"] for row in sample), default=last_close)
-    recent_low = min((row["low"] for row in sample), default=last_close)
     pullback_window = candles[-min(len(candles), max(fast * 2, 6)) :]
     pullback_low = min((row["low"] for row in pullback_window), default=last_close)
+    rebound_window = candles[-min(len(candles), max(6, min(fast, DIP_SWING_REBOUND_LOOKBACK_BARS))) :]
+    rebound_low = min((row["low"] for row in rebound_window), default=last_close)
     pullback_pct = pct_gap(recent_high, last_close)
-    rebound_pct = pct_gap(last_close, recent_low)
+    rebound_pct = pct_gap(last_close, rebound_low)
     ema_spread_pct = pct_gap(curr_fast, curr_slow)
     fast_slope_pct = pct_gap(curr_fast, prev_fast)
     slow_slope_pct = pct_gap(curr_slow, prev_slow)
