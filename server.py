@@ -117,8 +117,13 @@ DIP_SWING_MIN_FAST_SLOPE_PCT = Decimal("0.02")
 DIP_SWING_MAX_CHASE_PCT = Decimal("0.18")
 DIP_SWING_MIN_ENTRY_SCORE = 5
 DIP_SWING_MIN_EXIT_SCORE = 4
+DIP_SWING_HARD_EXIT_SCORE = 5
 DIP_SWING_EST_ROUNDTRIP_COST_PCT = Decimal("0.16")
 DIP_SWING_MIN_NET_EDGE_PCT = Decimal("0.08")
+DIP_SWING_MIN_EDGE_COST_RATIO = Decimal("1.9")
+DIP_SWING_MIN_RANGE_COST_RATIO = Decimal("3.0")
+DIP_SWING_MIN_PROTECTIVE_EXIT_PCT = Decimal("0.28")
+DIP_SWING_HARD_BREAK_LOSS_PCT = Decimal("0.45")
 DIP_SWING_TARGET_MIN_MARGIN_RATIO = Decimal("0.003")
 DIP_SWING_TARGET_MAX_MARGIN_RATIO = Decimal("0.012")
 DIP_SWING_MIN_LIQ_BUFFER_PCT = Decimal("18")
@@ -4268,11 +4273,12 @@ def strategy_detail_line(config: dict[str, Any], origin_label: str = "") -> str:
         target_multiple = resolve_target_balance_multiple(config)
         parts = [
             "市场扫描 + 净优势过滤 + 能力驱动放大",
-            "趋势扩散 + 回踩反弹 + 不追价",
+            "趋势扩散 + 回踩反弹 + 不追价 + 手续费区不乱平",
             f"只做多 · {config.get('swapTdMode', 'isolated')} {config.get('swapLeverage', '2')}x",
             f"目标止盈 {config.get('takeProfitPct', '8')}%",
             f"止损 {config.get('stopLossPct', '2.5')}%",
             f"回撤阈值 {format_decimal(DIP_SWING_PULLBACK_PCT, 1)}% · 反弹 {format_decimal(DIP_SWING_REBOUND_PCT, 2)}%",
+            f"优势/成本 ≥ {format_decimal(DIP_SWING_MIN_EDGE_COST_RATIO, 1)}x · 波动/成本 ≥ {format_decimal(DIP_SWING_MIN_RANGE_COST_RATIO, 1)}x",
             f"强平缓冲 ≥ {format_decimal(DIP_SWING_MIN_LIQ_BUFFER_PCT, 0)}%",
         ]
         if target_multiple > Decimal("1"):
@@ -6061,6 +6067,10 @@ def evaluate_dip_swing_target_snapshot(
     estimated_cost_pct = DIP_SWING_EST_ROUNDTRIP_COST_PCT + min(Decimal("0.12"), volatility_pct * Decimal("0.04"))
     setup_edge_pct = max(ema_spread_pct, Decimal("0")) + max(fast_slope_pct, Decimal("0")) + max(rebound_pct, Decimal("0"))
     net_edge_pct = setup_edge_pct - estimated_cost_pct
+    edge_cost_ratio = (setup_edge_pct / estimated_cost_pct) if estimated_cost_pct > 0 else Decimal("0")
+    range_cost_ratio = (volatility_pct / estimated_cost_pct) if estimated_cost_pct > 0 else Decimal("0")
+    edge_cost_ready = edge_cost_ratio >= DIP_SWING_MIN_EDGE_COST_RATIO
+    range_cost_ready = range_cost_ratio >= DIP_SWING_MIN_RANGE_COST_RATIO
     open_position = next((row for row in positions if safe_decimal(row.get("pos"), "0") != 0), {})
     pos_value = safe_decimal(open_position.get("pos"), "0")
     position_side = "flat"
@@ -6085,6 +6095,8 @@ def evaluate_dip_swing_target_snapshot(
         )
         and entry_score >= DIP_SWING_MIN_ENTRY_SCORE
         and net_edge_pct >= DIP_SWING_MIN_NET_EDGE_PCT
+        and edge_cost_ready
+        and range_cost_ready
         and position_side == "flat"
     )
     return {
@@ -6109,6 +6121,10 @@ def evaluate_dip_swing_target_snapshot(
         "estimatedCostPct": estimated_cost_pct,
         "setupEdgePct": setup_edge_pct,
         "netEdgePct": net_edge_pct,
+        "edgeCostRatio": edge_cost_ratio,
+        "rangeCostRatio": range_cost_ratio,
+        "edgeCostReady": edge_cost_ready,
+        "rangeCostReady": range_cost_ready,
         "positionSide": position_side,
         "liqPrice": liq_price,
         "liqBufferPct": liq_buffer,
@@ -6820,6 +6836,10 @@ def build_dip_swing_analysis(
     estimated_cost_pct = safe_decimal(selected_snapshot.get("estimatedCostPct"), "0")
     net_edge_pct = safe_decimal(selected_snapshot.get("netEdgePct"), "0")
     setup_edge_pct = safe_decimal(selected_snapshot.get("setupEdgePct"), "0")
+    edge_cost_ratio = safe_decimal(selected_snapshot.get("edgeCostRatio"), "0")
+    range_cost_ratio = safe_decimal(selected_snapshot.get("rangeCostRatio"), "0")
+    edge_cost_ready = bool(selected_snapshot.get("edgeCostReady"))
+    range_cost_ready = bool(selected_snapshot.get("rangeCostReady"))
     position_side = str(selected_snapshot.get("positionSide") or "flat")
     liq_price = safe_decimal(selected_snapshot.get("liqPrice"), "0")
     liq_buffer = safe_decimal(selected_snapshot.get("liqBufferPct"), "0")
@@ -6882,6 +6902,10 @@ def build_dip_swing_analysis(
                 f" · 近场净收益 {format_decimal(safe_decimal(ability_snapshot.get('netPnl'), '0'), 2)}U"
                 f" · 平仓胜率 {compact_metric(ability_snapshot.get('closeWinRatePct'), '0.1')}%"
             )
+    if safe_decimal(ability_snapshot.get("totalFees"), "0") < 0 and safe_decimal(ability_snapshot.get("netPnl"), "0") <= 0:
+        warnings.append(
+            f"近场净收益还没覆盖手续费 {format_decimal(abs(safe_decimal(ability_snapshot.get('totalFees'), '0')), 2)}U，继续收紧信号"
+        )
     if str(selected_signal.get("trend") or "") != "up":
         warnings.append("当前趋势未转强，不做波段开多")
     elif not bool(selected_signal.get("trendStrengthReady")):
@@ -6893,6 +6917,14 @@ def build_dip_swing_analysis(
     elif not bool(selected_signal.get("notOverextended")):
         warnings.append(
             f"当前价格高于快线 {compact_metric(price_vs_fast_pct, '0.01')}%，追价成本偏高，放弃开仓"
+        )
+    elif not edge_cost_ready:
+        warnings.append(
+            f"结构优势/成本比只有 {compact_metric(edge_cost_ratio, '0.01')}x，低于 {format_decimal(DIP_SWING_MIN_EDGE_COST_RATIO, 1)}x"
+        )
+    elif not range_cost_ready:
+        warnings.append(
+            f"最近波动只有成本的 {compact_metric(range_cost_ratio, '0.01')}x，容易被手续费磨损，继续空仓"
         )
     elif net_edge_pct < DIP_SWING_MIN_NET_EDGE_PCT:
         warnings.append(
@@ -6935,6 +6967,12 @@ def build_dip_swing_analysis(
     elif not bool(selected_signal.get("notOverextended")):
         decision = "observe"
         decision_label = "放弃追价，等回踩"
+    elif not edge_cost_ready:
+        decision = "observe"
+        decision_label = "结构优势/成本比不够"
+    elif not range_cost_ready:
+        decision = "observe"
+        decision_label = "波动太窄，容易磨损"
     elif net_edge_pct < DIP_SWING_MIN_NET_EDGE_PCT:
         decision = "observe"
         decision_label = "净优势不够，不交易"
@@ -6950,6 +6988,7 @@ def build_dip_swing_analysis(
         f"趋势扩散 {compact_metric(ema_spread_pct, '0.01')}%",
         f"快线斜率 {compact_metric(fast_slope_pct, '0.01')}%",
         f"净优势 {compact_metric(net_edge_pct, '0.01')}%",
+        f"优势/成本 {compact_metric(edge_cost_ratio, '0.01')}x",
     ]
     if target_multiple > Decimal("1"):
         summary_bits.append(f"目标余额 {format_decimal(target_multiple, 0)}x")
@@ -6971,6 +7010,10 @@ def build_dip_swing_analysis(
         summary_bits.append(
             f"评分 {entry_score}/8，净优势覆盖手续费，允许逐仓开多"
         )
+    elif not edge_cost_ready:
+        summary_bits.append("结构优势/成本比不够，先不为了手续费去博小波动")
+    elif not range_cost_ready:
+        summary_bits.append("波动区间太窄，单子大概率被手续费磨掉")
     elif net_edge_pct < DIP_SWING_MIN_NET_EDGE_PCT:
         summary_bits.append("信号有了，但净优势不够覆盖交易成本")
     else:
@@ -7018,6 +7061,8 @@ def build_dip_swing_analysis(
         "estimatedCostPct": compact_metric(estimated_cost_pct, "0.01"),
         "setupEdgePct": compact_metric(setup_edge_pct, "0.01"),
         "netEdgePct": compact_metric(net_edge_pct, "0.01"),
+        "edgeCostRatio": compact_metric(edge_cost_ratio, "0.01"),
+        "rangeCostRatio": compact_metric(range_cost_ratio, "0.01"),
         "liquidationPrice": decimal_to_str(liq_price) if liq_price > 0 else "",
         "liquidationBufferPct": compact_metric(liq_buffer, "0.1") if liq_buffer > 0 else "",
         "targetBalanceProgressPct": compact_metric(target_balance.get("progressPct"), "0.1"),
@@ -9708,6 +9753,7 @@ class AutomationEngine:
             max(int(automation["slowEma"]) + 30, 80),
         )
         signal = build_pullback_signal(candles, int(automation["fastEma"]), int(automation["slowEma"]))
+        volatility_pct = recent_range_pct(candles)
         positions = client.get_positions(inst_id).get("data", [])
         open_position = next((row for row in positions if safe_decimal(row.get("pos"), "0") != 0), {})
         pos_value = safe_decimal(open_position.get("pos"), "0")
@@ -9720,6 +9766,28 @@ class AutomationEngine:
         contract_value = safe_decimal(meta.get("ctVal"), decimal_to_str(default_swap_contract_value(inst_id)))
         leverage = safe_decimal(automation.get("swapLeverage"), "1")
         entry_score = int(signal.get("entryScore") or 0)
+        exit_score = int(signal.get("exitScore") or 0)
+        estimated_cost_pct = DIP_SWING_EST_ROUNDTRIP_COST_PCT + min(Decimal("0.12"), volatility_pct * Decimal("0.04"))
+        setup_edge_pct = (
+            max(safe_decimal(signal.get("emaSpreadPct"), "0"), Decimal("0"))
+            + max(safe_decimal(signal.get("fastSlopePct"), "0"), Decimal("0"))
+            + max(safe_decimal(signal.get("reboundPct"), "0"), Decimal("0"))
+        )
+        net_edge_pct = setup_edge_pct - estimated_cost_pct
+        edge_cost_ratio = (setup_edge_pct / estimated_cost_pct) if estimated_cost_pct > 0 else Decimal("0")
+        range_cost_ratio = (volatility_pct / estimated_cost_pct) if estimated_cost_pct > 0 else Decimal("0")
+        fee_exit_floor_pct = max(
+            DIP_SWING_MIN_PROTECTIVE_EXIT_PCT,
+            estimated_cost_pct + (DIP_SWING_MIN_NET_EDGE_PCT / Decimal("2")),
+        )
+        severe_trend_break = bool(signal.get("weakTrendReady")) and (
+            exit_score >= DIP_SWING_HARD_EXIT_SCORE
+            or (
+                str(signal.get("trend") or "") == "down"
+                and not bool(signal.get("closeAboveSlow"))
+                and safe_decimal(signal.get("slowSlopePct"), "0") < Decimal("0")
+            )
+        )
         target_plan = self._target_execution_plan(
             automation,
             lot_size,
@@ -9739,12 +9807,13 @@ class AutomationEngine:
         floating_pnl_pct = Decimal("0")
         if entry_price > 0 and last_price > 0 and position_side == "long":
             floating_pnl_pct = ((last_price - entry_price) / entry_price) * Decimal("100")
-        exit_score = int(signal.get("exitScore") or 0)
 
         status_text = (
             f"回撤 {compact_metric(signal.get('pullbackPct'), '0.1')}% / "
             f"反弹 {compact_metric(signal.get('reboundPct'), '0.1')}% / "
-            f"入场评分 {entry_score}/8"
+            f"入场评分 {entry_score}/8 / "
+            f"净优势 {compact_metric(net_edge_pct, '0.01')}% / "
+            f"优势/成本 {compact_metric(edge_cost_ratio, '0.01')}x"
         )
         if liq_buffer > 0:
             status_text += f" / 强平缓冲 {compact_metric(liq_buffer, '0.1')}%"
@@ -9843,19 +9912,36 @@ class AutomationEngine:
                 return
             cooldown_ready, reason = self._cooldown_ready(market_key, int(automation["cooldownSeconds"]))
             if bool(signal.get("weakTrendReady")):
-                if cooldown_ready:
+                should_exit_for_profit = floating_pnl_pct >= fee_exit_floor_pct
+                should_exit_for_break = severe_trend_break and floating_pnl_pct <= (Decimal("0") - DIP_SWING_HARD_BREAK_LOSS_PCT)
+                if cooldown_ready and (should_exit_for_profit or should_exit_for_break):
                     self._place_swap_order(
                         client,
                         inst_id,
                         "sell",
                         round_down(abs_pos, lot_size),
                         automation["swapTdMode"],
-                        "复合趋势破坏，主动平多",
+                        (
+                            "复合趋势破坏且已跑出手续费区，主动平多"
+                            if should_exit_for_profit
+                            else "复合趋势严重破坏，主动止损离场"
+                        ),
                         reduce_only=True,
                         market_key=market_key,
                     )
                 else:
-                    self._set_market(market_key, {"lastMessage": f"复合趋势破坏，但{reason}"})
+                    if not cooldown_ready:
+                        self._set_market(market_key, {"lastMessage": f"复合趋势破坏，但{reason}"})
+                    else:
+                        self._set_market(
+                            market_key,
+                            {
+                                "lastMessage": (
+                                    f"趋势转弱，但当前盈亏 {compact_metric(floating_pnl_pct, '0.01')}% 还没跑出手续费区"
+                                    f" {format_decimal(fee_exit_floor_pct, 2)}%，继续观察结构"
+                                )
+                            },
+                        )
                 return
             self._set_market(
                 market_key,
