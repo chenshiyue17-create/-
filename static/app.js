@@ -3030,9 +3030,11 @@ function getOrderStateLabel(state) {
 
 function getOrderSideLabel(order) {
   const side = order?.side === "sell" ? "卖出" : "买入";
+  const lifecycleRole = getOrderLifecycleRole(order);
+  const role = lifecycleRole?.label ? ` · ${lifecycleRole.label}` : "";
   const posSide = order?.posSide && order.posSide !== "net" ? ` · ${order.posSide}` : "";
   const tdMode = order?.tdMode ? ` · ${order.tdMode}` : "";
-  return `${side}${posSide}${tdMode}`;
+  return `${side}${role}${posSide}${tdMode}`;
 }
 
 function getOrderArbPhase(order) {
@@ -3188,7 +3190,7 @@ function buildOrderLifecycleContext(order, meta = {}) {
         : "这笔合约单已经成交，但当前同合约没有仓位；通常说明已经平仓或离场了。",
       noteText: meta?.source === "local_cache"
         ? "这是本地恢复出来的订单记录，仓位判断以当前账户快照为准。"
-        : "如果你想确认最终赚亏多少，看交易所回报里的已实现收益；如果没有回，就只能确认它现在已经不在持仓里了。",
+        : "如果你想确认最终赚亏多少，看交易所回报里的已实现收益；如果没有回，就只能确认它现在已经不在持仓里了。下面的“对应平仓时间”会继续帮你找最近的离场单。",
     };
   }
 
@@ -3776,6 +3778,55 @@ function isCloseLikeOrder(order) {
   return ["平", "止盈", "止损", "退场", "回补", "卖出"].some((token) => reason.includes(token));
 }
 
+function getOrderEventStamp(order) {
+  return Number(order?.fillTime || order?.uTime || order?.cTime || 0);
+}
+
+function getOrderLifecycleRole(order) {
+  const instType = String(order?.instType || "").toUpperCase();
+  const side = String(order?.side || "").toLowerCase();
+  const reason = String(order?.strategyReason || order?.lastMessage || "");
+  const phase = getOrderArbPhase(order);
+  if (phase === "entry") return { label: "入场开仓", closeLike: false };
+  if (phase === "hedge") return { label: "对冲开仓", closeLike: false };
+  if (phase === "rollback") return { label: "回滚离场", closeLike: true };
+  if (phase === "exit") return { label: "退场平仓", closeLike: true };
+  if (isCloseLikeOrder(order)) {
+    if (reason.includes("止盈")) return { label: "止盈平仓", closeLike: true };
+    if (reason.includes("止损")) return { label: "止损平仓", closeLike: true };
+    if (reason.includes("回补")) return { label: "回补平仓", closeLike: true };
+    if (instType === "SPOT") return { label: "现货离场", closeLike: true };
+    return { label: side === "buy" ? "平空" : "平多", closeLike: true };
+  }
+  if (instType === "SPOT") {
+    return { label: side === "buy" ? "现货建仓" : "现货开仓", closeLike: false };
+  }
+  return { label: side === "sell" ? "开空" : "开多", closeLike: false };
+}
+
+function getOrderEventTimeLabel(order) {
+  return getOrderLifecycleRole(order).closeLike ? "平仓时间" : "成交时间";
+}
+
+function getOrderEventTimeText(order) {
+  return formatOrderTime(order?.fillTime || order?.uTime || order?.cTime);
+}
+
+function findRelatedCloseOrder(order, orders = dashboardState.recentOrdersAll || []) {
+  if (!order || getOrderLifecycleRole(order).closeLike) return null;
+  const currentKey = getOrderKey(order);
+  const instId = String(order?.instId || "");
+  const currentStamp = getOrderEventStamp(order);
+  return (orders || [])
+    .filter((item) => {
+      if (!item || getOrderKey(item) === currentKey) return false;
+      if (String(item?.instId || "") !== instId) return false;
+      if (!getOrderLifecycleRole(item).closeLike) return false;
+      return getOrderEventStamp(item) >= currentStamp;
+    })
+    .sort((left, right) => getOrderEventStamp(left) - getOrderEventStamp(right))[0] || null;
+}
+
 function buildOrderJournalInsight(journal, orders) {
   const list = Array.isArray(orders) ? orders : [];
   const filled = list.filter((item) => String(item?.state || "") === "filled");
@@ -4294,6 +4345,19 @@ function renderOrderDetail(order, meta = {}) {
   const requestSize = formatOrderValue(order.sz);
   const filledSize = formatOrderValue(order.accFillSz || order.fillSz || 0);
   const lifecycle = buildOrderLifecycleContext(order, meta);
+  const lifecycleRole = getOrderLifecycleRole(order);
+  const eventTimeLabel = getOrderEventTimeLabel(order);
+  const eventTimeText = getOrderEventTimeText(order);
+  const relatedCloseOrder = findRelatedCloseOrder(order, dashboardState.recentOrdersAll || []);
+  const relatedCloseTimeText = relatedCloseOrder ? getOrderEventTimeText(relatedCloseOrder) : "--";
+  const relatedCloseRole = relatedCloseOrder ? getOrderLifecycleRole(relatedCloseOrder) : null;
+  const relatedCloseSummary = relatedCloseOrder
+    ? `${relatedCloseRole?.label || "平仓"} · ${relatedCloseOrder.ordId || relatedCloseOrder.clOrdId || "--"}`
+    : lifecycleRole.closeLike
+      ? "这笔单本身就是离场单"
+      : (lifecycle.valueText === "当前无仓" || lifecycle.valueText === "已平仓" || lifecycle.valueText === "已卖出")
+        ? "最近订单里还没识别到对应平仓单"
+        : "当前仍在持仓，或最近订单里还没出现离场单";
   const pnl = buildOrderPnlContext(order, meta);
   const cancelReason = getOrderCancelReason(order);
   const cancelReasonShort = summarizeOrderCancelReason(cancelReason);
@@ -4337,6 +4401,7 @@ function renderOrderDetail(order, meta = {}) {
     <div class="order-detail-grid">
       <div><b>委托数量</b><span>${escapeHtml(requestSize)}</span></div>
       <div><b>保证金 / 模式</b><span>${escapeHtml(order.tdMode || "--")}</span></div>
+      <div><b>订单角色</b><span>${escapeHtml(lifecycleRole.label)}</span></div>
       <div><b>当前状态</b><span>${escapeHtml(lifecycle.scopeText)}</span></div>
       <div><b>收益金额</b><span class="${escapeHtml(pnl.toneClass)}">${escapeHtml(pnl.valueText)}</span></div>
       <div><b>收益口径</b><span>${escapeHtml(pnl.scopeText)}</span></div>
@@ -4345,6 +4410,8 @@ function renderOrderDetail(order, meta = {}) {
       <div><b>Client ID</b><span>${escapeHtml(order.clOrdId || "--")}</span></div>
       <div><b>创建时间</b><span>${escapeHtml(createdAt)}</span></div>
       <div><b>最近更新时间</b><span>${escapeHtml(updatedAt)}</span></div>
+      <div><b>${escapeHtml(eventTimeLabel)}</b><span>${escapeHtml(eventTimeText)}</span></div>
+      <div><b>对应平仓时间</b><span>${escapeHtml(relatedCloseTimeText)}</span></div>
       <div><b>手续费</b><span>${escapeHtml(formatOrderValue(order.fee))}</span></div>
       <div><b>订单标签</b><span>${escapeHtml(order.tag || "--")}</span></div>
       <div><b>执行归因</b><span>${escapeHtml(strategyAttribution)}</span></div>
@@ -4354,6 +4421,7 @@ function renderOrderDetail(order, meta = {}) {
       <div><b>取消来源</b><span>${escapeHtml(order.cancelSource || "--")}</span></div>
       <div><b>仓位判断</b><span>${escapeHtml(lifecycle.detailText)}</span></div>
       <div><b>收益判断</b><span>${escapeHtml(pnl.detailText)}</span></div>
+      <div class="span-wide"><b>平仓关联</b><span>${escapeHtml(relatedCloseSummary)}</span></div>
       <div class="span-wide"><b>状态说明</b><span>${escapeHtml(lifecycle.noteText)}</span></div>
       <div class="span-wide"><b>收益说明</b><span>${escapeHtml(pnl.noteText)}</span></div>
       <div class="span-wide"><b>取消原因</b><span>${escapeHtml(cancelReason || "当前没有取消原因，这笔单不是撤单/失败单，或交易所没有返回额外说明。")}</span></div>
@@ -4493,6 +4561,12 @@ function renderOrderFeed(data) {
                 const activeClass = key === dashboardState.selectedOrderKey ? "active" : "";
                 const targetPrice = order.ordType === "market" ? "市价" : formatOrderValue(order.px);
                 const cancelReason = summarizeOrderCancelReason(getOrderCancelReason(order));
+                const eventTimeLabel = getOrderEventTimeLabel(order);
+                const eventTimeText = getOrderEventTimeText(order);
+                const relatedCloseOrder = findRelatedCloseOrder(order, filteredOrders);
+                const relatedCloseHint = relatedCloseOrder && !getOrderLifecycleRole(order).closeLike
+                  ? `对应平仓 ${getOrderEventTimeText(relatedCloseOrder)}`
+                  : "";
                 return `
                   <button type="button" class="order-card compact ${sideClass} ${activeClass}" data-order-key="${escapeHtml(key)}" data-order-symbol="${escapeHtml(group.symbol)}">
                     <div class="order-card-head">
@@ -4513,8 +4587,14 @@ function renderOrderFeed(data) {
                         <span>${escapeHtml(cancelReason)}</span>
                       </div>
                     ` : ""}
+                    ${relatedCloseHint ? `
+                      <div class="order-card-reason">
+                        <b>平仓关联</b>
+                        <span>${escapeHtml(relatedCloseHint)}</span>
+                      </div>
+                    ` : ""}
                     <div class="order-card-foot">
-                      <span>${escapeHtml(formatOrderTime(order.cTime))}</span>
+                      <span>${escapeHtml(`${eventTimeLabel} ${eventTimeText}`)}</span>
                       <span>${escapeHtml(order.clOrdId || order.ordId || "--")}</span>
                     </div>
                   </button>
@@ -5472,7 +5552,7 @@ async function refreshSnapshot() {
 
 async function refreshOrders() {
   return runSingleFlight("orders", async () => {
-    const data = await request("/api/orders/recent");
+    const data = await request("/api/orders/recent?limit=80");
     applyRecentOrders(data);
   });
 }

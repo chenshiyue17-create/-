@@ -3009,7 +3009,22 @@ def paper_swap_unrealized_pnl(market: dict[str, Any] | None) -> Decimal:
     return direction * (last_price - entry_price) * position_size * ct_val
 
 
-def get_local_recent_orders(inst_type: str = "", limit: int = 20) -> list[dict[str, Any]]:
+DEFAULT_RECENT_ORDER_LIMIT = 80
+MAX_RECENT_ORDER_LIMIT = 200
+
+
+def parse_recent_order_limit(query: dict[str, list[str]] | None, default: int = DEFAULT_RECENT_ORDER_LIMIT) -> int:
+    raw = ""
+    if query:
+        raw = str((query.get("limit") or [default])[0] or "")
+    try:
+        parsed = int(raw or default)
+    except Exception:
+        parsed = default
+    return max(20, min(parsed, MAX_RECENT_ORDER_LIMIT))
+
+
+def get_local_recent_orders(inst_type: str = "", limit: int = DEFAULT_RECENT_ORDER_LIMIT) -> list[dict[str, Any]]:
     stored = get_stored_local_orders(inst_type, limit=limit)
     if stored:
         return stored
@@ -3020,7 +3035,7 @@ def get_local_recent_orders(inst_type: str = "", limit: int = 20) -> list[dict[s
     return derived[:limit]
 
 
-def merge_order_feeds(*feeds: list[dict[str, Any]], limit: int = 20) -> list[dict[str, Any]]:
+def merge_order_feeds(*feeds: list[dict[str, Any]], limit: int = DEFAULT_RECENT_ORDER_LIMIT) -> list[dict[str, Any]]:
     merged: list[dict[str, Any]] = []
     seen = set()
     for feed in feeds:
@@ -10271,17 +10286,22 @@ class AppHandler(BaseHTTPRequestHandler):
                         )
                     json_response(self, payload, status=response.status_code)
                 elif path == "/api/orders/recent":
+                    limit = parse_recent_order_limit(query)
                     response = remote_gateway_request(config, "GET", self.path)
                     payload = response.json()
                     orders = payload.get("orders") or []
                     if isinstance(orders, list):
-                        enriched_orders = backfill_paper_execution_metrics(orders)
-                        summary = build_execution_journal_summary(enriched_orders)
-                        payload["orders"] = enriched_orders
-                        payload["journal"] = {key: value for key, value in summary.items() if key != "symbols"}
-                        payload["symbols"] = summary.get("symbols") or payload.get("symbols") or []
-                        payload["lastSource"] = payload.get("lastSource") or payload.get("source") or "remote_proxy"
-                        payload["lastReconciledAt"] = payload.get("lastReconciledAt") or now_local_iso()
+                        inst_type = (query.get("instType") or [""])[0]
+                        cached_orders = get_stored_local_orders(inst_type, limit=MAX_RECENT_ORDER_LIMIT)
+                        stream_orders = PRIVATE_ORDER_STREAM.get_recent_orders(inst_type, limit=MAX_RECENT_ORDER_LIMIT)
+                        merged_orders = merge_order_feeds(orders, stream_orders, cached_orders, limit=MAX_RECENT_ORDER_LIMIT)
+                        persist_local_orders(merged_orders, source="remote_proxy")
+                        journal = get_execution_journal_snapshot(inst_type, limit=limit)
+                        payload["orders"] = journal.get("orders") or backfill_paper_execution_metrics(merged_orders[:limit])
+                        payload["journal"] = journal.get("summary") or {}
+                        payload["symbols"] = journal.get("symbols") or payload.get("symbols") or []
+                        payload["lastSource"] = journal.get("lastSource") or payload.get("lastSource") or payload.get("source") or "remote_proxy"
+                        payload["lastReconciledAt"] = journal.get("lastReconciledAt") or payload.get("lastReconciledAt") or now_local_iso()
                     json_response(self, payload, status=response.status_code)
                 else:
                     response = remote_gateway_request(config, "GET", self.path)
@@ -10517,10 +10537,11 @@ class AppHandler(BaseHTTPRequestHandler):
                 error_response(self, message, status=400)
                 return
             inst_type = (query.get("instType") or [""])[0]
-            cached_journal = get_execution_journal_snapshot(inst_type, limit=20)
+            limit = parse_recent_order_limit(query)
+            cached_journal = get_execution_journal_snapshot(inst_type, limit=limit)
             cached_orders = cached_journal.get("orders") or []
-            stream_orders = PRIVATE_ORDER_STREAM.get_recent_orders(inst_type, limit=20)
-            merged_live_orders = merge_order_feeds(stream_orders, cached_orders, limit=20)
+            stream_orders = PRIVATE_ORDER_STREAM.get_recent_orders(inst_type, limit=limit)
+            merged_live_orders = merge_order_feeds(stream_orders, cached_orders, limit=limit)
             has_private_credentials = bool(
                 str(config.get("apiKey") or "").strip()
                 and str(config.get("secretKey") or "").strip()
@@ -10547,10 +10568,10 @@ class AppHandler(BaseHTTPRequestHandler):
                 if inst_type:
                     result = client.get_recent_orders(inst_type)
                     fills_result = client.get_recent_fills(inst_type, limit=100)
-                    merged_orders = merge_order_feeds(result.get("data", []), stream_orders, cached_orders, limit=20)
+                    merged_orders = merge_order_feeds(result.get("data", []), stream_orders, cached_orders, limit=limit)
                     merged_orders = enrich_execution_orders_with_fills(merged_orders, fills_result.get("data", []))
                     persist_local_orders(merged_orders, source="rest_multi" if (stream_orders or cached_orders) else "rest")
-                    journal = get_execution_journal_snapshot(inst_type, limit=20)
+                    journal = get_execution_journal_snapshot(inst_type, limit=limit)
                     json_response(
                         self,
                         {
@@ -10584,10 +10605,10 @@ class AppHandler(BaseHTTPRequestHandler):
                 if not merged_orders and errors:
                     raise OkxApiError("; ".join(errors))
 
-                merged_orders = merge_order_feeds(merged_orders, stream_orders, cached_orders, limit=20)
+                merged_orders = merge_order_feeds(merged_orders, stream_orders, cached_orders, limit=limit)
                 merged_orders = enrich_execution_orders_with_fills(merged_orders, recent_fills)
                 persist_local_orders(merged_orders, source="rest_multi")
-                journal = get_execution_journal_snapshot(inst_type, limit=20)
+                journal = get_execution_journal_snapshot(inst_type, limit=limit)
                 json_response(
                     self,
                     {
