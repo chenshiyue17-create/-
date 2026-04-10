@@ -25,7 +25,7 @@ import urllib.request
 import ssl
 import errno
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation, ROUND_DOWN
+from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_UP
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -122,8 +122,13 @@ DIP_SWING_EST_ROUNDTRIP_COST_PCT = Decimal("0.16")
 DIP_SWING_MIN_NET_EDGE_PCT = Decimal("0.08")
 DIP_SWING_MIN_EDGE_COST_RATIO = Decimal("1.9")
 DIP_SWING_MIN_RANGE_COST_RATIO = Decimal("3.0")
+DIP_SWING_MIN_ATR_COST_RATIO = Decimal("1.4")
+DIP_SWING_MIN_AVG_QUOTE_VOLUME_USD = Decimal("3000000")
+DIP_SWING_MIN_OPEN_INTEREST_USD = Decimal("6000000")
 DIP_SWING_MIN_PROTECTIVE_EXIT_PCT = Decimal("0.28")
 DIP_SWING_HARD_BREAK_LOSS_PCT = Decimal("0.45")
+DIP_SWING_ENTRY_ORDER_MAX_AGE_SECONDS = 75
+DIP_SWING_POST_ONLY_BUFFER_PCT = Decimal("0.02")
 DIP_SWING_TARGET_MIN_MARGIN_RATIO = Decimal("0.003")
 DIP_SWING_TARGET_MAX_MARGIN_RATIO = Decimal("0.012")
 DIP_SWING_MIN_LIQ_BUFFER_PCT = Decimal("18")
@@ -1028,6 +1033,19 @@ def round_down(value: Decimal, step: Decimal) -> Decimal:
         return value
     units = (value / step).to_integral_value(rounding=ROUND_DOWN)
     return units * step
+
+
+def round_up(value: Decimal, step: Decimal) -> Decimal:
+    if step <= 0:
+        return value
+    units = (value / step).to_integral_value(rounding=ROUND_UP)
+    return units * step
+
+
+def flag_true(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
 
 
 def parse_iso(value: str) -> datetime | None:
@@ -3969,6 +3987,25 @@ class OkxClient:
             params["clOrdId"] = cl_ord_id
         return self._request("GET", "/api/v5/trade/order", params=params)
 
+    def cancel_order(self, inst_id: str, ord_id: str | None = None, cl_ord_id: str | None = None) -> dict[str, Any]:
+        payload = {"instId": inst_id}
+        if ord_id:
+            payload["ordId"] = ord_id
+        if cl_ord_id:
+            payload["clOrdId"] = cl_ord_id
+        try:
+            result = self._request("POST", "/api/v5/trade/cancel-order", payload=payload)
+            self._extract_data_or_raise(result)
+            return result
+        except Exception:
+            if self._paper_enabled():
+                return {
+                    "code": "0",
+                    "data": [{"instId": inst_id, "ordId": ord_id or "", "clOrdId": cl_ord_id or "", "sCode": "0"}],
+                    "_paperSim": True,
+                }
+            raise
+
 
 def derive_private_ws_url(config: dict[str, Any]) -> str:
     base_url = str(config.get("baseUrl") or "https://www.okx.com").lower()
@@ -4272,13 +4309,13 @@ def strategy_detail_line(config: dict[str, Any], origin_label: str = "") -> str:
     if str(config.get("strategyPreset") or "") == "dip_swing":
         target_multiple = resolve_target_balance_multiple(config)
         parts = [
-            "市场扫描 + 净优势过滤 + 能力驱动放大",
-            "趋势扩散 + 回踩反弹 + 不追价 + 手续费区不乱平",
+            "市场扫描 + 因子裁判 + 能力驱动放大",
+            "趋势扩散 + 回踩反弹 + 不追价 + maker-first",
             f"只做多 · {config.get('swapTdMode', 'isolated')} {config.get('swapLeverage', '2')}x",
             f"目标止盈 {config.get('takeProfitPct', '8')}%",
             f"止损 {config.get('stopLossPct', '2.5')}%",
             f"回撤阈值 {format_decimal(DIP_SWING_PULLBACK_PCT, 1)}% · 反弹 {format_decimal(DIP_SWING_REBOUND_PCT, 2)}%",
-            f"优势/成本 ≥ {format_decimal(DIP_SWING_MIN_EDGE_COST_RATIO, 1)}x · 波动/成本 ≥ {format_decimal(DIP_SWING_MIN_RANGE_COST_RATIO, 1)}x",
+            f"优势/成本 ≥ {format_decimal(DIP_SWING_MIN_EDGE_COST_RATIO, 1)}x · 波动/成本 ≥ {format_decimal(DIP_SWING_MIN_RANGE_COST_RATIO, 1)}x · ATR/成本 ≥ {format_decimal(DIP_SWING_MIN_ATR_COST_RATIO, 1)}x",
             f"强平缓冲 ≥ {format_decimal(DIP_SWING_MIN_LIQ_BUFFER_PCT, 0)}%",
         ]
         if target_multiple > Decimal("1"):
@@ -4324,6 +4361,8 @@ def get_closed_candles(client: OkxClient, inst_id: str, bar: str, limit: int) ->
                 "high": safe_decimal(row[2]),
                 "low": safe_decimal(row[3]),
                 "close": safe_decimal(row[4]),
+                "volume": safe_decimal(row[5]),
+                "quoteVolume": safe_decimal(row[7] if len(row) > 7 else row[5]),
                 "confirm": row[8],
             }
         )
@@ -5982,6 +6021,46 @@ def recent_range_pct(candles: list[dict[str, Any]], window: int = 24) -> Decimal
     return ((high - low) / last_close) * Decimal("100")
 
 
+def average_true_range_pct(candles: list[dict[str, Any]], window: int = 14) -> Decimal:
+    if len(candles) < 2:
+        return Decimal("0")
+    sample = candles[-min(len(candles), max(window + 1, 3)) :]
+    true_ranges: list[Decimal] = []
+    prev_close = safe_decimal(sample[0].get("close"), "0")
+    for row in sample[1:]:
+        high = safe_decimal(row.get("high"), "0")
+        low = safe_decimal(row.get("low"), "0")
+        if prev_close <= 0:
+            prev_close = safe_decimal(row.get("close"), "0")
+            continue
+        true_range = max(
+            high - low,
+            abs(high - prev_close),
+            abs(low - prev_close),
+        )
+        true_ranges.append((true_range / prev_close) * Decimal("100"))
+        prev_close = safe_decimal(row.get("close"), "0")
+    if not true_ranges:
+        return Decimal("0")
+    return sum(true_ranges, Decimal("0")) / Decimal(len(true_ranges))
+
+
+def average_quote_volume_usd(candles: list[dict[str, Any]], window: int = 12) -> Decimal:
+    if not candles:
+        return Decimal("0")
+    sample = candles[-min(len(candles), window) :]
+    quote_volumes = [safe_decimal(row.get("quoteVolume"), "0") for row in sample]
+    if any(volume > 0 for volume in quote_volumes):
+        positive = [volume for volume in quote_volumes if volume > 0]
+        if positive:
+            return sum(positive, Decimal("0")) / Decimal(len(positive))
+    notionals = [safe_decimal(row.get("close"), "0") * safe_decimal(row.get("volume"), "0") for row in sample]
+    positive_notionals = [notional for notional in notionals if notional > 0]
+    if not positive_notionals:
+        return Decimal("0")
+    return sum(positive_notionals, Decimal("0")) / Decimal(len(positive_notionals))
+
+
 def runtime_research_options(automation: dict[str, Any]) -> dict[str, Any]:
     slow = max(int(automation.get("slowEma", 21) or 21), 8)
     return {
@@ -6013,6 +6092,77 @@ def pct_gap(numerator: Decimal, denominator: Decimal) -> Decimal:
     if denominator <= 0:
         return Decimal("0")
     return ((numerator - denominator) / denominator) * Decimal("100")
+
+
+def normalized_open_interest_usd(
+    inst_id: str,
+    open_interest_row: dict[str, Any],
+    *,
+    last_price: Decimal,
+) -> Decimal:
+    open_interest_usd = safe_decimal(open_interest_row.get("oiUsd"), "0")
+    if open_interest_usd > 0:
+        return open_interest_usd
+    contract_value = default_swap_contract_value(inst_id)
+    raw_oi = safe_decimal(open_interest_row.get("oi"), "0")
+    if raw_oi > 0 and contract_value > 0 and last_price > 0:
+        return raw_oi * contract_value * last_price
+    oi_ccy = safe_decimal(open_interest_row.get("oiCcy"), "0")
+    if oi_ccy > 0 and last_price > 0:
+        return oi_ccy * last_price
+    return Decimal("0")
+
+
+def build_dip_swing_factor_bundle(
+    signal: dict[str, Any],
+    *,
+    entry_score: int,
+    edge_cost_ready: bool,
+    range_cost_ready: bool,
+    atr_cost_ready: bool,
+    liquidity_ready: bool,
+) -> dict[str, Any]:
+    entry_factors = {
+        "trendUp": str(signal.get("trend") or "") == "up",
+        "trendStrength": bool(signal.get("trendStrengthReady")),
+        "pullbackContext": bool(signal.get("pullbackContext")) or bool(signal.get("bullCross")),
+        "reboundReady": bool(signal.get("reboundReady")) or bool(signal.get("bullCross")),
+        "notOverextended": bool(signal.get("notOverextended")),
+        "edgeCost": edge_cost_ready,
+        "rangeCost": range_cost_ready,
+        "atrCost": atr_cost_ready,
+        "liquidity": liquidity_ready,
+        "entryScore": entry_score >= DIP_SWING_MIN_ENTRY_SCORE,
+    }
+    vetoes: list[str] = []
+    if not entry_factors["trendUp"]:
+        vetoes.append("趋势未转强")
+    elif not entry_factors["trendStrength"]:
+        vetoes.append("趋势扩散和斜率不够")
+    if not entry_factors["pullbackContext"]:
+        vetoes.append("没有新的回踩或启动结构")
+    if not entry_factors["reboundReady"]:
+        vetoes.append("反弹确认不够")
+    if not entry_factors["notOverextended"]:
+        vetoes.append("当前位置属于追价")
+    if not entry_factors["edgeCost"]:
+        vetoes.append("结构优势/成本比不够")
+    if not entry_factors["rangeCost"]:
+        vetoes.append("波动区间太窄")
+    if not entry_factors["atrCost"]:
+        vetoes.append("真实波幅不够覆盖成本")
+    if not entry_factors["liquidity"]:
+        vetoes.append("流动性不够厚")
+    if not entry_factors["entryScore"]:
+        vetoes.append("入场评分不够")
+    ready = all(entry_factors.values())
+    factor_score = sum(1 for value in entry_factors.values() if value)
+    return {
+        "entryFactors": entry_factors,
+        "entryVetoes": vetoes,
+        "entryReady": ready,
+        "entryFactorScore": factor_score,
+    }
 
 
 def build_basis_arb_scan_target(config: dict[str, Any], symbol: str) -> dict[str, Any]:
@@ -6056,6 +6206,8 @@ def evaluate_dip_swing_target_snapshot(
     funding_rate_pct = safe_decimal(funding_row.get("fundingRate"), "0") * Decimal("100")
     basis_pct = pct_gap(last_price, mark_price)
     volatility_pct = recent_range_pct(candles)
+    atr_pct = average_true_range_pct(candles)
+    avg_quote_volume_usd = average_quote_volume_usd(candles)
     pullback_pct = safe_decimal(signal.get("pullbackPct"), "0")
     rebound_pct = safe_decimal(signal.get("reboundPct"), "0")
     ema_spread_pct = safe_decimal(signal.get("emaSpreadPct"), "0")
@@ -6069,8 +6221,39 @@ def evaluate_dip_swing_target_snapshot(
     net_edge_pct = setup_edge_pct - estimated_cost_pct
     edge_cost_ratio = (setup_edge_pct / estimated_cost_pct) if estimated_cost_pct > 0 else Decimal("0")
     range_cost_ratio = (volatility_pct / estimated_cost_pct) if estimated_cost_pct > 0 else Decimal("0")
+    atr_cost_ratio = (atr_pct / estimated_cost_pct) if estimated_cost_pct > 0 else Decimal("0")
     edge_cost_ready = edge_cost_ratio >= DIP_SWING_MIN_EDGE_COST_RATIO
     range_cost_ready = range_cost_ratio >= DIP_SWING_MIN_RANGE_COST_RATIO
+    atr_cost_ready = atr_cost_ratio >= DIP_SWING_MIN_ATR_COST_RATIO
+    open_interest_usd = normalized_open_interest_usd(
+        str(target.get("swapInstId") or ""),
+        open_interest_row,
+        last_price=last_price,
+    )
+    liquidity_ready = (
+        avg_quote_volume_usd >= DIP_SWING_MIN_AVG_QUOTE_VOLUME_USD
+        or open_interest_usd >= DIP_SWING_MIN_OPEN_INTEREST_USD
+    )
+    factor_bundle = build_dip_swing_factor_bundle(
+        signal,
+        entry_score=entry_score,
+        edge_cost_ready=edge_cost_ready,
+        range_cost_ready=range_cost_ready,
+        atr_cost_ready=atr_cost_ready,
+        liquidity_ready=liquidity_ready,
+    )
+    liquidity_score = min(avg_quote_volume_usd / Decimal("1000000"), Decimal("12")) + min(
+        open_interest_usd / Decimal("10000000"),
+        Decimal("12"),
+    )
+    execution_quality_score = (
+        max(net_edge_pct, Decimal("0")) * Decimal("6")
+        + edge_cost_ratio * Decimal("1.8")
+        + range_cost_ratio * Decimal("1.2")
+        + atr_cost_ratio * Decimal("1.1")
+        + liquidity_score
+        + Decimal(factor_bundle.get("entryFactorScore") or 0) * Decimal("0.5")
+    )
     open_position = next((row for row in positions if safe_decimal(row.get("pos"), "0") != 0), {})
     pos_value = safe_decimal(open_position.get("pos"), "0")
     position_side = "flat"
@@ -6087,16 +6270,8 @@ def evaluate_dip_swing_target_snapshot(
         or "--"
     )
     candidate = (
-        bool(signal.get("trendStrengthReady"))
-        and bool(signal.get("notOverextended"))
-        and (
-            bool(signal.get("bullCross"))
-            or (bool(signal.get("pullbackContext")) and bool(signal.get("reboundReady")))
-        )
-        and entry_score >= DIP_SWING_MIN_ENTRY_SCORE
+        bool(factor_bundle.get("entryReady"))
         and net_edge_pct >= DIP_SWING_MIN_NET_EDGE_PCT
-        and edge_cost_ready
-        and range_cost_ready
         and position_side == "flat"
     )
     return {
@@ -6110,6 +6285,8 @@ def evaluate_dip_swing_target_snapshot(
         "fundingRatePct": funding_rate_pct,
         "basisPct": basis_pct,
         "volatilityPct": volatility_pct,
+        "atrPct": atr_pct,
+        "avgQuoteVolumeUsd": avg_quote_volume_usd,
         "pullbackPct": pullback_pct,
         "reboundPct": rebound_pct,
         "emaSpreadPct": ema_spread_pct,
@@ -6123,8 +6300,15 @@ def evaluate_dip_swing_target_snapshot(
         "netEdgePct": net_edge_pct,
         "edgeCostRatio": edge_cost_ratio,
         "rangeCostRatio": range_cost_ratio,
+        "atrCostRatio": atr_cost_ratio,
         "edgeCostReady": edge_cost_ready,
         "rangeCostReady": range_cost_ready,
+        "atrCostReady": atr_cost_ready,
+        "liquidityReady": liquidity_ready,
+        "openInterestUsd": open_interest_usd,
+        "liquidityScore": liquidity_score,
+        "executionQualityScore": execution_quality_score,
+        "factorBundle": factor_bundle,
         "positionSide": position_side,
         "liqPrice": liq_price,
         "liqBufferPct": liq_buffer,
@@ -6770,10 +6954,13 @@ def build_dip_swing_analysis(
     market_candidate_snapshots = [row for row in market_snapshots if row.get("candidate")]
 
     ranking_key = lambda row: (
+        safe_decimal(row.get("executionQualityScore"), "-999"),
         safe_decimal(row.get("netEdgePct"), "-999"),
+        safe_decimal(row.get("edgeCostRatio"), "0"),
+        safe_decimal(row.get("atrCostRatio"), "0"),
+        safe_decimal(row.get("avgQuoteVolumeUsd"), "0"),
+        safe_decimal(row.get("openInterestUsd"), "0"),
         int(row.get("entryScore") or 0),
-        safe_decimal(row.get("emaSpreadPct"), "0"),
-        safe_decimal(row.get("fastSlopePct"), "0"),
     )
     if holding_snapshots:
         selected_snapshot = max(
@@ -6838,8 +7025,17 @@ def build_dip_swing_analysis(
     setup_edge_pct = safe_decimal(selected_snapshot.get("setupEdgePct"), "0")
     edge_cost_ratio = safe_decimal(selected_snapshot.get("edgeCostRatio"), "0")
     range_cost_ratio = safe_decimal(selected_snapshot.get("rangeCostRatio"), "0")
+    atr_pct = safe_decimal(selected_snapshot.get("atrPct"), "0")
+    atr_cost_ratio = safe_decimal(selected_snapshot.get("atrCostRatio"), "0")
+    avg_quote_volume_usd = safe_decimal(selected_snapshot.get("avgQuoteVolumeUsd"), "0")
+    open_interest_usd = safe_decimal(selected_snapshot.get("openInterestUsd"), "0")
+    execution_quality_score = safe_decimal(selected_snapshot.get("executionQualityScore"), "0")
     edge_cost_ready = bool(selected_snapshot.get("edgeCostReady"))
     range_cost_ready = bool(selected_snapshot.get("rangeCostReady"))
+    atr_cost_ready = bool(selected_snapshot.get("atrCostReady"))
+    liquidity_ready = bool(selected_snapshot.get("liquidityReady"))
+    factor_bundle = copy.deepcopy(selected_snapshot.get("factorBundle") or {})
+    entry_vetoes = list(factor_bundle.get("entryVetoes") or [])
     position_side = str(selected_snapshot.get("positionSide") or "flat")
     liq_price = safe_decimal(selected_snapshot.get("liqPrice"), "0")
     liq_buffer = safe_decimal(selected_snapshot.get("liqBufferPct"), "0")
@@ -6863,6 +7059,8 @@ def build_dip_swing_analysis(
             "symbol": str(row.get("symbol") or ""),
             "netEdgePct": compact_metric(safe_decimal(row.get("netEdgePct"), "0"), "0.01"),
             "entryScore": int(row.get("entryScore") or 0),
+            "qualityScore": compact_metric(safe_decimal(row.get("executionQualityScore"), "0"), "0.1"),
+            "atrPct": compact_metric(safe_decimal(row.get("atrPct"), "0"), "0.01"),
         }
         for row in sorted(market_candidate_snapshots, key=ranking_key, reverse=True)[:3]
     ]
@@ -6906,6 +7104,8 @@ def build_dip_swing_analysis(
         warnings.append(
             f"近场净收益还没覆盖手续费 {format_decimal(abs(safe_decimal(ability_snapshot.get('totalFees'), '0')), 2)}U，继续收紧信号"
         )
+    if entry_vetoes:
+        warnings.append("入场裁判拦截: " + " / ".join(entry_vetoes[:4]))
     if str(selected_signal.get("trend") or "") != "up":
         warnings.append("当前趋势未转强，不做波段开多")
     elif not bool(selected_signal.get("trendStrengthReady")):
@@ -6926,6 +7126,14 @@ def build_dip_swing_analysis(
         warnings.append(
             f"最近波动只有成本的 {compact_metric(range_cost_ratio, '0.01')}x，容易被手续费磨损，继续空仓"
         )
+    elif not atr_cost_ready:
+        warnings.append(
+            f"ATR 只有成本的 {compact_metric(atr_cost_ratio, '0.01')}x，波动不够支撑一笔完整波段"
+        )
+    elif not liquidity_ready:
+        warnings.append(
+            f"近端成交额 {format_decimal(avg_quote_volume_usd, 0)}U / 持仓量 {format_decimal(open_interest_usd, 0)}U，流动性不够厚"
+        )
     elif net_edge_pct < DIP_SWING_MIN_NET_EDGE_PCT:
         warnings.append(
             f"手续费后净优势只有 {compact_metric(net_edge_pct, '0.01')}%，低于无交易带 {format_decimal(DIP_SWING_MIN_NET_EDGE_PCT, 2)}%"
@@ -6935,7 +7143,7 @@ def build_dip_swing_analysis(
     elif top_candidates:
         warnings.append(
             "当前候选: " + " / ".join(
-                f"{item['symbol']} 净优势 {item['netEdgePct']}% · 评分 {item['entryScore']}/8"
+                f"{item['symbol']} 质量 {item['qualityScore']} · 净优势 {item['netEdgePct']}% · ATR {item['atrPct']}% · 评分 {item['entryScore']}/8"
                 for item in top_candidates
             )
         )
@@ -6973,6 +7181,12 @@ def build_dip_swing_analysis(
     elif not range_cost_ready:
         decision = "observe"
         decision_label = "波动太窄，容易磨损"
+    elif not atr_cost_ready:
+        decision = "observe"
+        decision_label = "真实波幅不够"
+    elif not liquidity_ready:
+        decision = "observe"
+        decision_label = "流动性不够厚"
     elif net_edge_pct < DIP_SWING_MIN_NET_EDGE_PCT:
         decision = "observe"
         decision_label = "净优势不够，不交易"
@@ -6987,6 +7201,7 @@ def build_dip_swing_analysis(
         f"反弹 {compact_metric(rebound_pct, '0.1')}%",
         f"趋势扩散 {compact_metric(ema_spread_pct, '0.01')}%",
         f"快线斜率 {compact_metric(fast_slope_pct, '0.01')}%",
+        f"ATR {compact_metric(atr_pct, '0.01')}%",
         f"净优势 {compact_metric(net_edge_pct, '0.01')}%",
         f"优势/成本 {compact_metric(edge_cost_ratio, '0.01')}x",
     ]
@@ -7014,6 +7229,10 @@ def build_dip_swing_analysis(
         summary_bits.append("结构优势/成本比不够，先不为了手续费去博小波动")
     elif not range_cost_ready:
         summary_bits.append("波动区间太窄，单子大概率被手续费磨掉")
+    elif not atr_cost_ready:
+        summary_bits.append("真实波幅不够，走不出完整波段")
+    elif not liquidity_ready:
+        summary_bits.append("成交深度不够厚，先不拿自己给市场喂手续费")
     elif net_edge_pct < DIP_SWING_MIN_NET_EDGE_PCT:
         summary_bits.append("信号有了，但净优势不够覆盖交易成本")
     else:
@@ -7063,6 +7282,11 @@ def build_dip_swing_analysis(
         "netEdgePct": compact_metric(net_edge_pct, "0.01"),
         "edgeCostRatio": compact_metric(edge_cost_ratio, "0.01"),
         "rangeCostRatio": compact_metric(range_cost_ratio, "0.01"),
+        "atrPct": compact_metric(atr_pct, "0.01"),
+        "atrCostRatio": compact_metric(atr_cost_ratio, "0.01"),
+        "avgQuoteVolumeUsd": compact_metric(avg_quote_volume_usd, "1"),
+        "openInterestUsd": compact_metric(open_interest_usd, "1"),
+        "executionQualityScore": compact_metric(execution_quality_score, "0.1"),
         "liquidationPrice": decimal_to_str(liq_price) if liq_price > 0 else "",
         "liquidationBufferPct": compact_metric(liq_buffer, "0.1") if liq_buffer > 0 else "",
         "targetBalanceProgressPct": compact_metric(target_balance.get("progressPct"), "0.1"),
@@ -8745,6 +8969,66 @@ class AutomationEngine:
         self._prepare_swap(client, automation)
         self._prepared_swap_signature = signature
 
+    @staticmethod
+    def _order_age_seconds(order: dict[str, Any]) -> float:
+        stamp = str(order.get("uTime") or order.get("cTime") or "").strip()
+        if not stamp:
+            return 0.0
+        try:
+            order_ts = float(stamp) / 1000.0
+        except (TypeError, ValueError):
+            return 0.0
+        return max(0.0, time.time() - order_ts)
+
+    def _working_swap_orders(
+        self,
+        inst_id: str,
+        *,
+        side: str | None = None,
+        reduce_only: bool | None = None,
+        limit: int = 120,
+    ) -> list[dict[str, Any]]:
+        orders = PRIVATE_ORDER_STREAM.get_recent_orders("SWAP", limit=limit)
+        working: list[dict[str, Any]] = []
+        for order in orders:
+            if str(order.get("instId") or "") != inst_id:
+                continue
+            if classify_execution_order_state(order) != "working":
+                continue
+            if side and str(order.get("side") or "").lower() != side.lower():
+                continue
+            if reduce_only is not None and flag_true(order.get("reduceOnly")) != reduce_only:
+                continue
+            working.append(order)
+        return working
+
+    def _cancel_swap_orders(
+        self,
+        client: OkxClient,
+        inst_id: str,
+        orders: list[dict[str, Any]],
+        reason: str,
+        *,
+        market_key: str = "swap",
+    ) -> None:
+        canceled = 0
+        for order in orders:
+            ord_id = str(order.get("ordId") or "").strip()
+            cl_ord_id = str(order.get("clOrdId") or "").strip()
+            if not ord_id and not cl_ord_id:
+                continue
+            try:
+                result = client.cancel_order(inst_id, ord_id=ord_id or None, cl_ord_id=cl_ord_id or None)
+                ack = deep_merge(order, (result.get("data") or [{}])[0])
+                ack["state"] = "canceled"
+                PRIVATE_ORDER_STREAM._ingest_orders([ack])
+                canceled += 1
+            except Exception as exc:
+                self._log("warn", f"{reason} · 永续 {inst_id} 撤单失败: {exc}")
+        if canceled > 0:
+            self._set_market(market_key, {"lastMessage": f"{reason} · 已撤 {canceled} 笔挂单"})
+            self._log("info", f"{reason} · 永续 {inst_id} 已撤 {canceled} 笔挂单")
+
     def _spot_reference_price(self, client: OkxClient, inst_id: str, side: str) -> Decimal:
         row = extract_first_row(client.get_ticker(inst_id))
         bid_px = safe_decimal(row.get("bidPx") or row.get("bidPrice"), "0")
@@ -8753,6 +9037,54 @@ class AutomationEngine:
         if side == "sell":
             return bid_px if bid_px > 0 else (last_px if last_px > 0 else ask_px)
         return ask_px if ask_px > 0 else (last_px if last_px > 0 else bid_px)
+
+    def _build_passive_swap_entry_order(
+        self,
+        client: OkxClient,
+        inst_id: str,
+        side: str,
+        size: Decimal,
+        td_mode: str,
+    ) -> tuple[dict[str, Any], str]:
+        meta = get_instrument_meta(client, "SWAP", inst_id)
+        tick_size = max(safe_decimal(meta.get("tickSz"), "0.0001"), Decimal("0.0001"))
+        lot_size = max(safe_decimal(meta.get("lotSz") or meta.get("minSz"), "0.0001"), Decimal("0.0001"))
+        min_size = max(safe_decimal(meta.get("minSz") or meta.get("lotSz"), "0.0001"), Decimal("0.0001"))
+        rounded_size = round_down(size, lot_size)
+        if rounded_size <= 0 or rounded_size < min_size:
+            raise OkxApiError(f"永续下单数量过小，无法在 {inst_id} 发起被动挂单")
+
+        row = extract_first_row(client.get_ticker(inst_id))
+        bid_px = safe_decimal(row.get("bidPx") or row.get("bidPrice"), "0")
+        ask_px = safe_decimal(row.get("askPx") or row.get("askPrice"), "0")
+        last_px = safe_decimal(row.get("last"), "0")
+        buffer_ratio = DIP_SWING_POST_ONLY_BUFFER_PCT / Decimal("100")
+
+        if side == "buy":
+            anchor_px = bid_px if bid_px > 0 else (last_px * (Decimal("1") - buffer_ratio) if last_px > 0 else ask_px)
+            passive_px = round_down(anchor_px, tick_size)
+            if ask_px > 0 and passive_px >= ask_px:
+                passive_px = round_down(max(ask_px - tick_size, tick_size), tick_size)
+        else:
+            anchor_px = ask_px if ask_px > 0 else (last_px * (Decimal("1") + buffer_ratio) if last_px > 0 else bid_px)
+            passive_px = round_up(anchor_px, tick_size)
+            if bid_px > 0 and passive_px <= bid_px:
+                passive_px = round_up(bid_px + tick_size, tick_size)
+
+        if passive_px <= 0:
+            raise OkxApiError(f"未拿到 {inst_id} 的有效盘口，无法构造被动挂单")
+
+        payload: dict[str, Any] = {
+            "instId": inst_id,
+            "tdMode": td_mode,
+            "side": side,
+            "ordType": "post_only",
+            "px": decimal_to_str(passive_px),
+            "sz": decimal_to_str(rounded_size),
+            "clOrdId": build_cl_ord_id("w"),
+        }
+        label = f"post-only 挂单 · {decimal_to_str(passive_px)}"
+        return payload, label
 
     def _build_protected_spot_sell_order(
         self,
@@ -9754,6 +10086,7 @@ class AutomationEngine:
         )
         signal = build_pullback_signal(candles, int(automation["fastEma"]), int(automation["slowEma"]))
         volatility_pct = recent_range_pct(candles)
+        avg_quote_volume_usd = average_quote_volume_usd(candles)
         positions = client.get_positions(inst_id).get("data", [])
         open_position = next((row for row in positions if safe_decimal(row.get("pos"), "0") != 0), {})
         pos_value = safe_decimal(open_position.get("pos"), "0")
@@ -9768,6 +10101,7 @@ class AutomationEngine:
         entry_score = int(signal.get("entryScore") or 0)
         exit_score = int(signal.get("exitScore") or 0)
         estimated_cost_pct = DIP_SWING_EST_ROUNDTRIP_COST_PCT + min(Decimal("0.12"), volatility_pct * Decimal("0.04"))
+        atr_pct = average_true_range_pct(candles)
         setup_edge_pct = (
             max(safe_decimal(signal.get("emaSpreadPct"), "0"), Decimal("0"))
             + max(safe_decimal(signal.get("fastSlopePct"), "0"), Decimal("0"))
@@ -9776,6 +10110,11 @@ class AutomationEngine:
         net_edge_pct = setup_edge_pct - estimated_cost_pct
         edge_cost_ratio = (setup_edge_pct / estimated_cost_pct) if estimated_cost_pct > 0 else Decimal("0")
         range_cost_ratio = (volatility_pct / estimated_cost_pct) if estimated_cost_pct > 0 else Decimal("0")
+        atr_cost_ratio = (atr_pct / estimated_cost_pct) if estimated_cost_pct > 0 else Decimal("0")
+        edge_cost_ready = edge_cost_ratio >= DIP_SWING_MIN_EDGE_COST_RATIO
+        range_cost_ready = range_cost_ratio >= DIP_SWING_MIN_RANGE_COST_RATIO
+        atr_cost_ready = atr_cost_ratio >= DIP_SWING_MIN_ATR_COST_RATIO
+        liquidity_ready = avg_quote_volume_usd >= DIP_SWING_MIN_AVG_QUOTE_VOLUME_USD
         fee_exit_floor_pct = max(
             DIP_SWING_MIN_PROTECTIVE_EXIT_PCT,
             estimated_cost_pct + (DIP_SWING_MIN_NET_EDGE_PCT / Decimal("2")),
@@ -9803,6 +10142,8 @@ class AutomationEngine:
             position_side = "long"
         elif pos_value < 0:
             position_side = "short"
+        pending_entry_orders = self._working_swap_orders(inst_id, side="buy", reduce_only=False)
+        pending_exit_orders = self._working_swap_orders(inst_id, side="sell", reduce_only=True)
         floating_pnl = safe_decimal(open_position.get("upl"), "0")
         floating_pnl_pct = Decimal("0")
         if entry_price > 0 and last_price > 0 and position_side == "long":
@@ -9813,7 +10154,9 @@ class AutomationEngine:
             f"反弹 {compact_metric(signal.get('reboundPct'), '0.1')}% / "
             f"入场评分 {entry_score}/8 / "
             f"净优势 {compact_metric(net_edge_pct, '0.01')}% / "
-            f"优势/成本 {compact_metric(edge_cost_ratio, '0.01')}x"
+            f"优势/成本 {compact_metric(edge_cost_ratio, '0.01')}x / "
+            f"ATR/成本 {compact_metric(atr_cost_ratio, '0.01')}x / "
+            f"成交额 {format_decimal(avg_quote_volume_usd, 0)}U"
         )
         if liq_buffer > 0:
             status_text += f" / 强平缓冲 {compact_metric(liq_buffer, '0.1')}%"
@@ -9875,6 +10218,9 @@ class AutomationEngine:
         take_profit = safe_decimal(automation.get("takeProfitPct"), "0")
         if position_side == "long" and entry_price > 0:
             if liq_buffer > 0 and liq_buffer <= DIP_SWING_MIN_LIQ_BUFFER_PCT:
+                if pending_exit_orders:
+                    self._set_market(market_key, {"lastMessage": f"强平缓冲不足，已有 {len(pending_exit_orders)} 笔退场单在执行"})
+                    return
                 self._place_swap_order(
                     client,
                     inst_id,
@@ -9887,6 +10233,9 @@ class AutomationEngine:
                 )
                 return
             if stop_loss > 0 and last_price <= entry_price * (Decimal("1") - stop_loss / Decimal("100")):
+                if pending_exit_orders:
+                    self._set_market(market_key, {"lastMessage": f"止损触发，已有 {len(pending_exit_orders)} 笔平仓单在执行"})
+                    return
                 self._place_swap_order(
                     client,
                     inst_id,
@@ -9899,6 +10248,9 @@ class AutomationEngine:
                 )
                 return
             if take_profit > 0 and last_price >= entry_price * (Decimal("1") + take_profit / Decimal("100")):
+                if pending_exit_orders:
+                    self._set_market(market_key, {"lastMessage": f"止盈触发，已有 {len(pending_exit_orders)} 笔平仓单在执行"})
+                    return
                 self._place_swap_order(
                     client,
                     inst_id,
@@ -9915,6 +10267,9 @@ class AutomationEngine:
                 should_exit_for_profit = floating_pnl_pct >= fee_exit_floor_pct
                 should_exit_for_break = severe_trend_break and floating_pnl_pct <= (Decimal("0") - DIP_SWING_HARD_BREAK_LOSS_PCT)
                 if cooldown_ready and (should_exit_for_profit or should_exit_for_break):
+                    if pending_exit_orders:
+                        self._set_market(market_key, {"lastMessage": f"趋势破坏，已有 {len(pending_exit_orders)} 笔退场单在执行"})
+                        return
                     self._place_swap_order(
                         client,
                         inst_id,
@@ -9958,7 +10313,31 @@ class AutomationEngine:
         if trade_contracts <= 0:
             self._set_market(market_key, {"lastMessage": "当前保证金预算不足以触发最小下单单位，继续观察"})
             return
-        if signal["signal"] not in {"pullback_buy", "bull_cross_buy"}:
+        entry_signal_ready = signal["signal"] in {"pullback_buy", "bull_cross_buy"}
+        if pending_entry_orders:
+            stale_entry_orders = [
+                order for order in pending_entry_orders
+                if self._order_age_seconds(order) >= DIP_SWING_ENTRY_ORDER_MAX_AGE_SECONDS
+            ]
+            if position_side != "flat" or not entry_signal_ready:
+                self._cancel_swap_orders(client, inst_id, pending_entry_orders, "买点失效，撤掉被动挂单", market_key=market_key)
+                pending_entry_orders = []
+            elif stale_entry_orders:
+                self._cancel_swap_orders(client, inst_id, stale_entry_orders, "被动挂单超时，准备重挂", market_key=market_key)
+                pending_entry_orders = []
+            else:
+                oldest_age = max(self._order_age_seconds(order) for order in pending_entry_orders)
+                self._set_market(
+                    market_key,
+                    {
+                        "lastMessage": (
+                            f"maker-first 挂单等待成交 · 已挂 {len(pending_entry_orders)} 笔 / {int(oldest_age)} 秒"
+                            f" · {status_text}"
+                        )
+                    },
+                )
+                return
+        if not entry_signal_ready:
             if signal["trend"] != "up":
                 self._set_market(market_key, {"lastMessage": f"趋势未转强 · {status_text}"})
             elif not bool(signal.get("trendStrengthReady")):
@@ -9980,6 +10359,18 @@ class AutomationEngine:
             else:
                 self._set_market(market_key, {"lastMessage": f"复合买点还没齐 · {status_text}"})
             return
+        if not edge_cost_ready:
+            self._set_market(market_key, {"lastMessage": f"结构优势/成本比不够，放弃这笔单 · {status_text}"})
+            return
+        if not range_cost_ready:
+            self._set_market(market_key, {"lastMessage": f"波动区间太窄，宁可不做也不喂手续费 · {status_text}"})
+            return
+        if not atr_cost_ready:
+            self._set_market(market_key, {"lastMessage": f"真实波幅不够，走不出完整波段 · {status_text}"})
+            return
+        if not liquidity_ready:
+            self._set_market(market_key, {"lastMessage": f"近端成交额不够厚，跳过这笔单 · {status_text}"})
+            return
         if not allow_new_entries:
             self._set_market(market_key, {"lastMessage": f"波段买点出现，但当前联网决策层为“{analysis_label}”，本轮不新开仓"})
             return
@@ -9994,6 +10385,7 @@ class AutomationEngine:
             trade_contracts,
             automation["swapTdMode"],
             f"波段开多 · {target_plan.get('phaseLabel', target_execution_phase_label(target_plan.get('phase', 'fixed')))} · 动态仓位 {decimal_to_str(trade_contracts)} 张",
+            passive_entry=True,
             market_key=market_key,
         )
 
@@ -10398,19 +10790,36 @@ class AutomationEngine:
         reason: str,
         *,
         reduce_only: bool = False,
+        passive_entry: bool = False,
         market_key: str = "swap",
         strategy_tag: str = "",
         strategy_action: str = "",
         strategy_leg: str = "",
     ) -> dict[str, Any]:
-        payload: dict[str, Any] = {
-            "instId": inst_id,
-            "tdMode": td_mode,
-            "side": side,
-            "ordType": "market",
-            "sz": decimal_to_str(size),
-            "clOrdId": build_cl_ord_id("w"),
-        }
+        execution_mode = "市价"
+        if passive_entry and not reduce_only:
+            try:
+                payload, execution_mode = self._build_passive_swap_entry_order(client, inst_id, side, size, td_mode)
+            except Exception as exc:
+                payload = {
+                    "instId": inst_id,
+                    "tdMode": td_mode,
+                    "side": side,
+                    "ordType": "market",
+                    "sz": decimal_to_str(size),
+                    "clOrdId": build_cl_ord_id("w"),
+                }
+                execution_mode = "市价回退"
+                self._log("warn", f"{reason} · 永续 {inst_id} 未能构造被动挂单，回退市价: {exc}")
+        else:
+            payload = {
+                "instId": inst_id,
+                "tdMode": td_mode,
+                "side": side,
+                "ordType": "market",
+                "sz": decimal_to_str(size),
+                "clOrdId": build_cl_ord_id("w"),
+            }
         if reduce_only:
             payload["reduceOnly"] = True
         if strategy_tag:
@@ -10429,7 +10838,7 @@ class AutomationEngine:
             PRIVATE_ORDER_STREAM._ingest_orders([order])
         order_id = order.get("ordId", "")
         self._increment_order_count(market_key, order_id, reason)
-        self._log("info", f"{reason} · 永续 {inst_id} 已发单")
+        self._log("info", f"{reason} · 永续 {inst_id} 已发单 · {execution_mode}")
         return order
 
 
