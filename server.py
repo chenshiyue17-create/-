@@ -2780,6 +2780,19 @@ def build_execution_journal_insight(orders: list[dict[str, Any]], summary: dict[
                 f"taker 占比 {format_decimal(taker_fill_pct, 1)}%。"
             )
         return message
+    if net_value < 0:
+        slip_mark_pct = safe_decimal((summary or {}).get("avgAbsSlipMarkPct"), "0")
+        taker_fill_pct = safe_decimal((summary or {}).get("takerFillPct"), "0")
+        message = (
+            f"当前净结果 {format_decimal(net_value, 4)} USDT。"
+            f" 已实现 {format_decimal(realized_value, 4)} USDT / 手续费 {format_decimal(fee_value, 4)} USDT。"
+        )
+        if slip_mark_pct > 0 or taker_fill_pct > 0:
+            message += (
+                f" 近期加权滑点约 {format_decimal(slip_mark_pct, 4)}% / "
+                f"taker 占比 {format_decimal(taker_fill_pct, 1)}%。"
+            )
+        return message
     if realized_value != 0:
         direction = "盈利" if realized_value > 0 else "亏损"
         return f"当前已实现{direction} {format_decimal(realized_value, 4)} USDT。"
