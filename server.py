@@ -152,6 +152,8 @@ DIP_SWING_SYMBOL_PERFORMANCE_PENALTY_DIVISOR = Decimal("4")
 DIP_SWING_HARD_BREAK_LOSS_PCT = Decimal("0.45")
 DIP_SWING_POST_ONLY_BUFFER_PCT = Decimal("0.02")
 DIP_SWING_EXIT_POST_ONLY_BUFFER_PCT = Decimal("0.02")
+DIP_SWING_POST_ONLY_ENTRY_EXTRA_TICKS = Decimal("2")
+DIP_SWING_POST_ONLY_EXIT_EXTRA_TICKS = Decimal("2")
 DIP_SWING_EXIT_PROTECTION_PCT = Decimal("0.08")
 DIP_SWING_TARGET_MIN_MARGIN_RATIO = Decimal("0.012")
 DIP_SWING_TARGET_MAX_MARGIN_RATIO = Decimal("0.050")
@@ -9859,14 +9861,23 @@ class AutomationEngine:
         ask_px = safe_decimal(row.get("askPx") or row.get("askPrice"), "0")
         last_px = safe_decimal(row.get("last"), "0")
         buffer_ratio = DIP_SWING_POST_ONLY_BUFFER_PCT / Decimal("100")
+        extra_ticks = max(Decimal("1"), DIP_SWING_POST_ONLY_ENTRY_EXTRA_TICKS)
 
         if side == "buy":
-            anchor_px = bid_px if bid_px > 0 else (last_px * (Decimal("1") - buffer_ratio) if last_px > 0 else ask_px)
+            anchor_px = (
+                max(bid_px - (tick_size * extra_ticks), tick_size)
+                if bid_px > 0
+                else (last_px * (Decimal("1") - buffer_ratio) if last_px > 0 else ask_px)
+            )
             passive_px = round_down(anchor_px, tick_size)
             if ask_px > 0 and passive_px >= ask_px:
                 passive_px = round_down(max(ask_px - tick_size, tick_size), tick_size)
         else:
-            anchor_px = ask_px if ask_px > 0 else (last_px * (Decimal("1") + buffer_ratio) if last_px > 0 else bid_px)
+            anchor_px = (
+                ask_px + (tick_size * extra_ticks)
+                if ask_px > 0
+                else (last_px * (Decimal("1") + buffer_ratio) if last_px > 0 else bid_px)
+            )
             passive_px = round_up(anchor_px, tick_size)
             if bid_px > 0 and passive_px <= bid_px:
                 passive_px = round_up(bid_px + tick_size, tick_size)
@@ -9907,14 +9918,23 @@ class AutomationEngine:
         ask_px = safe_decimal(row.get("askPx") or row.get("askPrice"), "0")
         last_px = safe_decimal(row.get("last"), "0")
         buffer_ratio = DIP_SWING_EXIT_POST_ONLY_BUFFER_PCT / Decimal("100")
+        extra_ticks = max(Decimal("1"), DIP_SWING_POST_ONLY_EXIT_EXTRA_TICKS)
 
         if side == "sell":
-            anchor_px = ask_px if ask_px > 0 else (last_px * (Decimal("1") + buffer_ratio) if last_px > 0 else bid_px)
+            anchor_px = (
+                ask_px + (tick_size * extra_ticks)
+                if ask_px > 0
+                else (last_px * (Decimal("1") + buffer_ratio) if last_px > 0 else bid_px)
+            )
             passive_px = round_up(anchor_px, tick_size)
             if bid_px > 0 and passive_px <= bid_px:
                 passive_px = round_up(bid_px + tick_size, tick_size)
         else:
-            anchor_px = bid_px if bid_px > 0 else (last_px * (Decimal("1") - buffer_ratio) if last_px > 0 else ask_px)
+            anchor_px = (
+                max(bid_px - (tick_size * extra_ticks), tick_size)
+                if bid_px > 0
+                else (last_px * (Decimal("1") - buffer_ratio) if last_px > 0 else ask_px)
+            )
             passive_px = round_down(anchor_px, tick_size)
             if ask_px > 0 and passive_px >= ask_px:
                 passive_px = round_down(max(ask_px - tick_size, tick_size), tick_size)
