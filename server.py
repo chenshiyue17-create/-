@@ -150,10 +150,10 @@ DIP_SWING_SYMBOL_NEGATIVE_NET_BLOCK_USDT = Decimal("15")
 DIP_SWING_SYMBOL_MAX_TAKER_FILL_PCT = Decimal("24")
 DIP_SWING_SYMBOL_PERFORMANCE_PENALTY_DIVISOR = Decimal("4")
 DIP_SWING_HARD_BREAK_LOSS_PCT = Decimal("0.45")
-DIP_SWING_POST_ONLY_BUFFER_PCT = Decimal("0.02")
-DIP_SWING_EXIT_POST_ONLY_BUFFER_PCT = Decimal("0.02")
-DIP_SWING_POST_ONLY_ENTRY_EXTRA_TICKS = Decimal("2")
-DIP_SWING_POST_ONLY_EXIT_EXTRA_TICKS = Decimal("2")
+DIP_SWING_POST_ONLY_BUFFER_PCT = Decimal("0")
+DIP_SWING_EXIT_POST_ONLY_BUFFER_PCT = Decimal("0")
+DIP_SWING_POST_ONLY_ENTRY_EXTRA_TICKS = Decimal("0")
+DIP_SWING_POST_ONLY_EXIT_EXTRA_TICKS = Decimal("0")
 DIP_SWING_MARKET_FALLBACK_OPEN_GAP = 12
 DIP_SWING_MARKET_FALLBACK_OPEN_STREAK = 6
 DIP_SWING_FORCE_MARKET_ENTRY_POLL_SECONDS = 1
@@ -9865,7 +9865,7 @@ class AutomationEngine:
         ask_px = safe_decimal(row.get("askPx") or row.get("askPrice"), "0")
         last_px = safe_decimal(row.get("last"), "0")
         buffer_ratio = DIP_SWING_POST_ONLY_BUFFER_PCT / Decimal("100")
-        extra_ticks = max(Decimal("1"), DIP_SWING_POST_ONLY_ENTRY_EXTRA_TICKS)
+        extra_ticks = max(Decimal("0"), DIP_SWING_POST_ONLY_ENTRY_EXTRA_TICKS)
 
         if side == "buy":
             anchor_px = (
@@ -9922,7 +9922,7 @@ class AutomationEngine:
         ask_px = safe_decimal(row.get("askPx") or row.get("askPrice"), "0")
         last_px = safe_decimal(row.get("last"), "0")
         buffer_ratio = DIP_SWING_EXIT_POST_ONLY_BUFFER_PCT / Decimal("100")
-        extra_ticks = max(Decimal("1"), DIP_SWING_POST_ONLY_EXIT_EXTRA_TICKS)
+        extra_ticks = max(Decimal("0"), DIP_SWING_POST_ONLY_EXIT_EXTRA_TICKS)
 
         if side == "sell":
             anchor_px = (
