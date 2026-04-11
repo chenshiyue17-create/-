@@ -12106,6 +12106,39 @@ class AutomationEngine:
         strategy_action: str = "",
         strategy_leg: str = "",
     ) -> dict[str, Any]:
+        if strategy_action == "entry" and not reduce_only:
+            try:
+                positions = client.get_positions(inst_id).get("data", [])
+            except Exception:
+                positions = []
+            open_position = next(
+                (row for row in positions if safe_decimal(row.get("pos"), "0") != 0),
+                {},
+            )
+            pos_value = safe_decimal(open_position.get("pos"), "0")
+            reverse_entry_blocked = (
+                (pos_value > 0 and side == "sell")
+                or (pos_value < 0 and side == "buy")
+            )
+            if reverse_entry_blocked:
+                position_side = "做多" if pos_value > 0 else "做空"
+                self._set_market(
+                    market_key,
+                    {
+                        "lastMessage": (
+                            f"{ONLY_STRATEGY_LABEL}检测到同币反向持仓仍在 {position_side}"
+                            "，未达到每单净赚 1U 前不允许反手开新仓"
+                        )
+                    },
+                )
+                self._log(
+                    "info",
+                    (
+                        f"{reason} · 永续 {inst_id} 跳过反手开仓"
+                        f" · 当前仍有{position_side}仓位 {decimal_to_str(abs(pos_value))}"
+                    ),
+                )
+                return {}
         execution_mode = "市价"
         if passive_entry and not reduce_only:
             try:
