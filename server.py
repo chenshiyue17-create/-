@@ -142,6 +142,11 @@ DIP_SWING_MIN_PROTECTIVE_EXIT_PCT = Decimal("0.28")
 DIP_SWING_ORDER_PRESSURE_WINDOW_MINUTES = 240
 DIP_SWING_MAX_OPEN_CLOSE_GAP = 4
 DIP_SWING_MAX_CONSECUTIVE_OPEN_STREAK = 3
+DIP_SWING_SYMBOL_PERF_MIN_CLOSE_ORDERS = 2
+DIP_SWING_SYMBOL_NEGATIVE_NET_WARN_USDT = Decimal("5")
+DIP_SWING_SYMBOL_NEGATIVE_NET_BLOCK_USDT = Decimal("15")
+DIP_SWING_SYMBOL_MAX_TAKER_FILL_PCT = Decimal("24")
+DIP_SWING_SYMBOL_PERFORMANCE_PENALTY_DIVISOR = Decimal("4")
 DIP_SWING_HARD_BREAK_LOSS_PCT = Decimal("0.45")
 DIP_SWING_POST_ONLY_BUFFER_PCT = Decimal("0.02")
 DIP_SWING_EXIT_POST_ONLY_BUFFER_PCT = Decimal("0.02")
@@ -6742,6 +6747,23 @@ def evaluate_dip_swing_target_snapshot(
     recent_avg_abs_slip_index_pct = safe_decimal(symbol_pressure.get("avgAbsSlipIndexPct"), "0")
     recent_taker_fill_pct = safe_decimal(symbol_pressure.get("takerFillPct"), "0")
     recent_execution_cost_floor_pct = safe_decimal(symbol_pressure.get("executionCostFloorPct"), "0")
+    recent_net_pnl = safe_decimal(symbol_pressure.get("recentNetPnl"), "0")
+    recent_close_orders = int(symbol_pressure.get("closeOrders") or 0)
+    recent_open_close_gap = int(symbol_pressure.get("openCloseGap") or 0)
+    recent_consecutive_open_streak = int(symbol_pressure.get("consecutiveOpenStreak") or 0)
+    symbol_performance_blocked = (
+        recent_close_orders >= DIP_SWING_SYMBOL_PERF_MIN_CLOSE_ORDERS
+        and recent_net_pnl <= -DIP_SWING_SYMBOL_NEGATIVE_NET_BLOCK_USDT
+    )
+    symbol_taker_blocked = (
+        recent_close_orders >= DIP_SWING_SYMBOL_PERF_MIN_CLOSE_ORDERS
+        and recent_net_pnl <= Decimal("0")
+        and recent_taker_fill_pct >= DIP_SWING_SYMBOL_MAX_TAKER_FILL_PCT
+    )
+    symbol_pressure_blocked = (
+        recent_open_close_gap > DIP_SWING_MAX_OPEN_CLOSE_GAP
+        or recent_consecutive_open_streak > DIP_SWING_MAX_CONSECUTIVE_OPEN_STREAK
+    )
     funding_drag_pct = max(Decimal("0"), funding_rate_pct) * Decimal("0.35")
     estimated_cost_pct = max(estimated_cost_pct, recent_execution_cost_floor_pct + funding_drag_pct)
     setup_edge_pct = max(ema_spread_pct, Decimal("0")) + max(fast_slope_pct, Decimal("0")) + max(rebound_pct, Decimal("0"))
@@ -6769,10 +6791,44 @@ def evaluate_dip_swing_target_snapshot(
         atr_cost_ready=atr_cost_ready,
         liquidity_ready=liquidity_ready,
     )
+    factor_bundle = copy.deepcopy(factor_bundle)
+    entry_factors = dict(factor_bundle.get("entryFactors") or {})
+    entry_vetoes = list(factor_bundle.get("entryVetoes") or [])
+    execution_health_ready = not (symbol_performance_blocked or symbol_taker_blocked or symbol_pressure_blocked)
+    entry_factors["executionHealth"] = execution_health_ready
+    if symbol_performance_blocked:
+        entry_vetoes.append(
+            f"近场净结果 {format_decimal(recent_net_pnl, 2)}U，最近 {recent_close_orders} 笔平仓表现偏差"
+        )
+    elif recent_close_orders >= DIP_SWING_SYMBOL_PERF_MIN_CLOSE_ORDERS and recent_net_pnl <= -DIP_SWING_SYMBOL_NEGATIVE_NET_WARN_USDT:
+        entry_vetoes.append(
+            f"近场净结果 {format_decimal(recent_net_pnl, 2)}U，先别继续放大这个标的"
+        )
+    if symbol_taker_blocked:
+        entry_vetoes.append(
+            f"近期 taker 占比 {format_decimal(recent_taker_fill_pct, 1)}%，执行质量偏差"
+        )
+    if symbol_pressure_blocked:
+        entry_vetoes.append(
+            f"开平差 {recent_open_close_gap} / 连开 {recent_consecutive_open_streak}，交易结构失衡"
+        )
+    factor_bundle["entryFactors"] = entry_factors
+    factor_bundle["entryVetoes"] = entry_vetoes
+    factor_bundle["entryReady"] = all(bool(value) for value in entry_factors.values())
+    factor_bundle["entryFactorScore"] = sum(1 for value in entry_factors.values() if value)
     liquidity_score = min(avg_quote_volume_usd / Decimal("1000000"), Decimal("12")) + min(
         open_interest_usd / Decimal("10000000"),
         Decimal("12"),
     )
+    symbol_performance_penalty = Decimal("0")
+    if recent_net_pnl < 0:
+        symbol_performance_penalty += abs(recent_net_pnl) / DIP_SWING_SYMBOL_PERFORMANCE_PENALTY_DIVISOR
+    if recent_taker_fill_pct > DIP_SWING_SYMBOL_MAX_TAKER_FILL_PCT:
+        symbol_performance_penalty += (recent_taker_fill_pct - DIP_SWING_SYMBOL_MAX_TAKER_FILL_PCT) * Decimal("0.4")
+    if recent_open_close_gap > DIP_SWING_MAX_OPEN_CLOSE_GAP:
+        symbol_performance_penalty += Decimal(recent_open_close_gap - DIP_SWING_MAX_OPEN_CLOSE_GAP) * Decimal("2")
+    if recent_consecutive_open_streak > DIP_SWING_MAX_CONSECUTIVE_OPEN_STREAK:
+        symbol_performance_penalty += Decimal(recent_consecutive_open_streak - DIP_SWING_MAX_CONSECUTIVE_OPEN_STREAK) * Decimal("1.5")
     execution_quality_score = (
         max(net_edge_pct, Decimal("0")) * Decimal("6")
         + edge_cost_ratio * Decimal("1.8")
@@ -6780,7 +6836,7 @@ def evaluate_dip_swing_target_snapshot(
         + atr_cost_ratio * Decimal("1.1")
         + liquidity_score
         + Decimal(factor_bundle.get("entryFactorScore") or 0) * Decimal("0.5")
-    )
+    ) - symbol_performance_penalty
     open_position = next((row for row in positions if safe_decimal(row.get("pos"), "0") != 0), {})
     pos_value = safe_decimal(open_position.get("pos"), "0")
     position_size = abs(pos_value)
@@ -6803,6 +6859,9 @@ def evaluate_dip_swing_target_snapshot(
         bool(factor_bundle.get("entryReady"))
         and net_edge_pct >= DIP_SWING_MIN_NET_EDGE_PCT
         and position_side == "flat"
+        and not symbol_performance_blocked
+        and not symbol_taker_blocked
+        and not symbol_pressure_blocked
     )
     return {
         "symbol": str(target.get("watchlistSymbol") or strategy_symbol_label(target)),
@@ -6847,6 +6906,12 @@ def evaluate_dip_swing_target_snapshot(
         "recentAvgAbsSlipIndexPct": recent_avg_abs_slip_index_pct,
         "recentTakerFillPct": recent_taker_fill_pct,
         "executionCostFloorPct": recent_execution_cost_floor_pct,
+        "recentNetPnl": recent_net_pnl,
+        "recentCloseOrders": recent_close_orders,
+        "symbolPerformanceBlocked": symbol_performance_blocked,
+        "symbolTakerBlocked": symbol_taker_blocked,
+        "symbolPressureBlocked": symbol_pressure_blocked,
+        "symbolPerformancePenalty": symbol_performance_penalty,
         "positionSide": position_side,
         "positionSize": position_size,
         "entryPrice": entry_price,
@@ -6913,6 +6978,7 @@ def build_profit_loop_snapshot_metrics(snapshot: dict[str, Any]) -> dict[str, An
     estimated_cost_pct = safe_decimal(snapshot.get("estimatedCostPct"), "0")
     liquidity_score = safe_decimal(snapshot.get("liquidityScore"), "0")
     execution_quality_score = safe_decimal(snapshot.get("executionQualityScore"), "0")
+    symbol_performance_penalty = safe_decimal(snapshot.get("symbolPerformancePenalty"), "0")
     basis_penalty = abs(safe_decimal(snapshot.get("basisPct"), "0")) * Decimal("0.5")
     predicted_move_pct = max(
         atr_pct * Decimal("0.55"),
@@ -6925,6 +6991,7 @@ def build_profit_loop_snapshot_metrics(snapshot: dict[str, Any]) -> dict[str, An
         + (predicted_net_pct * Decimal("16"))
         + liquidity_score
         - basis_penalty
+        - symbol_performance_penalty
     )
     return {
         "plannedSide": side,
@@ -7646,6 +7713,11 @@ def build_dip_swing_analysis(
     recent_avg_abs_slip_index_pct = safe_decimal(selected_snapshot.get("recentAvgAbsSlipIndexPct"), "0")
     recent_taker_fill_pct = safe_decimal(selected_snapshot.get("recentTakerFillPct"), "0")
     execution_cost_floor_pct = safe_decimal(selected_snapshot.get("executionCostFloorPct"), "0")
+    recent_symbol_net_pnl = safe_decimal(selected_snapshot.get("recentNetPnl"), "0")
+    recent_symbol_close_orders = int(selected_snapshot.get("recentCloseOrders") or 0)
+    symbol_performance_blocked = bool(selected_snapshot.get("symbolPerformanceBlocked"))
+    symbol_taker_blocked = bool(selected_snapshot.get("symbolTakerBlocked"))
+    symbol_pressure_blocked = bool(selected_snapshot.get("symbolPressureBlocked"))
     edge_cost_ready = bool(selected_snapshot.get("edgeCostReady"))
     range_cost_ready = bool(selected_snapshot.get("rangeCostReady"))
     atr_cost_ready = bool(selected_snapshot.get("atrCostReady"))
@@ -7776,6 +7848,16 @@ def build_dip_swing_analysis(
             f" / taker {compact_metric(recent_taker_fill_pct, '0.1')}%"
             f" / 成本地板 {compact_metric(execution_cost_floor_pct, '0.01')}%"
         )
+    if recent_symbol_close_orders >= DIP_SWING_SYMBOL_PERF_MIN_CLOSE_ORDERS and recent_symbol_net_pnl <= -DIP_SWING_SYMBOL_NEGATIVE_NET_WARN_USDT:
+        warnings.append(
+            f"{selected_symbol} 近场净结果 {format_decimal(recent_symbol_net_pnl, 2)}U / 平仓 {recent_symbol_close_orders} 笔，先降权处理"
+        )
+    if symbol_performance_blocked:
+        warnings.append(f"{selected_symbol} 最近净亏偏大，已临时禁开新仓")
+    if symbol_taker_blocked:
+        warnings.append(f"{selected_symbol} 近期 taker 占比偏高，已临时禁开新仓")
+    if symbol_pressure_blocked:
+        warnings.append(f"{selected_symbol} 开平结构失衡，先等平仓闭环")
     if entry_vetoes:
         warnings.append("结构裁判快照: " + " / ".join(entry_vetoes[:4]))
     warnings.append(
@@ -7910,6 +7992,11 @@ def build_dip_swing_analysis(
         "recentAvgAbsSlipIndexPct": compact_metric(recent_avg_abs_slip_index_pct, "0.001"),
         "recentTakerFillPct": compact_metric(recent_taker_fill_pct, "0.1"),
         "executionCostFloorPct": compact_metric(execution_cost_floor_pct, "0.01"),
+        "recentSymbolNetPnl": compact_metric(recent_symbol_net_pnl, "0.01"),
+        "recentSymbolCloseOrders": recent_symbol_close_orders,
+        "symbolPerformanceBlocked": symbol_performance_blocked,
+        "symbolTakerBlocked": symbol_taker_blocked,
+        "symbolPressureBlocked": symbol_pressure_blocked,
         "liquidationPrice": decimal_to_str(liq_price) if liq_price > 0 else "",
         "liquidationBufferPct": compact_metric(liq_buffer, "0.1") if liq_buffer > 0 else "",
         "targetBalanceProgressPct": compact_metric(target_balance.get("progressPct"), "0.1"),
@@ -10902,6 +10989,17 @@ class AutomationEngine:
         recent_avg_abs_slip_index_pct = safe_decimal(symbol_pressure.get("avgAbsSlipIndexPct"), "0")
         recent_taker_fill_pct = safe_decimal(symbol_pressure.get("takerFillPct"), "0")
         execution_cost_floor_pct = safe_decimal(symbol_pressure.get("executionCostFloorPct"), "0")
+        recent_net_pnl = safe_decimal(symbol_pressure.get("recentNetPnl"), "0")
+        recent_close_orders = int(symbol_pressure.get("closeOrders") or 0)
+        symbol_performance_blocked = (
+            recent_close_orders >= DIP_SWING_SYMBOL_PERF_MIN_CLOSE_ORDERS
+            and recent_net_pnl <= -DIP_SWING_SYMBOL_NEGATIVE_NET_BLOCK_USDT
+        )
+        symbol_taker_blocked = (
+            recent_close_orders >= DIP_SWING_SYMBOL_PERF_MIN_CLOSE_ORDERS
+            and recent_net_pnl <= Decimal("0")
+            and recent_taker_fill_pct >= DIP_SWING_SYMBOL_MAX_TAKER_FILL_PCT
+        )
         estimated_cost_pct = max(
             estimated_cost_pct,
             execution_cost_floor_pct + safe_decimal(cost_snapshot.get("fundingDragPct"), "0"),
@@ -10940,6 +11038,7 @@ class AutomationEngine:
             f"ATR {compact_metric(atr_pct, '0.01')}% / "
             f"maker {compact_metric(maker_fee_pct, '0.001')}% / taker {compact_metric(taker_fee_pct, '0.001')}% / "
             f"滑点 {compact_metric(recent_avg_abs_slip_mark_pct, '0.001')}% / taker占比 {compact_metric(recent_taker_fill_pct, '0.1')}% / "
+            f"近场净收益 {format_decimal(recent_net_pnl, 2)}U / "
             f"成交额 {format_decimal(avg_quote_volume_usd, 0)}U / "
             f"开平差 {symbol_pressure['openCloseGap']} / 连开 {symbol_pressure['consecutiveOpenStreak']}"
         )
@@ -11057,6 +11156,8 @@ class AutomationEngine:
             and range_cost_ready
             and atr_cost_ready
             and liquidity_ready
+            and not symbol_performance_blocked
+            and not symbol_taker_blocked
             and int(symbol_pressure.get("openCloseGap") or 0) <= DIP_SWING_MAX_OPEN_CLOSE_GAP
             and int(symbol_pressure.get("consecutiveOpenStreak") or 0) <= DIP_SWING_MAX_CONSECUTIVE_OPEN_STREAK
         )
@@ -11107,6 +11208,10 @@ class AutomationEngine:
                 reasons.append(f"开平差过大 {symbol_pressure['openCloseGap']}")
             if int(symbol_pressure.get("consecutiveOpenStreak") or 0) > DIP_SWING_MAX_CONSECUTIVE_OPEN_STREAK:
                 reasons.append(f"连续开仓过多 {symbol_pressure['consecutiveOpenStreak']}")
+            if symbol_performance_blocked:
+                reasons.append(f"近场净亏 {format_decimal(recent_net_pnl, 2)}U")
+            if symbol_taker_blocked:
+                reasons.append(f"taker 占比偏高 {compact_metric(recent_taker_fill_pct, '0.1')}%")
             if recent_avg_abs_slip_mark_pct > 0 or recent_taker_fill_pct > 0:
                 reasons.append(
                     f"近期滑点 {compact_metric(recent_avg_abs_slip_mark_pct, '0.001')}% / taker {compact_metric(recent_taker_fill_pct, '0.1')}%"
