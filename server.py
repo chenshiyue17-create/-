@@ -149,6 +149,8 @@ DIP_SWING_MIN_PROTECTIVE_EXIT_PCT = Decimal("0.28")
 DIP_SWING_ORDER_PRESSURE_WINDOW_MINUTES = 45
 DIP_SWING_MAX_OPEN_CLOSE_GAP = 64
 DIP_SWING_MAX_CONSECUTIVE_OPEN_STREAK = 24
+DIP_SWING_MAX_OPEN_ONLY_ORDERS_PER_SYMBOL = 3
+DIP_SWING_MAX_UNDERWATER_OPEN_GAP = 2
 DIP_SWING_SYMBOL_PERF_MIN_CLOSE_ORDERS = 2
 DIP_SWING_SYMBOL_NEGATIVE_NET_WARN_USDT = Decimal("5")
 DIP_SWING_SYMBOL_NEGATIVE_NET_BLOCK_USDT = Decimal("15")
@@ -2966,6 +2968,29 @@ def build_execution_symbol_pressure_snapshot(
         "roundtripFeeFloorPct": safe_decimal(cost_snapshot.get("roundtripFeeFloorPct"), "0"),
         "executionCostFloorPct": safe_decimal(cost_snapshot.get("executionCostFloorPct"), "0"),
     }
+
+
+def dip_swing_symbol_cycle_block_reason(
+    symbol_pressure: dict[str, Any] | None,
+    *,
+    net_target_usdt: Decimal = DIP_SWING_NET_TARGET_USDT,
+) -> str:
+    pressure = symbol_pressure or {}
+    open_orders = int(pressure.get("openOrders") or 0)
+    close_orders = int(pressure.get("closeOrders") or 0)
+    open_close_gap = int(pressure.get("openCloseGap") or 0)
+    recent_net_pnl = safe_decimal(pressure.get("recentNetPnl"), "0")
+    if close_orders == 0 and open_orders >= DIP_SWING_MAX_OPEN_ONLY_ORDERS_PER_SYMBOL:
+        return (
+            f"同币最近已连续开仓 {open_orders} 笔，"
+            "还没有形成有效平仓闭环，先停止继续叠加"
+        )
+    if close_orders > 0 and recent_net_pnl < net_target_usdt and open_close_gap >= DIP_SWING_MAX_UNDERWATER_OPEN_GAP:
+        return (
+            f"同币最近净结果仅 {format_decimal(recent_net_pnl, 2)}U，"
+            f"开平差还有 {open_close_gap}，先别继续放量"
+        )
+    return ""
 
 
 def backfill_paper_execution_metrics(orders: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -6890,6 +6915,8 @@ def evaluate_dip_swing_target_snapshot(
     recent_close_orders = int(symbol_pressure.get("closeOrders") or 0)
     recent_open_close_gap = int(symbol_pressure.get("openCloseGap") or 0)
     recent_consecutive_open_streak = int(symbol_pressure.get("consecutiveOpenStreak") or 0)
+    symbol_cycle_block_reason = dip_swing_symbol_cycle_block_reason(symbol_pressure)
+    symbol_cycle_blocked = bool(symbol_cycle_block_reason)
     symbol_performance_blocked = (
         recent_close_orders >= DIP_SWING_SYMBOL_PERF_MIN_CLOSE_ORDERS
         and recent_net_pnl <= -DIP_SWING_SYMBOL_NEGATIVE_NET_BLOCK_USDT
@@ -6935,6 +6962,7 @@ def evaluate_dip_swing_target_snapshot(
     entry_vetoes = list(factor_bundle.get("entryVetoes") or [])
     execution_health_ready = not (symbol_performance_blocked or symbol_taker_blocked or symbol_pressure_blocked)
     entry_factors["executionHealth"] = execution_health_ready
+    entry_factors["closeLoop"] = not symbol_cycle_blocked
     if symbol_performance_blocked:
         entry_vetoes.append(
             f"近场净结果 {format_decimal(recent_net_pnl, 2)}U，最近 {recent_close_orders} 笔平仓表现偏差"
@@ -6951,6 +6979,8 @@ def evaluate_dip_swing_target_snapshot(
         entry_vetoes.append(
             f"开平差 {recent_open_close_gap} / 连开 {recent_consecutive_open_streak}，交易结构失衡"
         )
+    if symbol_cycle_blocked:
+        entry_vetoes.append(symbol_cycle_block_reason)
     factor_bundle["entryFactors"] = entry_factors
     factor_bundle["entryVetoes"] = entry_vetoes
     factor_bundle["entryReady"] = all(bool(value) for value in entry_factors.values())
@@ -7001,6 +7031,7 @@ def evaluate_dip_swing_target_snapshot(
         and not symbol_performance_blocked
         and not symbol_taker_blocked
         and not symbol_pressure_blocked
+        and not symbol_cycle_blocked
     )
     return {
         "symbol": str(target.get("watchlistSymbol") or strategy_symbol_label(target)),
@@ -7047,6 +7078,8 @@ def evaluate_dip_swing_target_snapshot(
         "executionCostFloorPct": recent_execution_cost_floor_pct,
         "recentNetPnl": recent_net_pnl,
         "recentCloseOrders": recent_close_orders,
+        "symbolCycleBlocked": symbol_cycle_blocked,
+        "symbolCycleBlockReason": symbol_cycle_block_reason,
         "symbolPerformanceBlocked": symbol_performance_blocked,
         "symbolTakerBlocked": symbol_taker_blocked,
         "symbolPressureBlocked": symbol_pressure_blocked,
@@ -11342,6 +11375,8 @@ class AutomationEngine:
         execution_cost_floor_pct = safe_decimal(symbol_pressure.get("executionCostFloorPct"), "0")
         recent_net_pnl = safe_decimal(symbol_pressure.get("recentNetPnl"), "0")
         recent_close_orders = int(symbol_pressure.get("closeOrders") or 0)
+        symbol_cycle_block_reason = dip_swing_symbol_cycle_block_reason(symbol_pressure)
+        symbol_cycle_blocked = bool(symbol_cycle_block_reason)
         symbol_performance_blocked = (
             recent_close_orders >= DIP_SWING_SYMBOL_PERF_MIN_CLOSE_ORDERS
             and recent_net_pnl <= -DIP_SWING_SYMBOL_NEGATIVE_NET_BLOCK_USDT
@@ -11397,6 +11432,8 @@ class AutomationEngine:
             f"成交额 {format_decimal(avg_quote_volume_usd, 0)}U / "
             f"开平差 {symbol_pressure['openCloseGap']} / 连开 {symbol_pressure['consecutiveOpenStreak']}"
         )
+        if symbol_cycle_blocked:
+            status_text += f" / 闭环拦截 {symbol_cycle_block_reason}"
         if liq_buffer > 0 and not aggressive_scalp_mode:
             status_text += f" / 强平缓冲 {compact_metric(liq_buffer, '0.1')}%"
         if safe_decimal(target_snapshot.get("targetEq"), "0") > 0 and not aggressive_scalp_mode:
@@ -11540,6 +11577,14 @@ class AutomationEngine:
             if pending_exit_orders:
                 self._cancel_swap_orders(client, inst_id, pending_exit_orders, "这单净利目标未到，撤掉旧平仓单继续持有", market_key=market_key)
             if allow_new_entries and holding_same_direction and trade_contracts > 0:
+                if symbol_cycle_blocked:
+                    self._set_market(
+                        market_key,
+                        {
+                            "lastMessage": f"{ONLY_STRATEGY_LABEL}同向持仓暂停加仓 · {symbol_cycle_block_reason} · {status_text}",
+                        },
+                    )
+                    return
                 cooldown_ready, reason = self._cooldown_ready(market_key, effective_cooldown_seconds)
                 if not cooldown_ready and not aggressive_scalp_mode:
                     self._set_market(
@@ -11593,6 +11638,14 @@ class AutomationEngine:
                         f"{ONLY_STRATEGY_LABEL}预计这单净赚只有 {format_decimal(projected_entry_net_pnl, 2)}U"
                         f"，达不到每单 {format_decimal(DIP_SWING_NET_TARGET_USDT, 0)}U，不开仓"
                     )
+                },
+            )
+            return
+        if symbol_cycle_blocked:
+            self._set_market(
+                market_key,
+                {
+                    "lastMessage": f"{ONLY_STRATEGY_LABEL}暂不开仓 · {symbol_cycle_block_reason} · {status_text}"
                 },
             )
             return
