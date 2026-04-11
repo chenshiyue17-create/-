@@ -3413,7 +3413,7 @@ def get_stored_local_orders(inst_type: str = "", limit: int = 20) -> list[dict[s
     return items[:limit]
 
 
-def get_execution_journal_orders(inst_type: str = "", limit: int = DEFAULT_RECENT_ORDER_LIMIT) -> tuple[list[dict[str, Any]], str, str]:
+def get_execution_journal_orders(inst_type: str = "", limit: int = 80) -> tuple[list[dict[str, Any]], str, str]:
     state = LOCAL_ORDER_STORE.current()
     stored_orders = get_stored_local_orders(inst_type, limit=MAX_RECENT_ORDER_LIMIT)
     stream_orders = PRIVATE_ORDER_STREAM.get_recent_orders(inst_type, limit=MAX_RECENT_ORDER_LIMIT)
