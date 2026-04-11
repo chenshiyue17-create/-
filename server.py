@@ -10107,6 +10107,31 @@ class AutomationEngine:
         label = f"post-only 挂单 · {decimal_to_str(passive_px)}"
         return payload, label
 
+    def _build_aggressive_swap_entry_order(
+        self,
+        client: OkxClient,
+        inst_id: str,
+        side: str,
+        size: Decimal,
+        td_mode: str,
+    ) -> tuple[dict[str, Any], str]:
+        meta = get_instrument_meta(client, "SWAP", inst_id)
+        lot_size = max(safe_decimal(meta.get("lotSz") or meta.get("minSz"), "0.0001"), Decimal("0.0001"))
+        min_size = max(safe_decimal(meta.get("minSz") or meta.get("lotSz"), "0.0001"), Decimal("0.0001"))
+        rounded_size = round_down(size, lot_size)
+        if rounded_size <= 0 or rounded_size < min_size:
+            raise OkxApiError(f"永续下单数量过小，无法在 {inst_id} 发起最优限价 IOC")
+
+        payload: dict[str, Any] = {
+            "instId": inst_id,
+            "tdMode": td_mode,
+            "side": side,
+            "ordType": "optimal_limit_ioc",
+            "sz": decimal_to_str(rounded_size),
+            "clOrdId": build_cl_ord_id("w"),
+        }
+        return payload, "最优限价 IOC"
+
     def _build_passive_swap_exit_order(
         self,
         client: OkxClient,
@@ -10164,6 +10189,32 @@ class AutomationEngine:
         }
         label = f"post-only 平仓 · {decimal_to_str(passive_px)}"
         return payload, label
+
+    def _build_aggressive_swap_exit_order(
+        self,
+        client: OkxClient,
+        inst_id: str,
+        side: str,
+        size: Decimal,
+        td_mode: str,
+    ) -> tuple[dict[str, Any], str]:
+        meta = get_instrument_meta(client, "SWAP", inst_id)
+        lot_size = max(safe_decimal(meta.get("lotSz") or meta.get("minSz"), "0.0001"), Decimal("0.0001"))
+        min_size = max(safe_decimal(meta.get("minSz") or meta.get("lotSz"), "0.0001"), Decimal("0.0001"))
+        rounded_size = round_down(size, lot_size)
+        if rounded_size <= 0 or rounded_size < min_size:
+            raise OkxApiError(f"永续平仓数量过小，无法在 {inst_id} 发起最优限价 IOC")
+
+        payload: dict[str, Any] = {
+            "instId": inst_id,
+            "tdMode": td_mode,
+            "side": side,
+            "ordType": "optimal_limit_ioc",
+            "sz": decimal_to_str(rounded_size),
+            "reduceOnly": True,
+            "clOrdId": build_cl_ord_id("w"),
+        }
+        return payload, "最优限价 IOC 平仓"
 
     def _build_protected_swap_exit_order(
         self,
@@ -11568,7 +11619,9 @@ class AutomationEngine:
                     automation["swapTdMode"],
                     f"{ONLY_STRATEGY_LABEL}这单净赚 {format_decimal(DIP_SWING_NET_TARGET_USDT, 0)}U+ 平仓",
                     reduce_only=True,
-                    protected_exit=True,
+                    passive_exit=not aggressive_scalp_mode,
+                    protected_exit=not aggressive_scalp_mode,
+                    prefer_fill=aggressive_scalp_mode,
                     market_key=market_key,
                     strategy_action="exit",
                     strategy_leg="swap",
@@ -11600,6 +11653,11 @@ class AutomationEngine:
                     or int(symbol_pressure.get("openCloseGap") or 0) >= DIP_SWING_MARKET_FALLBACK_OPEN_GAP
                     or int(symbol_pressure.get("consecutiveOpenStreak") or 0) >= DIP_SWING_MARKET_FALLBACK_OPEN_STREAK
                 )
+                entry_mode_label = (
+                    "市价直开"
+                    if force_market_entry
+                    else ("最优限价IOC" if aggressive_scalp_mode else "maker-first")
+                )
                 self._place_swap_order(
                     client,
                     inst_id,
@@ -11609,10 +11667,11 @@ class AutomationEngine:
                     (
                         f"{ONLY_STRATEGY_LABEL}同向加仓循环 · {desired_side_label}"
                         f" · 动态仓位 {decimal_to_str(trade_contracts)} 张"
-                        f" · {'市价直开' if force_market_entry else 'maker-first'}"
+                        f" · {entry_mode_label}"
                         f" · 并发挂单 {len(pending_entry_orders) + 1}/{pending_entry_capacity}"
                     ),
                     passive_entry=not force_market_entry,
+                    prefer_fill=aggressive_scalp_mode and not force_market_entry,
                     market_key=market_key,
                     strategy_action="entry",
                     strategy_leg="swap",
@@ -11732,6 +11791,11 @@ class AutomationEngine:
             or int(symbol_pressure.get("openCloseGap") or 0) >= DIP_SWING_MARKET_FALLBACK_OPEN_GAP
             or int(symbol_pressure.get("consecutiveOpenStreak") or 0) >= DIP_SWING_MARKET_FALLBACK_OPEN_STREAK
         )
+        entry_mode_label = (
+            "市价直开"
+            if force_market_entry
+            else ("最优限价IOC" if aggressive_scalp_mode else "maker-first")
+        )
         self._place_swap_order(
             client,
             inst_id,
@@ -11741,10 +11805,11 @@ class AutomationEngine:
             (
                 f"{ONLY_STRATEGY_LABEL}开仓 · {desired_side_label}"
                 f" · 动态仓位 {decimal_to_str(trade_contracts)} 张"
-                f" · {'市价直开' if force_market_entry else 'maker-first'}"
+                f" · {entry_mode_label}"
                 f" · 并发挂单 {len(pending_entry_orders) + 1}/{pending_entry_capacity}"
             ),
             passive_entry=not force_market_entry,
+            prefer_fill=aggressive_scalp_mode and not force_market_entry,
             market_key=market_key,
             strategy_action="entry",
             strategy_leg="swap",
@@ -12158,6 +12223,7 @@ class AutomationEngine:
         strategy_tag: str = "",
         strategy_action: str = "",
         strategy_leg: str = "",
+        prefer_fill: bool = False,
     ) -> dict[str, Any]:
         if strategy_action == "entry" and not reduce_only:
             try:
@@ -12193,7 +12259,21 @@ class AutomationEngine:
                 )
                 return {}
         execution_mode = "市价"
-        if passive_entry and not reduce_only:
+        if prefer_fill and not reduce_only:
+            try:
+                payload, execution_mode = self._build_aggressive_swap_entry_order(client, inst_id, side, size, td_mode)
+            except Exception as exc:
+                payload = {
+                    "instId": inst_id,
+                    "tdMode": td_mode,
+                    "side": side,
+                    "ordType": "market",
+                    "sz": decimal_to_str(size),
+                    "clOrdId": build_cl_ord_id("w"),
+                }
+                execution_mode = "市价回退"
+                self._log("warn", f"{reason} · 永续 {inst_id} 未能构造最优限价 IOC，回退市价: {exc}")
+        elif passive_entry and not reduce_only:
             try:
                 payload, execution_mode = self._build_passive_swap_entry_order(client, inst_id, side, size, td_mode)
             except Exception as exc:
@@ -12207,6 +12287,25 @@ class AutomationEngine:
                 }
                 execution_mode = "市价回退"
                 self._log("warn", f"{reason} · 永续 {inst_id} 未能构造被动挂单，回退市价: {exc}")
+        elif prefer_fill and reduce_only:
+            try:
+                payload, execution_mode = self._build_aggressive_swap_exit_order(client, inst_id, side, size, td_mode)
+            except Exception as exc:
+                try:
+                    payload, execution_mode = self._build_protected_swap_exit_order(client, inst_id, side, size, td_mode)
+                    execution_mode = f"{execution_mode} 回退"
+                    self._log("warn", f"{reason} · 永续 {inst_id} 未能构造最优限价 IOC 平仓，回退保护价 IOC: {exc}")
+                except Exception as fallback_exc:
+                    payload = {
+                        "instId": inst_id,
+                        "tdMode": td_mode,
+                        "side": side,
+                        "ordType": "market",
+                        "sz": decimal_to_str(size),
+                        "clOrdId": build_cl_ord_id("w"),
+                    }
+                    execution_mode = "市价回退"
+                    self._log("warn", f"{reason} · 永续 {inst_id} 快速平仓失败，回退市价: {fallback_exc}")
         elif passive_exit and reduce_only:
             try:
                 payload, execution_mode = self._build_passive_swap_exit_order(client, inst_id, side, size, td_mode)
