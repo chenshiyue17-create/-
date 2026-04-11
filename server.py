@@ -3122,14 +3122,16 @@ def is_non_blocking_execution_order(order: dict[str, Any]) -> bool:
 
 
 def execution_tag_family(order: dict[str, Any]) -> str:
+    tag = str(order.get("tag") or order.get("strategyTag") or "").strip().lower()
+    reason = str(order.get("strategyReason") or order.get("lastMessage") or "").strip()
+    is_arb_order = tag.startswith("arb_") or ("套利" in reason)
+    if not is_arb_order:
+        return ""
     action = str(order.get("strategyAction") or "").strip().lower()
     if action in {"entry", "hedge", "exit", "cover", "rollback"}:
         if action == "cover":
             return "exit"
         return action
-    tag = str(order.get("tag") or order.get("strategyTag") or "").strip().lower()
-    if not tag.startswith("arb_"):
-        return ""
     if "entry" in tag:
         return "entry"
     if "hedge" in tag:

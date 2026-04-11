@@ -3280,12 +3280,14 @@ function getOrderSideLabel(order) {
 }
 
 function getOrderArbPhase(order) {
+  const tag = String(order?.strategyTag || order?.tag || "").trim().toLowerCase();
+  const reason = String(order?.strategyReason || order?.lastMessage || "").trim();
+  const isArbOrder = tag.startsWith("arb_") || reason.includes("套利");
+  if (!isArbOrder) return "";
   const action = String(order?.strategyAction || "").trim().toLowerCase();
   if (["entry", "hedge", "exit", "cover", "rollback"].includes(action)) {
     return action === "cover" ? "exit" : action;
   }
-  const tag = String(order?.strategyTag || order?.tag || "").trim().toLowerCase();
-  if (!tag.startsWith("arb_")) return "";
   if (tag.includes("entry")) return "entry";
   if (tag.includes("hedge")) return "hedge";
   if (tag.includes("cover") || tag.includes("exit")) return "exit";
