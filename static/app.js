@@ -3375,6 +3375,19 @@ function getDefaultOrderContractValue(instId) {
   return 1;
 }
 
+function getOrderNotionalValue(order) {
+  const price = toOrderNumber(order?.avgPx || order?.fillPx || order?.px);
+  const size = toOrderNumber(order?.accFillSz || order?.fillSz || order?.sz);
+  if (!(price > 0 && size > 0)) {
+    return 0;
+  }
+  if (!isSwapOrder(order)) {
+    return price * size;
+  }
+  const contractValue = toOrderNumber(order?.contractValue) || getDefaultOrderContractValue(order?.instId);
+  return contractValue > 0 ? price * size * contractValue : 0;
+}
+
 function getOrderLeverageContext(order) {
   if (!isSwapOrder(order)) {
     return {
@@ -3401,10 +3414,8 @@ function getOrderLeverageContext(order) {
 function buildOrderMarginContext(order) {
   const tdModeRaw = String(order?.tdMode || "").trim();
   const tdModeLabel = tdModeRaw === "isolated" ? "逐仓" : tdModeRaw === "cross" ? "全仓" : (tdModeRaw || "--");
-  const price = toOrderNumber(order?.avgPx || order?.fillPx || order?.px);
-  const size = toOrderNumber(order?.accFillSz || order?.fillSz || order?.sz);
+  const notional = getOrderNotionalValue(order);
   if (!isSwapOrder(order)) {
-    const notional = price > 0 && size > 0 ? price * size : 0;
     return {
       modeLabel: tdModeLabel,
       marginText: "--",
@@ -3418,7 +3429,6 @@ function buildOrderMarginContext(order) {
 
   const leverage = toOrderNumber(order?.lever);
   const contractValue = toOrderNumber(order?.contractValue) || getDefaultOrderContractValue(order?.instId);
-  const notional = price > 0 && size > 0 && contractValue > 0 ? price * size * contractValue : 0;
   const margin = notional > 0 && leverage > 0 ? notional / leverage : 0;
   const contractValueText = contractValue > 0 ? `${formatOrderValue(contractValue)} ${getOrderSymbol(order)}/张` : "--";
   return {
@@ -3840,6 +3850,7 @@ function groupOrdersBySymbol(orders, meta = {}) {
     if (hasPosition) scopeParts.push("持仓浮动");
     if (numeric.some((item) => item.quality === "estimated")) scopeParts.push("现价估算");
     const scopeLabel = scopeParts.length ? `含${scopeParts.join(" / ")}` : "收益待更多成本口径";
+    const orderAmount = items.reduce((sum, item) => sum + getOrderNotionalValue(item), 0);
     return {
       symbol,
       orders: items.slice().sort((a, b) => Number(b.uTime || b.cTime || 0) - Number(a.uTime || a.cTime || 0)),
@@ -3866,6 +3877,7 @@ function groupOrdersBySymbol(orders, meta = {}) {
       unresolvedCount,
       hasPnl: numeric.length > 0,
       scopeLabel,
+      orderAmount,
       latestAt: formatOrderTime(latestItem?.uTime || latestItem?.cTime),
       latestInstId: latestItem?.instId || `${symbol}-USDT`,
     };
@@ -4472,7 +4484,7 @@ function renderOrderSymbolOverview(groups, meta = {}) {
         <div class="order-symbol-metrics">
           <div><b>净结果</b><span class="tone-${pnlClass}">${group.hasPnl ? `${formatSignedMoney(group.pnlTotal)} USDT` : "--"}</span></div>
           <div><b>净结果口径</b><span>${escapeHtml(group.scopeLabel)}</span></div>
-          <div><b>套利净收益</b><span>${group.arbOrderCount ? `${formatSignedMoney(group.arbNetPnl)} USDT` : "--"}</span></div>
+          <div><b>订单金额</b><span>${group.orderAmount > 0 ? `${formatMoney(group.orderAmount)} USDT` : "--"}</span></div>
           <div><b>工作中 / 已成交 / 异常</b><span>${group.working} / ${group.filled} / ${group.riskCount}</span></div>
           <div><b>成交率</b><span>${group.orderCount ? formatPercentValue(group.successRate) : "--"}</span></div>
           <div><b>套利腿</b><span>${group.arbOrderCount ? `${group.arbEntryOrders}/${group.arbHedgeOrders}/${group.arbExitOrders}/${group.arbRollbackOrders}` : "--"}</span></div>
@@ -4592,7 +4604,7 @@ function renderOrderTerminalFocus(selectedGroup, meta = {}) {
       <div><b>watchlist</b><span>${escapeHtml(watchlistLabel)}</span></div>
       <div><b>工作中 / 已成交</b><span>${selectedGroup.working} / ${selectedGroup.filled}</span></div>
       <div><b>异常 / 成交率</b><span>${selectedGroup.riskCount} / ${formatPercentValue(selectedGroup.successRate)}</span></div>
-      <div><b>套利净收益</b><span>${selectedGroup.arbOrderCount ? `${formatSignedMoney(selectedGroup.arbNetPnl)} USDT` : "--"}</span></div>
+      <div><b>订单金额</b><span>${selectedGroup.orderAmount > 0 ? `${formatMoney(selectedGroup.orderAmount)} USDT` : "--"}</span></div>
       <div><b>套利腿进度</b><span>${selectedGroup.arbOrderCount ? `开腿 ${selectedGroup.arbEntryOrders} · 对冲 ${selectedGroup.arbHedgeOrders} · 退场 ${selectedGroup.arbExitOrders} · 回滚 ${selectedGroup.arbRollbackOrders}` : "当前不是套利腿订单流"}</span></div>
       <div><b>${focusInsight ? "收益判断" : isBenignExecutionCancelReason(selectedGroup.topCancelReason) ? "最近执行提示" : "最近异常"}</b><span>${escapeHtml(focusInsight || selectedGroup.topCancelReason || "当前没有明显异常撤单")}</span></div>
     </div>
