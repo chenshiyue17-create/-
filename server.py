@@ -1730,7 +1730,7 @@ def build_market_risk_label(target: dict[str, Any], market_kind: str) -> str:
         )
     if str(target.get("strategyPreset") or "") == "dip_swing":
         return (
-            f"净赚 {format_decimal(DIP_SWING_NET_TARGET_USDT, 0)}U+ 就平 · "
+            f"每单净赚 {format_decimal(DIP_SWING_NET_TARGET_USDT, 0)}U+ 就平 · "
             f"缓冲 ≥ {format_decimal(DIP_SWING_MIN_LIQ_BUFFER_PCT, 0)}% · "
             f"动态仓位 · {format_decimal(safe_decimal(target.get('swapLeverage'), '10'), 0)}x 逐仓"
         )
@@ -7798,7 +7798,7 @@ def build_dip_swing_analysis(
     if position_side in {"long", "short"}:
         warnings.append(
             f"当前持有 {selected_symbol}{'多单' if position_side == 'long' else '空单'}"
-            f" · 当前净结果估算 {format_decimal(net_close_pnl, 2)}U / 目标 {format_decimal(DIP_SWING_NET_TARGET_USDT, 0)}U"
+            f" · 当前这单净结果估算 {format_decimal(net_close_pnl, 2)}U / 每单目标 {format_decimal(DIP_SWING_NET_TARGET_USDT, 0)}U"
         )
     elif selected_from_market:
         warnings.append(f"watchlist 外出现更优循环目标，当前切到 {selected_symbol}")
@@ -7867,7 +7867,7 @@ def build_dip_swing_analysis(
         decision_label = "先收缩风险"
     elif position_side in {"long", "short"}:
         decision = "manage"
-        decision_label = "达到净利，准备平仓" if net_close_pnl >= DIP_SWING_NET_TARGET_USDT else "盯净利 1U 平仓"
+        decision_label = "这单已达净利，准备平仓" if net_close_pnl >= DIP_SWING_NET_TARGET_USDT else "盯这单净利 1U 平仓"
     elif allow_new_entries:
         decision = "execute"
         decision_label = "持续开仓"
@@ -7882,7 +7882,7 @@ def build_dip_swing_analysis(
         f"预期波动 {compact_metric(predicted_move_pct, '0.01')}%",
         f"预期净优势 {compact_metric(predicted_net_pct, '0.01')}%",
         f"maker {compact_metric(maker_fee_pct, '0.001')}% / taker {compact_metric(taker_fee_pct, '0.001')}%",
-        f"净利目标 {format_decimal(DIP_SWING_NET_TARGET_USDT, 0)}U",
+        f"每单净利目标 {format_decimal(DIP_SWING_NET_TARGET_USDT, 0)}U",
     ]
     if target_multiple > Decimal("1"):
         summary_bits.append(f"目标余额 {format_decimal(target_multiple, 0)}x")
@@ -7899,7 +7899,7 @@ def build_dip_swing_analysis(
     if blockers:
         summary_bits.append(blockers[0])
     elif position_side in {"long", "short"}:
-        summary_bits.append(f"当前净结果估算 {format_decimal(net_close_pnl, 2)}U，达到 {format_decimal(DIP_SWING_NET_TARGET_USDT, 0)}U 就平")
+        summary_bits.append(f"当前这单净结果估算 {format_decimal(net_close_pnl, 2)}U，达到 {format_decimal(DIP_SWING_NET_TARGET_USDT, 0)}U 就平")
     elif allow_new_entries:
         summary_bits.append("空仓即开，保持 24 小时循环")
     else:
@@ -7914,7 +7914,7 @@ def build_dip_swing_analysis(
         "selectedStrategyDetail": (
             "方向驱动 + 赢亏积分仓位"
             f" · 空仓即开 {planned_side_label}"
-            f" · 净赚 {format_decimal(DIP_SWING_NET_TARGET_USDT, 0)}U+ 就平"
+            f" · 每单净赚 {format_decimal(DIP_SWING_NET_TARGET_USDT, 0)}U+ 就平"
             f" · 开仓 maker-first / 平仓 IOC · {selected_config.get('swapTdMode', 'isolated')} {selected_config.get('swapLeverage', '2')}x"
         ),
         "selectedReturnPct": "",
@@ -11014,8 +11014,8 @@ class AutomationEngine:
 
         status_text = (
             f"方向 {desired_side_label} / "
-            f"净利目标 {format_decimal(DIP_SWING_NET_TARGET_USDT, 0)}U / "
-            f"当前净结果 {format_decimal(net_close_pnl, 2)}U / "
+            f"每单净利目标 {format_decimal(DIP_SWING_NET_TARGET_USDT, 0)}U / "
+            f"当前这单净结果 {format_decimal(net_close_pnl, 2)}U / "
             f"预期净优势 {compact_metric(net_edge_pct, '0.01')}% / "
             f"ATR {compact_metric(atr_pct, '0.01')}% / "
             f"maker {compact_metric(maker_fee_pct, '0.001')}% / taker {compact_metric(taker_fee_pct, '0.001')}% / "
@@ -11096,7 +11096,7 @@ class AutomationEngine:
                             market_key,
                             {
                                 "lastMessage": (
-                                    f"{ONLY_STRATEGY_LABEL}已达到净利目标，已有 {len(pending_exit_orders)} 笔平仓单在执行 · {status_text}"
+                                    f"{ONLY_STRATEGY_LABEL}这单已达到净利目标，已有 {len(pending_exit_orders)} 笔平仓单在执行 · {status_text}"
                                 )
                             },
                         )
@@ -11108,14 +11108,14 @@ class AutomationEngine:
                     close_side,
                     round_down(abs_pos, lot_size),
                     automation["swapTdMode"],
-                    f"{ONLY_STRATEGY_LABEL}净赚 {format_decimal(DIP_SWING_NET_TARGET_USDT, 0)}U+ 平仓",
+                    f"{ONLY_STRATEGY_LABEL}这单净赚 {format_decimal(DIP_SWING_NET_TARGET_USDT, 0)}U+ 平仓",
                     reduce_only=True,
                     protected_exit=True,
                     market_key=market_key,
                 )
                 return
             if pending_exit_orders:
-                self._cancel_swap_orders(client, inst_id, pending_exit_orders, "净利目标未到，撤掉旧平仓单继续持有", market_key=market_key)
+                self._cancel_swap_orders(client, inst_id, pending_exit_orders, "这单净利目标未到，撤掉旧平仓单继续持有", market_key=market_key)
             self._set_market(
                 market_key,
                 {

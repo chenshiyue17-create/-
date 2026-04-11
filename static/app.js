@@ -1784,7 +1784,7 @@ function renderAnalysisState(analysis) {
           data.marketRegime,
           `方向 ${data.plannedSideLabel || "--"}`,
           `预期净优势 ${data.predictedNetPct || "--"}%`,
-          data.profitTargetUsdt ? `净利目标 ${data.profitTargetUsdt}U` : "",
+          data.profitTargetUsdt ? `每单净利目标 ${data.profitTargetUsdt}U` : "",
           data.liquidationBufferPct ? `强平缓冲 ${data.liquidationBufferPct}%` : "",
         ].filter(Boolean).join(" · ")
       : "等待方向、净优势和强平缓冲分析";
