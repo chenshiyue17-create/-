@@ -122,6 +122,7 @@ DIP_SWING_NET_TARGET_USDT = Decimal("1")
 DIP_SWING_MIN_NET_HOLD_USDT = Decimal("-999999")
 DIP_SWING_ENTRY_ORDER_MAX_AGE_SECONDS = 4
 DIP_SWING_EXIT_ORDER_MAX_AGE_SECONDS = 4
+DIP_SWING_EXIT_RETRY_SECONDS = 2
 DIP_SWING_MAX_PENDING_ENTRY_ORDERS_PER_SYMBOL = 64
 DIP_SWING_NON_BLOCKING_ORDER_TYPES = {"market", "ioc", "fok", "optimal_limit_ioc"}
 DIP_SWING_DIRECTION_LOOKBACK_BARS = 6
@@ -459,6 +460,7 @@ REMOTE_CONFIG_KEYS = (
 )
 REMOTE_CONFIG_FETCH_TIMEOUT = 8.0
 REMOTE_NODE_HEALTH_TIMEOUT = 6.0
+REMOTE_AUTOMATION_STATE_TIMEOUT = 4.0
 
 
 def build_proxy_runtime_config(current: dict[str, Any], payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -11407,6 +11409,17 @@ class AutomationEngine:
                             },
                         )
                         return
+                exit_retry_ready, exit_retry_reason = self._cooldown_ready(market_key, DIP_SWING_EXIT_RETRY_SECONDS)
+                if not exit_retry_ready:
+                    self._set_market(
+                        market_key,
+                        {
+                            "lastMessage": (
+                                f"{ONLY_STRATEGY_LABEL}这单已达到净利目标，等待上一笔平仓回报 · {exit_retry_reason} · {status_text}"
+                            )
+                        },
+                    )
+                    return
                 close_side = "sell" if position_side == "long" else "buy"
                 self._place_swap_order(
                     client,
@@ -12203,19 +12216,45 @@ class AppHandler(BaseHTTPRequestHandler):
                     payload["remoteGatewayUrl"] = remote_gateway_url(config)
                     json_response(self, payload, status=response.status_code)
                 elif path == "/api/automation/state":
-                    response = remote_gateway_request(config, "GET", self.path)
-                    payload = response.json()
-                    remote_automation = load_remote_automation_config_for_proxy(config)
-                    if isinstance(payload.get("state"), dict):
-                        payload["state"] = enrich_remote_dip_swing_runtime_state(
-                            payload.get("state") or {},
-                            remote_automation,
-                            CONFIG.current(),
+                    try:
+                        response = remote_gateway_request(
+                            config,
+                            "GET",
+                            self.path,
+                            timeout=REMOTE_AUTOMATION_STATE_TIMEOUT,
+                        )
+                        payload = response.json()
+                        remote_automation = load_remote_automation_config_for_proxy(config)
+                        if isinstance(payload.get("state"), dict):
+                            payload["state"] = enrich_remote_dip_swing_runtime_state(
+                                payload.get("state") or {},
+                                remote_automation,
+                                CONFIG.current(),
+                            )
+                            local_journal = get_execution_journal_snapshot(limit=80)
+                            if (local_journal.get("orders") or local_journal.get("summary")):
+                                payload["state"]["executionJournal"] = local_journal
+                        json_response(self, payload, status=response.status_code)
+                    except Exception as exc:
+                        fallback_state = sanitize_only_dip_swing_runtime_state(
+                            AUTOMATION_ENGINE.snapshot(),
+                            AUTOMATION_CONFIG.current(),
                         )
                         local_journal = get_execution_journal_snapshot(limit=80)
                         if (local_journal.get("orders") or local_journal.get("summary")):
-                            payload["state"]["executionJournal"] = local_journal
-                    json_response(self, payload, status=response.status_code)
+                            fallback_state["executionJournal"] = local_journal
+                        warnings = list((fallback_state.get("analysis") or {}).get("warnings") or [])
+                        warnings.append(f"远端状态暂时未回，已切到本地缓存视图: {exc}")
+                        fallback_state.setdefault("analysis", {})["warnings"] = warnings[-6:]
+                        json_response(
+                            self,
+                            {
+                                "ok": True,
+                                "state": fallback_state,
+                                "remoteStateLoaded": False,
+                                "remoteStateError": str(exc),
+                            },
+                        )
                 elif path == "/api/orders/recent":
                     limit = parse_recent_order_limit(query)
                     response = remote_gateway_request(config, "GET", self.path)
