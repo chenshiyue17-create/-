@@ -7614,7 +7614,9 @@ def build_dip_swing_analysis(
     for row in extra_market_snapshots:
         row["profitLoop"] = build_profit_loop_snapshot_metrics(row)
     market_snapshots = target_snapshots + extra_market_snapshots
-    market_candidate_snapshots = [
+    watchlist_entry_ready_snapshots = [row for row in target_snapshots if bool(row.get("candidate"))]
+    market_entry_ready_snapshots = [row for row in market_snapshots if bool(row.get("candidate"))]
+    market_positive_snapshots = [
         row
         for row in market_snapshots
         if safe_decimal((row.get("profitLoop") or {}).get("predictedNetPct"), "0") > Decimal("0")
@@ -7636,8 +7638,10 @@ def build_dip_swing_analysis(
                 safe_decimal((row.get("profitLoop") or {}).get("loopQualityScore"), "-999"),
             ),
         )
-    elif market_candidate_snapshots:
-        selected_snapshot = max(market_candidate_snapshots, key=ranking_key)
+    elif market_entry_ready_snapshots:
+        selected_snapshot = max(market_entry_ready_snapshots, key=ranking_key)
+    elif market_positive_snapshots:
+        selected_snapshot = max(market_positive_snapshots, key=ranking_key)
     elif target_snapshots:
         selected_snapshot = max(target_snapshots, key=ranking_key)
     else:
@@ -7749,10 +7753,9 @@ def build_dip_swing_analysis(
     predicted_move_pct = safe_decimal(loop_metrics.get("predictedMovePct"), "0")
     predicted_net_pct = safe_decimal(loop_metrics.get("predictedNetPct"), "0")
     loop_quality_score = safe_decimal(loop_metrics.get("loopQualityScore"), "0")
-    candidate_count = len(
-        [row for row in target_snapshots if safe_decimal((row.get("profitLoop") or {}).get("predictedNetPct"), "0") > Decimal("0")]
-    )
-    market_candidate_count = len(market_candidate_snapshots)
+    candidate_count = len(watchlist_entry_ready_snapshots)
+    market_candidate_count = len(market_entry_ready_snapshots)
+    market_positive_count = len(market_positive_snapshots)
     top_candidates = [
         {
             "symbol": str(row.get("symbol") or ""),
@@ -7761,7 +7764,11 @@ def build_dip_swing_analysis(
             "qualityScore": compact_metric(safe_decimal((row.get("profitLoop") or {}).get("loopQualityScore"), "0"), "0.1"),
             "atrPct": compact_metric(safe_decimal(row.get("atrPct"), "0"), "0.01"),
         }
-        for row in sorted(market_candidate_snapshots, key=ranking_key, reverse=True)[:3]
+        for row in sorted(
+            market_entry_ready_snapshots or market_positive_snapshots,
+            key=ranking_key,
+            reverse=True,
+        )[:3]
     ]
 
     selected_config = deep_merge({}, selected_target)
@@ -7867,8 +7874,8 @@ def build_dip_swing_analysis(
         warnings.append(
             f"近端成交额 {format_decimal(avg_quote_volume_usd, 0)}U / 持仓量 {format_decimal(open_interest_usd, 0)}U，流动性一般"
         )
-    if market_candidate_count == 0:
-        warnings.append(f"扩展市场已扫 {len(market_snapshots)} 币，当前没有明显正净优势候选，仍会按最高质量标的循环执行")
+    if market_positive_count == 0:
+        warnings.append(f"扩展市场已扫 {len(market_snapshots)} 币，当前没有明显正净优势候选")
     elif top_candidates:
         warnings.append(
             "当前候选: " + " / ".join(
@@ -7879,7 +7886,8 @@ def build_dip_swing_analysis(
     if market_scan_errors:
         warnings.append(f"扩展扫描跳过 {len(market_scan_errors)} 币")
 
-    allow_new_entries = position_side == "flat" and not blockers
+    selected_entry_ready = bool(selected_snapshot.get("candidate"))
+    allow_new_entries = position_side == "flat" and not blockers and selected_entry_ready
     if blockers:
         decision = "skip"
         decision_label = "先收缩风险"
@@ -7889,6 +7897,9 @@ def build_dip_swing_analysis(
     elif allow_new_entries:
         decision = "execute"
         decision_label = "持续开仓"
+    elif market_positive_count > 0:
+        decision = "observe"
+        decision_label = "等待结构确认"
     else:
         decision = "observe"
         decision_label = ONLY_STRATEGY_FALLBACK_DECISION
@@ -7920,8 +7931,10 @@ def build_dip_swing_analysis(
         summary_bits.append(f"当前净结果估算 {format_decimal(net_close_pnl, 2)}U，达到 {format_decimal(DIP_SWING_NET_TARGET_USDT, 0)}U 就平")
     elif allow_new_entries:
         summary_bits.append("空仓即开，保持 24 小时循环")
+    elif market_positive_count > 0:
+        summary_bits.append("方向和净优势已出现，但结构还没齐，继续等待下一轮确认")
     else:
-        summary_bits.append("继续保持循环")
+        summary_bits.append("继续扫描市场，不为低优势单交手续费")
 
     return {
         "statusText": "已联网分析",
@@ -7961,6 +7974,7 @@ def build_dip_swing_analysis(
         "candidateCount": candidate_count,
         "marketScanCount": len(market_snapshots),
         "marketCandidateCount": market_candidate_count,
+        "marketPositiveCount": market_positive_count,
         "marketTopCandidates": top_candidates,
         "plannedSide": planned_side,
         "plannedSideLabel": planned_side_label,
