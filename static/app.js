@@ -261,9 +261,11 @@ function getJournalSummaryMetrics(journal = {}) {
   };
 }
 
-function journalUsesPaperEquity(journal = {}) {
+function journalUsesPaperEquity(journal = {}, explicitOrders = null) {
   const source = journal && typeof journal === "object" ? journal : {};
-  const orders = Array.isArray(source.orders) ? source.orders : [];
+  const orders = Array.isArray(explicitOrders)
+    ? explicitOrders
+    : (Array.isArray(source.orders) ? source.orders : []);
   if (orders.some((order) => {
     const tag = String(order?.tag || "").trim().toLowerCase();
     const ordId = String(order?.ordId || "").trim().toLowerCase();
@@ -2105,8 +2107,8 @@ function renderDeskOverview() {
     extractAbilityNetPnl(analysis),
     pnlAmount
   );
-  const paperEquityMode = journalUsesPaperEquity(executionJournal)
-    || journalUsesPaperEquity(dashboardState.orderJournal || {});
+  const paperEquityMode = journalUsesPaperEquity(executionJournal, dashboardState.recentOrdersAll || [])
+    || journalUsesPaperEquity(dashboardState.orderJournal || {}, dashboardState.recentOrdersAll || []);
   const journalMetrics = getJournalSummaryMetrics(executionJournal);
   const realizedNet = Number(journalMetrics.realizedPnl ?? 0);
   const feeNet = Number(journalMetrics.totalFees ?? 0);
@@ -4943,17 +4945,24 @@ function renderOrderFeed(data) {
   const allOrders = data?.orders || [];
   const target = $("recentOrders");
   const fallbackJournal = buildDerivedOrderJournal(allOrders, data?.lastSource || data?.source || "", data?.symbols || []);
+  const sourceJournal = data?.journal || fallbackJournal;
   dashboardState.recentOrdersAll = allOrders;
-  dashboardState.orderJournal = data?.journal || fallbackJournal;
+  dashboardState.orderJournal = {
+    ...sourceJournal,
+    orders: allOrders,
+    lastSource: data?.lastSource || sourceJournal.lastSource || data?.source || "",
+    lastReconciledAt: data?.lastReconciledAt || sourceJournal.lastReconciledAt || "",
+  };
   dashboardState.orderJournalSymbols = data?.symbols || fallbackJournal.symbols || [];
   dashboardState.orderFeedMeta = {
     source: data?.source || "rest",
     stream: data?.stream || null,
-    journal: data?.journal || fallbackJournal,
+    journal: dashboardState.orderJournal,
     symbols: data?.symbols || fallbackJournal.symbols || [],
     lastReconciledAt: data?.lastReconciledAt || fallbackJournal.lastReconciledAt || "",
     lastSource: data?.lastSource || fallbackJournal.lastSource || "",
   };
+  renderDeskOverview();
   const baseGroups = groupOrdersBySymbol(allOrders, dashboardState.orderFeedMeta);
   const stateFilter = dashboardState.orderStateFilter || "all";
   const marketFilter = dashboardState.orderMarketFilter || "all";
