@@ -7477,6 +7477,7 @@ def build_basis_arb_analysis(
     funding_aligned = bool(selected_snapshot.get("fundingAligned"))
 
     aggressive_scalp_mode = DIP_SWING_AGGRESSIVE_SCALP_MODE
+    aggressive_scalp_mode = DIP_SWING_AGGRESSIVE_SCALP_MODE
     blockers: list[str] = []
     warnings: list[str] = []
     reverse_basis = bool(selected_snapshot.get("reverseBasis"))
@@ -7969,7 +7970,12 @@ def build_dip_swing_analysis(
     if market_scan_errors:
         warnings.append(f"扩展扫描跳过 {len(market_scan_errors)} 币")
 
-    allow_new_entries = not blockers
+    ignored_blockers = list(blockers)
+    if aggressive_scalp_mode and blockers:
+        warnings.append("超短直开模式已忽略风险闸门：" + " / ".join(ignored_blockers[:3]))
+        blockers = []
+
+    allow_new_entries = True if aggressive_scalp_mode else (not blockers)
     if blockers:
         decision = "skip"
         decision_label = "先收缩风险"
