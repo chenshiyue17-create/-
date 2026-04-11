@@ -154,6 +154,8 @@ DIP_SWING_POST_ONLY_BUFFER_PCT = Decimal("0.02")
 DIP_SWING_EXIT_POST_ONLY_BUFFER_PCT = Decimal("0.02")
 DIP_SWING_POST_ONLY_ENTRY_EXTRA_TICKS = Decimal("2")
 DIP_SWING_POST_ONLY_EXIT_EXTRA_TICKS = Decimal("2")
+DIP_SWING_MARKET_FALLBACK_OPEN_GAP = 12
+DIP_SWING_MARKET_FALLBACK_OPEN_STREAK = 6
 DIP_SWING_EXIT_PROTECTION_PCT = Decimal("0.08")
 DIP_SWING_TARGET_MIN_MARGIN_RATIO = Decimal("0.012")
 DIP_SWING_TARGET_MAX_MARGIN_RATIO = Decimal("0.050")
@@ -11095,6 +11097,7 @@ class AutomationEngine:
         pending_entry_orders = self._working_swap_orders(inst_id, side="buy", reduce_only=False)
         pending_entry_orders += self._working_swap_orders(inst_id, side="sell", reduce_only=False)
         pending_entry_capacity = max(1, DIP_SWING_MAX_PENDING_ENTRY_ORDERS_PER_SYMBOL)
+        prefer_aggressive_entry = False
         pending_exit_orders = self._working_swap_orders(inst_id, side="sell", reduce_only=True)
         pending_exit_orders += self._working_swap_orders(inst_id, side="buy", reduce_only=True)
         stale_exit_orders = [
@@ -11215,6 +11218,7 @@ class AutomationEngine:
             elif stale_entry_orders:
                 self._cancel_swap_orders(client, inst_id, stale_entry_orders, "同向挂单超时，准备重挂", market_key=market_key)
                 pending_entry_orders = [order for order in pending_entry_orders if order not in stale_entry_orders]
+                prefer_aggressive_entry = True
             elif pending_entry_orders and len(pending_entry_orders) >= pending_entry_capacity:
                 oldest_age = max(self._order_age_seconds(order) for order in pending_entry_orders)
                 self._set_market(
@@ -11285,6 +11289,11 @@ class AutomationEngine:
                         },
                     )
                     return
+                force_market_entry = (
+                    prefer_aggressive_entry
+                    or int(symbol_pressure.get("openCloseGap") or 0) >= DIP_SWING_MARKET_FALLBACK_OPEN_GAP
+                    or int(symbol_pressure.get("consecutiveOpenStreak") or 0) >= DIP_SWING_MARKET_FALLBACK_OPEN_STREAK
+                )
                 self._place_swap_order(
                     client,
                     inst_id,
@@ -11294,9 +11303,10 @@ class AutomationEngine:
                     (
                         f"{ONLY_STRATEGY_LABEL}同向加仓循环 · {desired_side_label}"
                         f" · 动态仓位 {decimal_to_str(trade_contracts)} 张"
+                        f" · {'市价补开' if force_market_entry else 'maker-first'}"
                         f" · 并发挂单 {len(pending_entry_orders) + 1}/{pending_entry_capacity}"
                     ),
-                    passive_entry=True,
+                    passive_entry=not force_market_entry,
                     market_key=market_key,
                 )
                 return
@@ -11331,6 +11341,7 @@ class AutomationEngine:
             elif stale_entry_orders:
                 self._cancel_swap_orders(client, inst_id, stale_entry_orders, "被动挂单超时，准备重挂", market_key=market_key)
                 pending_entry_orders = [order for order in pending_entry_orders if order not in stale_entry_orders]
+                prefer_aggressive_entry = True
             elif len(pending_entry_orders) >= pending_entry_capacity:
                 oldest_age = max(self._order_age_seconds(order) for order in pending_entry_orders)
                 self._set_market(
@@ -11383,6 +11394,11 @@ class AutomationEngine:
         if not cooldown_ready:
             self._set_market(market_key, {"lastMessage": f"{ONLY_STRATEGY_LABEL}准备开仓，但{reason}"})
             return
+        force_market_entry = (
+            prefer_aggressive_entry
+            or int(symbol_pressure.get("openCloseGap") or 0) >= DIP_SWING_MARKET_FALLBACK_OPEN_GAP
+            or int(symbol_pressure.get("consecutiveOpenStreak") or 0) >= DIP_SWING_MARKET_FALLBACK_OPEN_STREAK
+        )
         self._place_swap_order(
             client,
             inst_id,
@@ -11392,9 +11408,10 @@ class AutomationEngine:
             (
                 f"{ONLY_STRATEGY_LABEL}开仓 · {desired_side_label}"
                 f" · 动态仓位 {decimal_to_str(trade_contracts)} 张"
+                f" · {'市价补开' if force_market_entry else 'maker-first'}"
                 f" · 并发挂单 {len(pending_entry_orders) + 1}/{pending_entry_capacity}"
             ),
-            passive_entry=True,
+            passive_entry=not force_market_entry,
             market_key=market_key,
         )
 
