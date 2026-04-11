@@ -3957,10 +3957,20 @@ function isBenignExecutionCancelReason(reason) {
   const text = String(reason || "").trim().toLowerCase();
   if (!text) return false;
   return (
-    text.includes("immediate or cancel")
-    && text.includes("was canceled")
-    && text.includes("wasn")
-    && text.includes("filled completely")
+    (
+      text.includes("immediate or cancel")
+      && text.includes("was canceled")
+      && text.includes("wasn")
+      && text.includes("filled completely")
+    )
+    || (
+      text.includes("post-only")
+      && (
+        text.includes("take liquidity")
+        || text.includes("would take liquidity")
+        || text.includes("turn to taker")
+      )
+    )
   );
 }
 
@@ -3969,6 +3979,9 @@ function summarizeOrderCancelReason(reason) {
   if (!text) return "";
   const lower = text.toLowerCase();
   if (isBenignExecutionCancelReason(text)) {
+    if (lower.includes("post-only")) {
+      return "Post-only 被动单如果立即成交会吃掉流动性，交易所已自动撤销。";
+    }
     return "IOC 保护单未完全成交，剩余部分已自动撤销。";
   }
   if (
@@ -4276,6 +4289,7 @@ function renderOrderGlobalSummary(groups) {
   const totalTone = total > 0 ? "positive" : total < 0 ? "negative" : "muted";
   const summaryCancelReason = journal.lastCancelReason || execution.latestCancelReason || execution.topCancelReason || "";
   const summaryAlertLabel = isBenignExecutionCancelReason(summaryCancelReason) ? "最近执行提示" : "最近异常";
+  const summaryCancelReasonText = summarizeOrderCancelReason(summaryCancelReason) || summaryCancelReason;
   const stateLabelMap = {
     all: "全部状态",
     working: "只看工作中",
@@ -4338,7 +4352,7 @@ function renderOrderGlobalSummary(groups) {
       <span>${escapeHtml(
         arbOrderCount
           ? `现货开腿 ${arbEntryOrders} · 永续对冲 ${arbHedgeOrders} · 退场 ${arbExitOrders} · 回滚 ${arbRollbackOrders}`
-          : (summaryCancelReason || "当前没有明显异常撤单，订单终端会在这里提示最近一次失败或取消的原因。")
+          : (summaryCancelReasonText || "当前没有明显异常撤单，订单终端会在这里提示最近一次失败或取消的原因。")
       )}</span>
     </div>
   `;
@@ -4378,7 +4392,7 @@ function renderOrderSymbolOverview(groups, meta = {}) {
         ${group.topCancelReason ? `
           <div class="order-warning-note">
             <b>${isBenignExecutionCancelReason(group.topCancelReason) ? "最近执行提示" : "最近异常"}</b>
-            <span>${escapeHtml(group.topCancelReason)}</span>
+            <span>${escapeHtml(summarizeOrderCancelReason(group.topCancelReason) || group.topCancelReason)}</span>
           </div>
         ` : ""}
         <div class="order-symbol-actions">
@@ -4629,8 +4643,9 @@ function renderOrderSummary(data, orders) {
   if ($("orderSummaryInsight")) {
     const summaryCancelReason = journal.lastCancelReason || stats.latestCancelReason || stats.topCancelReason || "";
     const summaryAlertLabel = isBenignExecutionCancelReason(summaryCancelReason) ? "最近执行提示" : "最近异常";
+    const summaryCancelReasonText = summarizeOrderCancelReason(summaryCancelReason) || summaryCancelReason;
     $("orderSummaryInsight").innerHTML = riskCount
-      ? `<b>${summaryAlertLabel}</b><span>${escapeHtml(summaryCancelReason || "存在已撤或失败订单，详情区会继续显示交易所原始原因。")} · 账本 ${escapeHtml(journalSource)} · 最近对账 ${escapeHtml(reconciledAt)}${arbOrderCount ? ` · 套利开腿 ${arbEntryOrders} / 对冲 ${arbHedgeOrders} / 退场 ${arbExitOrders} / 回滚 ${arbRollbackOrders}` : ""}</span>`
+      ? `<b>${summaryAlertLabel}</b><span>${escapeHtml(summaryCancelReasonText || "存在已撤或失败订单，详情区会继续显示交易所原始原因。")} · 账本 ${escapeHtml(journalSource)} · 最近对账 ${escapeHtml(reconciledAt)}${arbOrderCount ? ` · 套利开腿 ${arbEntryOrders} / 对冲 ${arbHedgeOrders} / 退场 ${arbExitOrders} / 回滚 ${arbRollbackOrders}` : ""}</span>`
       : `<b>当前概览</b><span>${insight || (totalCount ? `最近 ${totalCount} 笔里成交 ${filledCount} 笔，当前没有明显异常撤单。账本 ${journalSource}，最近对账 ${reconciledAt}。${arbOrderCount ? `套利开腿 ${arbEntryOrders} / 对冲 ${arbHedgeOrders} / 退场 ${arbExitOrders} / 回滚 ${arbRollbackOrders}。` : ""}` : "订单一进来，这里会直接告诉你成功率、账本来源和最近异常原因。")}</span>`;
   }
 }
