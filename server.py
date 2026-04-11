@@ -104,6 +104,7 @@ BASIS_ARB_SCAN_LOCK = threading.RLock()
 BASIS_ARB_MARKET_UNIVERSE_CACHE: dict[str, Any] = {"ts": 0.0, "symbols": []}
 BASIS_ARB_MARKET_SCAN_CACHE: dict[str, Any] = {"ts": 0.0, "key": "", "rows": []}
 DIP_SWING_SCAN_SYMBOL_LIMIT = 24
+DIP_SWING_EXECUTION_TARGET_LIMIT = 3
 DIP_SWING_SCAN_LOCK = threading.RLock()
 DIP_SWING_MARKET_UNIVERSE_CACHE: dict[str, Any] = {"ts": 0.0, "symbols": []}
 DIP_SWING_MARKET_SCAN_CACHE: dict[str, Any] = {"ts": 0.0, "key": "", "rows": []}
@@ -7747,11 +7748,29 @@ def build_dip_swing_analysis(
         )[:3]
     ]
 
+    execution_candidate_rows = sorted(
+        market_positive_snapshots or market_snapshots,
+        key=ranking_key,
+        reverse=True,
+    )
+    execution_symbols: list[str] = []
+    seen_execution_symbols: set[str] = set()
+    for row in execution_candidate_rows:
+        symbol = str(row.get("symbol") or "").strip()
+        if not symbol or symbol in seen_execution_symbols:
+            continue
+        seen_execution_symbols.add(symbol)
+        execution_symbols.append(symbol)
+        if len(execution_symbols) >= DIP_SWING_EXECUTION_TARGET_LIMIT:
+            break
+    if not execution_symbols:
+        execution_symbols = list(watchlist_symbols) or [selected_symbol]
+
     selected_config = deep_merge({}, automation)
-    selected_config["watchlistSymbols"] = automation.get("watchlistSymbols", selected_symbol)
+    selected_config["watchlistSymbols"] = ",".join(execution_symbols)
     selected_config["watchlistOverrides"] = copy.deepcopy(automation.get("watchlistOverrides") or {})
-    selected_config["spotInstId"] = automation.get("spotInstId", selected_target.get("spotInstId"))
-    selected_config["swapInstId"] = automation.get("swapInstId", selected_target.get("swapInstId"))
+    selected_config["spotInstId"] = f"{execution_symbols[0]}-USDT"
+    selected_config["swapInstId"] = f"{execution_symbols[0]}-USDT-SWAP"
     live_fee_rates = cache_okx_swap_fee_rates(client, str(selected_target.get("swapInstId") or ""))
     maker_fee_pct = safe_decimal(live_fee_rates.get("makerFeePct"), decimal_to_str(OKX_DEFAULT_SWAP_MAKER_FEE_PCT))
     taker_fee_pct = safe_decimal(live_fee_rates.get("takerFeePct"), decimal_to_str(OKX_DEFAULT_SWAP_TAKER_FEE_PCT))
@@ -7806,6 +7825,8 @@ def build_dip_swing_analysis(
         )
     elif selected_from_market:
         warnings.append(f"watchlist 外出现更优循环目标，当前切到 {selected_symbol}")
+    if len(execution_symbols) > 1:
+        warnings.append(f"执行层当前按 {len(execution_symbols)} 币并行：{', '.join(execution_symbols)}")
     if target_multiple > Decimal("1"):
         if int(ability_snapshot.get("closeOrders") or 0) <= 0:
             warnings.append(
@@ -7903,6 +7924,8 @@ def build_dip_swing_analysis(
             summary_bits.append("先积累赢亏积分，再放大仓位")
     if selected_from_market:
         summary_bits.append("市场轮动目标")
+    if len(execution_symbols) > 1:
+        summary_bits.append(f"执行 {len(execution_symbols)} 币并行")
     if position_side in {"long", "short"} and liq_buffer > 0:
         summary_bits.append(f"强平缓冲 {compact_metric(liq_buffer, '0.1')}%")
     if blockers:
@@ -7949,6 +7972,8 @@ def build_dip_swing_analysis(
         "blockers": blockers,
         "selectedConfig": deep_merge({}, selected_config),
         "selectedWatchlistSymbol": selected_symbol,
+        "executionWatchlistSymbols": execution_symbols,
+        "executionTargetCount": len(execution_symbols),
         "selectedFromMarketScan": selected_from_market,
         "watchlistCount": len(watchlist_symbols),
         "candidateCount": candidate_count,
