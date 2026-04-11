@@ -1800,6 +1800,9 @@ function sanitizeAnalysisForSwingOnly(analysis = {}) {
 function sanitizeAutomationStateForSwingOnly(state = {}) {
   const sanitized = { ...(state || {}) };
   sanitized.analysis = sanitizeAnalysisForSwingOnly(sanitized.analysis || {});
+  if (!sanitized.analysis.lastAnalyzedAt && sanitized.lastCycleAt) {
+    sanitized.analysis.lastAnalyzedAt = sanitized.lastCycleAt;
+  }
   if (hasLegacyNonSwingText(sanitized.modeText)) {
     sanitized.modeText = "利润循环";
   }
@@ -1817,21 +1820,17 @@ function mergeAutomationRuntimeState(previous = {}, incoming = {}) {
   if (!Object.keys(next).length) {
     return { ...prev };
   }
+  const nextAnalysis = next.analysis && typeof next.analysis === "object" ? next.analysis : null;
+  const nextPipeline = next.lastPipeline && typeof next.lastPipeline === "object" ? next.lastPipeline : null;
   return {
     ...prev,
     ...next,
-    analysis: {
-      ...(prev.analysis || {}),
-      ...(next.analysis || {}),
-    },
+    analysis: nextAnalysis ? { ...nextAnalysis } : { ...(prev.analysis || {}) },
     research: {
       ...(prev.research || {}),
       ...(next.research || {}),
     },
-    lastPipeline: {
-      ...(prev.lastPipeline || {}),
-      ...(next.lastPipeline || {}),
-    },
+    lastPipeline: nextPipeline ? { ...nextPipeline } : { ...(prev.lastPipeline || {}) },
     executionJournal: next.executionJournal || prev.executionJournal || null,
     markets: {
       ...(prev.markets || {}),
