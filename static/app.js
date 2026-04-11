@@ -799,8 +799,26 @@ function syncRailAutomationToggles() {
   });
 }
 
+function isAutomationActuallyRunning(automation = {}) {
+  const runtime = automation && typeof automation === "object" ? automation : {};
+  if (runtime.running) return true;
+  const statusText = String(runtime.statusText || "").trim();
+  if (/待机|未启动|已停止|已手动停止/.test(statusText)) return false;
+  const analysis = sanitizeAnalysisForSwingOnly(runtime.analysis || {});
+  const modeText = String(runtime.modeText || "").trim();
+  const scalpMode = Boolean(
+    String(analysis.selectedStrategyName || "").includes("利润循环")
+    || String(analysis.executionAbilityPhaseLabel || "").includes("直开")
+    || modeText.includes("利润循环")
+  );
+  if (!scalpMode) return false;
+  const lastCycleAt = String(runtime.lastCycleAt || "").trim();
+  const cycleMs = lastCycleAt ? Date.parse(lastCycleAt) : NaN;
+  return Number.isFinite(cycleMs) && (Date.now() - cycleMs) < 120000;
+}
+
 function syncRailStrategyButtons() {
-  const running = Boolean(dashboardState.automation?.running);
+  const running = isAutomationActuallyRunning(dashboardState.automation);
   const blocked = isLiveRouteBlocked();
   const start = $("rail-start-automation");
   const runOnce = $("rail-run-automation-once");
@@ -845,7 +863,7 @@ function renderRailStrategyControls() {
     $("swapInstId")?.value
   );
   const simulated = isSimulatedMode();
-  const running = Boolean(automation.running);
+  const running = isAutomationActuallyRunning(automation);
   const allowLiveTrading = Boolean($("autoAllowLiveTrading")?.checked);
   const allowLiveManualOrders = Boolean($("autoAllowLiveManualOrders")?.checked);
   const allowLiveAutostart = Boolean($("autoAllowLiveAutostart")?.checked);
@@ -1967,7 +1985,7 @@ function extractAutomationStopReason(statusText = "", lastError = "") {
 function deriveDeskModePresentation(automation = {}, modeText = "模拟盘") {
   const statusText = String(automation.statusText || "").trim();
   const modeDetail = String(automation.modeText || "").trim();
-  const running = Boolean(automation.running);
+  const running = isAutomationActuallyRunning(automation);
   const consecutiveErrors = Number(automation.consecutiveErrors || 0);
   const stopReason = extractAutomationStopReason(statusText, automation.lastError);
   const hasHardStop = !running && (
@@ -5554,6 +5572,9 @@ async function loadMinerConfig() {
 function renderAutomationState(state) {
   const mergedState = mergeAutomationRuntimeState(dashboardState.automation || {}, state || {});
   const sanitizedState = sanitizeAutomationStateForSwingOnly(mergedState);
+  if (isAutomationActuallyRunning(sanitizedState) && /待机|未启动|已停止|已手动停止/.test(String(sanitizedState.statusText || ""))) {
+    sanitizedState.statusText = "运行中";
+  }
   dashboardState.automation = sanitizedState;
   if (mergedState?.executionJournal) {
     dashboardState.orderJournal = mergedState.executionJournal;
@@ -5561,7 +5582,7 @@ function renderAutomationState(state) {
   }
   renderResearchState(sanitizedState?.research || {});
   renderAnalysisState(sanitizedState?.analysis || {}, sanitizedState);
-  const running = Boolean(sanitizedState?.running);
+  const running = isAutomationActuallyRunning(sanitizedState);
   $("bot-dot").style.background = running ? "var(--success)" : "#59636f";
   $("bot-status").textContent = sanitizedState?.statusText || "未启动";
   $("bot-mode").textContent = sanitizedState?.modeText || "等待配置";
