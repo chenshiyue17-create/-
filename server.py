@@ -10289,8 +10289,8 @@ class AutomationEngine:
         targets: list[dict[str, Any]],
     ) -> dict[str, Any]:
         watchlist_entries: list[dict[str, Any]] = []
-        enabled_spot = 0
-        enabled_swap = 0
+        enabled_spot = sum(1 for target in targets if target.get("spotEnabled"))
+        enabled_swap = sum(1 for target in targets if target.get("swapEnabled"))
         active_symbols = 0
         arb_runtime = {
             "watching": 0,
@@ -10301,62 +10301,88 @@ class AutomationEngine:
             "brokenPair": 0,
             "blocked": 0,
         }
-        for target in targets:
+
+        def run_target_cycle(target: dict[str, Any]) -> tuple[dict[str, Any], str, str]:
             spot_key = f"spot:{target['spotInstId']}"
             swap_key = f"swap:{target['swapInstId']}"
-            if str(target.get("strategyPreset") or "") == "basis_arb":
-                enabled_spot += 1
-                enabled_swap += 1
-                self._run_basis_arb_cycle(
-                    client,
-                    target,
-                    balance_snapshot,
-                    analysis_label,
-                    allow_new_entries,
-                    spot_key=spot_key,
-                    swap_key=swap_key,
-                )
-            else:
-                if target.get("spotEnabled"):
-                    enabled_spot += 1
-                    self._run_spot_cycle(
+            try:
+                if str(target.get("strategyPreset") or "") == "basis_arb":
+                    self._run_basis_arb_cycle(
                         client,
                         target,
                         balance_snapshot,
-                        allow_new_entries,
                         analysis_label,
-                        market_key=spot_key,
+                        allow_new_entries,
+                        spot_key=spot_key,
+                        swap_key=swap_key,
                     )
                 else:
-                    self._set_market(
-                        spot_key,
-                        {
-                            "enabled": False,
-                            "instId": target.get("spotInstId", ""),
-                            "lastMessage": "现货策略未启用",
-                        },
-                    )
+                    if target.get("spotEnabled"):
+                        self._run_spot_cycle(
+                            client,
+                            target,
+                            balance_snapshot,
+                            allow_new_entries,
+                            analysis_label,
+                            market_key=spot_key,
+                        )
+                    else:
+                        self._set_market(
+                            spot_key,
+                            {
+                                "enabled": False,
+                                "instId": target.get("spotInstId", ""),
+                                "lastMessage": "现货策略未启用",
+                            },
+                        )
 
-                if target.get("swapEnabled"):
-                    enabled_swap += 1
-                    self._run_swap_cycle(
-                        client,
-                        target,
-                        allow_new_entries,
-                        analysis_label,
-                        market_key=swap_key,
-                    )
-                else:
-                    self._set_market(
-                        swap_key,
-                        {
-                            "enabled": False,
-                            "instId": target.get("swapInstId", ""),
-                            "lastMessage": "永续策略未启用",
-                        },
-                    )
+                    if target.get("swapEnabled"):
+                        self._run_swap_cycle(
+                            client,
+                            target,
+                            allow_new_entries,
+                            analysis_label,
+                            market_key=swap_key,
+                        )
+                    else:
+                        self._set_market(
+                            swap_key,
+                            {
+                                "enabled": False,
+                                "instId": target.get("swapInstId", ""),
+                                "lastMessage": "永续策略未启用",
+                            },
+                        )
+            except Exception as exc:
+                self._log("error", f"{target.get('watchlistSymbol') or target.get('swapInstId')}: 执行失败: {exc}")
+                self._set_market(
+                    swap_key,
+                    {
+                        "enabled": bool(target.get("swapEnabled")),
+                        "instId": target.get("swapInstId", ""),
+                        "lastMessage": f"执行失败: {exc}",
+                    },
+                )
+                self._set_market(
+                    spot_key,
+                    {
+                        "enabled": bool(target.get("spotEnabled")),
+                        "instId": target.get("spotInstId", ""),
+                        "lastMessage": f"执行失败: {exc}",
+                    },
+                )
+            return target, spot_key, swap_key
 
-            current_state = self.snapshot()
+        if len(targets) <= 1:
+            executed_targets = [run_target_cycle(target) for target in targets]
+        else:
+            max_workers = max(1, min(len(targets), DIP_SWING_EXECUTION_TARGET_LIMIT))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_map = {executor.submit(run_target_cycle, target): target for target in targets}
+                executed_targets = [future.result() for future in concurrent.futures.as_completed(future_map)]
+
+        current_state = self.snapshot()
+        for target, spot_key, swap_key in executed_targets:
             spot_market = copy.deepcopy(current_state.get("markets", {}).get(spot_key) or default_market_state())
             swap_market = copy.deepcopy(current_state.get("markets", {}).get(swap_key) or default_market_state())
             entry = build_watchlist_entry(
