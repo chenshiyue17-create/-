@@ -7722,6 +7722,10 @@ def build_dip_swing_analysis(
     loop_metrics = copy.deepcopy(selected_snapshot.get("profitLoop") or {})
     planned_side = str(loop_metrics.get("plannedSide") or "buy")
     planned_side_label = str(loop_metrics.get("plannedSideLabel") or profit_loop_trade_side_label(planned_side))
+    holding_same_direction = (
+        (position_side == "long" and planned_side == "buy")
+        or (position_side == "short" and planned_side == "sell")
+    )
     predicted_move_pct = safe_decimal(loop_metrics.get("predictedMovePct"), "0")
     predicted_net_pct = safe_decimal(loop_metrics.get("predictedNetPct"), "0")
     loop_quality_score = safe_decimal(loop_metrics.get("loopQualityScore"), "0")
@@ -7861,13 +7865,18 @@ def build_dip_swing_analysis(
     if market_scan_errors:
         warnings.append(f"扩展扫描跳过 {len(market_scan_errors)} 币")
 
-    allow_new_entries = position_side == "flat" and not blockers
+    allow_new_entries = not blockers
     if blockers:
         decision = "skip"
         decision_label = "先收缩风险"
     elif position_side in {"long", "short"}:
         decision = "manage"
-        decision_label = "这单已达净利，准备平仓" if net_close_pnl >= DIP_SWING_NET_TARGET_USDT else "盯这单净利 1U 平仓"
+        if net_close_pnl >= DIP_SWING_NET_TARGET_USDT:
+            decision_label = "这单已达净利，准备平仓"
+        elif allow_new_entries and holding_same_direction:
+            decision_label = "持仓中继续循环"
+        else:
+            decision_label = "持仓中观察平仓"
     elif allow_new_entries:
         decision = "execute"
         decision_label = "持续开仓"
@@ -7900,6 +7909,8 @@ def build_dip_swing_analysis(
         summary_bits.append(blockers[0])
     elif position_side in {"long", "short"}:
         summary_bits.append(f"当前这单净结果估算 {format_decimal(net_close_pnl, 2)}U，达到 {format_decimal(DIP_SWING_NET_TARGET_USDT, 0)}U 就平")
+        if allow_new_entries and holding_same_direction:
+            summary_bits.append("同方向持仓不中断，继续循环开仓")
     elif allow_new_entries:
         summary_bits.append("空仓即开，保持 24 小时循环")
     else:
@@ -10958,6 +10969,10 @@ class AutomationEngine:
             position_side = "long"
         elif pos_value < 0:
             position_side = "short"
+        holding_same_direction = (
+            (position_side == "long" and desired_side == "buy")
+            or (position_side == "short" and desired_side == "sell")
+        )
         pending_entry_orders = self._working_swap_orders(inst_id, side="buy", reduce_only=False)
         pending_entry_orders += self._working_swap_orders(inst_id, side="sell", reduce_only=False)
         pending_exit_orders = self._working_swap_orders(inst_id, side="sell", reduce_only=True)
@@ -11066,9 +11081,32 @@ class AutomationEngine:
         )
 
         if position_side in {"long", "short"}:
-            if pending_entry_orders:
-                self._cancel_swap_orders(client, inst_id, pending_entry_orders, "已有持仓，撤掉未成交开仓单", market_key=market_key)
+            stale_entry_orders = [
+                order for order in pending_entry_orders
+                if self._order_age_seconds(order) >= DIP_SWING_ENTRY_ORDER_MAX_AGE_SECONDS
+            ]
+            wrong_side_entry_orders = [
+                order for order in pending_entry_orders
+                if str(order.get("side") or "").lower() != desired_side
+            ]
+            if wrong_side_entry_orders or not holding_same_direction:
+                self._cancel_swap_orders(client, inst_id, pending_entry_orders, "持仓方向变化，撤掉旧开仓单", market_key=market_key)
                 pending_entry_orders = []
+            elif stale_entry_orders:
+                self._cancel_swap_orders(client, inst_id, stale_entry_orders, "同向挂单超时，准备重挂", market_key=market_key)
+                pending_entry_orders = [order for order in pending_entry_orders if order not in stale_entry_orders]
+            elif pending_entry_orders:
+                oldest_age = max(self._order_age_seconds(order) for order in pending_entry_orders)
+                self._set_market(
+                    market_key,
+                    {
+                        "lastMessage": (
+                            f"{ONLY_STRATEGY_LABEL}同向持仓继续挂单中 · 已挂 {len(pending_entry_orders)} 笔 / {int(oldest_age)} 秒"
+                            f" · {status_text}"
+                        )
+                    },
+                )
+                return
             if liq_buffer > 0 and liq_buffer <= DIP_SWING_MIN_LIQ_BUFFER_PCT:
                 if pending_exit_orders:
                     self._cancel_swap_orders(client, inst_id, pending_exit_orders, "强平缓冲不足，撤掉旧平仓单后紧急退出", market_key=market_key)
@@ -11116,6 +11154,27 @@ class AutomationEngine:
                 return
             if pending_exit_orders:
                 self._cancel_swap_orders(client, inst_id, pending_exit_orders, "这单净利目标未到，撤掉旧平仓单继续持有", market_key=market_key)
+            if allow_new_entries and holding_same_direction and trade_contracts > 0:
+                cooldown_ready, reason = self._cooldown_ready(market_key, int(automation["cooldownSeconds"]))
+                if not cooldown_ready:
+                    self._set_market(
+                        market_key,
+                        {
+                            "lastMessage": f"{ONLY_STRATEGY_LABEL}同方向持仓继续循环，但{reason} · {status_text}",
+                        },
+                    )
+                    return
+                self._place_swap_order(
+                    client,
+                    inst_id,
+                    desired_side,
+                    trade_contracts,
+                    automation["swapTdMode"],
+                    f"{ONLY_STRATEGY_LABEL}同向加仓循环 · {desired_side_label} · 动态仓位 {decimal_to_str(trade_contracts)} 张",
+                    passive_entry=True,
+                    market_key=market_key,
+                )
+                return
             self._set_market(
                 market_key,
                 {
