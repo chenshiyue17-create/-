@@ -7747,11 +7747,11 @@ def build_dip_swing_analysis(
         )[:3]
     ]
 
-    selected_config = deep_merge({}, selected_target)
-    selected_config["watchlistSymbols"] = selected_symbol
-    selected_config["watchlistOverrides"] = {}
-    selected_config["spotInstId"] = selected_target.get("spotInstId")
-    selected_config["swapInstId"] = selected_target.get("swapInstId")
+    selected_config = deep_merge({}, automation)
+    selected_config["watchlistSymbols"] = automation.get("watchlistSymbols", selected_symbol)
+    selected_config["watchlistOverrides"] = copy.deepcopy(automation.get("watchlistOverrides") or {})
+    selected_config["spotInstId"] = automation.get("spotInstId", selected_target.get("spotInstId"))
+    selected_config["swapInstId"] = automation.get("swapInstId", selected_target.get("swapInstId"))
     live_fee_rates = cache_okx_swap_fee_rates(client, str(selected_target.get("swapInstId") or ""))
     maker_fee_pct = safe_decimal(live_fee_rates.get("makerFeePct"), decimal_to_str(OKX_DEFAULT_SWAP_MAKER_FEE_PCT))
     taker_fee_pct = safe_decimal(live_fee_rates.get("takerFeePct"), decimal_to_str(OKX_DEFAULT_SWAP_TAKER_FEE_PCT))
