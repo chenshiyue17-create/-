@@ -2109,6 +2109,7 @@ function renderDeskOverview() {
   );
   const paperEquityMode = journalUsesPaperEquity(executionJournal, dashboardState.recentOrdersAll || [])
     || journalUsesPaperEquity(dashboardState.orderJournal || {}, dashboardState.recentOrdersAll || []);
+  const sessionEquityMode = currentEq > 0 && startEq > 0;
   const journalMetrics = getJournalSummaryMetrics(executionJournal);
   const realizedNet = Number(journalMetrics.realizedPnl ?? 0);
   const feeNet = Number(journalMetrics.totalFees ?? 0);
@@ -2134,8 +2135,10 @@ function renderDeskOverview() {
   const displayPnlAmount = hasSessionPnl
     ? pnlAmount
     : (Number.isFinite(cache.pnlAmount) ? cache.pnlAmount : null);
-  const preferredTotalEq = paperEquityMode && currentEq > 0 ? currentEq : totalEq;
-  const balanceGoalBase = startEq > 0 ? startEq : preferredTotalEq;
+  const preferredTotalEq = sessionEquityMode
+    ? currentEq
+    : (paperEquityMode && currentEq > 0 ? currentEq : totalEq);
+  const balanceGoalBase = sessionEquityMode ? startEq : (startEq > 0 ? startEq : preferredTotalEq);
   const balanceTargetEq = stateTargetEq > 0 ? stateTargetEq : (balanceGoalBase > 0 ? balanceGoalBase * 10 : 0);
   const balanceTargetProgressPct = stateTargetEq > 0
     ? stateTargetProgressPct
@@ -2165,7 +2168,9 @@ function renderDeskOverview() {
 
   $("desk-total-equity").textContent = displayTotalEq > 0 ? `${formatMoney(displayTotalEq)} USDT` : "--";
   $("desk-total-equity-sub").textContent =
-    paperEquityMode
+    sessionEquityMode
+      ? `会话权益 ${formatMoney(displayTotalEq || 0)} USDT · 余额与订单统一口径`
+      : paperEquityMode
       ? `纸面权益 ${formatMoney(displayTotalEq || 0)} USDT · 订单与余额统一口径`
       : (balanceBreakdown || (summary.adjEq ? `调整后权益 ${formatMoney(summary.adjEq)} USDT` : "等待账户快照"));
 
@@ -2268,7 +2273,9 @@ function renderDeskOverview() {
     railBalanceMain.textContent = formatMoney(displayTotalEq || 0);
   }
   if (railBalanceSub) {
-    railBalanceSub.textContent = paperEquityMode
+    railBalanceSub.textContent = sessionEquityMode
+      ? `会话账本 · ${formatMoney(displayTotalEq || 0)} USDT`
+      : paperEquityMode
       ? `纸面账本 · ${formatMoney(displayTotalEq || 0)} USDT`
       : (balanceBreakdown || (displayTotalEq > 0
         ? `USDT · 调整后 ${formatMoney(Number(summary.adjEq || displayTotalEq))}`
