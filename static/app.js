@@ -261,6 +261,20 @@ function getJournalSummaryMetrics(journal = {}) {
   };
 }
 
+function journalUsesPaperEquity(journal = {}) {
+  const source = journal && typeof journal === "object" ? journal : {};
+  const orders = Array.isArray(source.orders) ? source.orders : [];
+  if (orders.some((order) => {
+    const tag = String(order?.tag || "").trim().toLowerCase();
+    const ordId = String(order?.ordId || "").trim().toLowerCase();
+    return tag === "paper-sim" || ordId.startsWith("paper-");
+  })) {
+    return true;
+  }
+  const lastSource = String(source.lastSource || source.summary?.lastSource || "").trim().toLowerCase();
+  return lastSource.includes("paper");
+}
+
 function journalLooksStale(metrics, analysisNetResult, sessionPnlAmount) {
   if (!metrics?.hasData) return false;
   const net = metrics.netPnl;
@@ -2082,13 +2096,8 @@ function renderDeskOverview() {
     || (fundingTotalEq > 0
       ? `资金账户 ${formatMoney(fundingTotalEq)} USDT · 交易账户 ${formatMoney(tradingTotalEq)} USDT`
       : (tradingTotalEq > 0 ? `交易账户 ${formatMoney(tradingTotalEq)} USDT` : ""));
-  const balanceGoalBase = startEq > 0 ? startEq : totalEq;
   const stateTargetEq = Number(automation.targetBalanceEq || 0);
   const stateTargetProgressPct = Number(automation.targetBalanceProgressPct || 0);
-  const balanceTargetEq = stateTargetEq > 0 ? stateTargetEq : (balanceGoalBase > 0 ? balanceGoalBase * 10 : 0);
-  const balanceTargetProgressPct = stateTargetEq > 0
-    ? stateTargetProgressPct
-    : (balanceTargetEq > 0 ? (totalEq / balanceTargetEq) * 100 : 0);
   const analysis = automation.analysis || {};
   const executionJournal = selectBestExecutionJournal(
     automation.executionJournal || {},
@@ -2096,6 +2105,8 @@ function renderDeskOverview() {
     extractAbilityNetPnl(analysis),
     pnlAmount
   );
+  const paperEquityMode = journalUsesPaperEquity(executionJournal)
+    || journalUsesPaperEquity(dashboardState.orderJournal || {});
   const journalMetrics = getJournalSummaryMetrics(executionJournal);
   const realizedNet = Number(journalMetrics.realizedPnl ?? 0);
   const feeNet = Number(journalMetrics.totalFees ?? 0);
@@ -2121,8 +2132,14 @@ function renderDeskOverview() {
   const displayPnlAmount = hasSessionPnl
     ? pnlAmount
     : (Number.isFinite(cache.pnlAmount) ? cache.pnlAmount : null);
-  const displayTotalEq = totalEq > 0
-    ? totalEq
+  const preferredTotalEq = paperEquityMode && currentEq > 0 ? currentEq : totalEq;
+  const balanceGoalBase = startEq > 0 ? startEq : preferredTotalEq;
+  const balanceTargetEq = stateTargetEq > 0 ? stateTargetEq : (balanceGoalBase > 0 ? balanceGoalBase * 10 : 0);
+  const balanceTargetProgressPct = stateTargetEq > 0
+    ? stateTargetProgressPct
+    : (balanceTargetEq > 0 ? (preferredTotalEq / balanceTargetEq) * 100 : 0);
+  const displayTotalEq = preferredTotalEq > 0
+    ? preferredTotalEq
     : (Number.isFinite(cache.totalEq) ? cache.totalEq : 0);
   const displayNetResult = Number.isFinite(effectiveNetResult)
     ? effectiveNetResult
@@ -2133,11 +2150,11 @@ function renderDeskOverview() {
   const displayFeeNet = netResultReady
     ? feeNet
     : (Number.isFinite(cache.feeNet) ? cache.feeNet : 0);
-  if (hasSessionPnl || Number.isFinite(effectiveNetResult) || totalEq > 0) {
+  if (hasSessionPnl || Number.isFinite(effectiveNetResult) || preferredTotalEq > 0) {
     dashboardState.equityDisplayCache = {
       pnlPct: hasSessionPnl ? pnlPct : cache.pnlPct,
       pnlAmount: hasSessionPnl ? pnlAmount : cache.pnlAmount,
-      totalEq: totalEq > 0 ? totalEq : cache.totalEq,
+      totalEq: preferredTotalEq > 0 ? preferredTotalEq : cache.totalEq,
       netResult: Number.isFinite(effectiveNetResult) ? effectiveNetResult : cache.netResult,
       realizedNet: netResultReady ? realizedNet : cache.realizedNet,
       feeNet: netResultReady ? feeNet : cache.feeNet,
@@ -2146,7 +2163,9 @@ function renderDeskOverview() {
 
   $("desk-total-equity").textContent = displayTotalEq > 0 ? `${formatMoney(displayTotalEq)} USDT` : "--";
   $("desk-total-equity-sub").textContent =
-    balanceBreakdown || (summary.adjEq ? `调整后权益 ${formatMoney(summary.adjEq)} USDT` : "等待账户快照");
+    paperEquityMode
+      ? `纸面权益 ${formatMoney(displayTotalEq || 0)} USDT · 订单与余额统一口径`
+      : (balanceBreakdown || (summary.adjEq ? `调整后权益 ${formatMoney(summary.adjEq)} USDT` : "等待账户快照"));
 
   $("desk-session-pnl").textContent =
     Number.isFinite(displayPnlPct) ? `${formatPercentValue(displayPnlPct)}` : "--";
@@ -2244,12 +2263,14 @@ function renderDeskOverview() {
       : `${formatMoney(minerDailyUsd || 0)} USDT/天 · ${minerProgress.hashrateText || "0 H/s"}`;
 
   if (railBalanceMain) {
-    railBalanceMain.textContent = formatMoney(totalEq || 0);
+    railBalanceMain.textContent = formatMoney(displayTotalEq || 0);
   }
   if (railBalanceSub) {
-    railBalanceSub.textContent = balanceBreakdown || (totalEq > 0
-      ? `USDT · 调整后 ${formatMoney(Number(summary.adjEq || totalEq))}`
-      : "USDT");
+    railBalanceSub.textContent = paperEquityMode
+      ? `纸面账本 · ${formatMoney(displayTotalEq || 0)} USDT`
+      : (balanceBreakdown || (displayTotalEq > 0
+        ? `USDT · 调整后 ${formatMoney(Number(summary.adjEq || displayTotalEq))}`
+        : "USDT"));
   }
   if (railBalanceTarget) {
     railBalanceTarget.textContent = balanceTargetEq > 0
