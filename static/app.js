@@ -238,6 +238,58 @@ function extractAbilityNetPnl(analysis = {}) {
   return Number.isFinite(parsed) ? parsed : NaN;
 }
 
+function getJournalSummaryMetrics(journal = {}) {
+  const source = journal && typeof journal === "object" ? journal : {};
+  const summary = source.summary && typeof source.summary === "object" ? source.summary : source;
+  const netPnl = Number(summary.netPnl ?? NaN);
+  const realizedPnl = Number(summary.realizedPnl ?? NaN);
+  const totalFees = Number(summary.totalFees ?? NaN);
+  const totalOrders = Number(summary.totalOrders ?? source.totalOrders ?? (Array.isArray(source.orders) ? source.orders.length : 0) ?? 0);
+  const lastReconciledAt = Date.parse(source.lastReconciledAt || summary.lastReconciledAt || "") || 0;
+  return {
+    raw: source,
+    summary,
+    netPnl,
+    realizedPnl,
+    totalFees,
+    totalOrders,
+    lastReconciledAt,
+    hasData: Number.isFinite(netPnl)
+      || Number.isFinite(realizedPnl)
+      || Number.isFinite(totalFees)
+      || totalOrders > 0,
+  };
+}
+
+function journalLooksStale(metrics, analysisNetResult, sessionPnlAmount) {
+  if (!metrics?.hasData) return false;
+  const net = metrics.netPnl;
+  if (!Number.isFinite(net)) return false;
+  let staleVotes = 0;
+  if (Number.isFinite(analysisNetResult)) {
+    const analysisGap = Math.abs(net - analysisNetResult);
+    if (analysisGap > Math.max(300, Math.abs(analysisNetResult) * 3 + 120)) staleVotes += 1;
+  }
+  if (Number.isFinite(sessionPnlAmount)) {
+    const sessionGap = Math.abs(net - sessionPnlAmount);
+    if (sessionGap > Math.max(600, Math.abs(sessionPnlAmount) * 2.5 + 200)) staleVotes += 1;
+  }
+  return staleVotes > 0;
+}
+
+function selectBestExecutionJournal(primaryJournal, fallbackJournal, analysisNetResult, sessionPnlAmount) {
+  const primary = getJournalSummaryMetrics(primaryJournal || {});
+  const fallback = getJournalSummaryMetrics(fallbackJournal || {});
+  if (!primary.hasData) return fallback.raw || primary.raw || {};
+  if (!fallback.hasData) return primary.raw || fallback.raw || {};
+  const primaryStale = journalLooksStale(primary, analysisNetResult, sessionPnlAmount);
+  const fallbackStale = journalLooksStale(fallback, analysisNetResult, sessionPnlAmount);
+  if (primaryStale && !fallbackStale) return fallback.raw;
+  if (fallbackStale && !primaryStale) return primary.raw;
+  if (fallback.lastReconciledAt && fallback.lastReconciledAt > primary.lastReconciledAt) return fallback.raw;
+  return primary.raw;
+}
+
 function formatStrategyMode(mode) {
   if (mode === "short_only") return "只做空";
   if (mode === "trend_follow") return "顺势双向";
@@ -1966,16 +2018,22 @@ function renderDeskOverview() {
   const balanceTargetProgressPct = stateTargetEq > 0
     ? stateTargetProgressPct
     : (balanceTargetEq > 0 ? (totalEq / balanceTargetEq) * 100 : 0);
-  const executionJournal = automation.executionJournal || dashboardState.orderJournal || {};
   const analysis = automation.analysis || {};
-  const realizedNet = Number(executionJournal.realizedPnl ?? 0);
-  const feeNet = Number(executionJournal.totalFees ?? 0);
-  const netResult = Number(executionJournal.netPnl ?? (realizedNet + feeNet));
+  const executionJournal = selectBestExecutionJournal(
+    automation.executionJournal || {},
+    dashboardState.orderJournal || {},
+    extractAbilityNetPnl(analysis),
+    pnlAmount
+  );
+  const journalMetrics = getJournalSummaryMetrics(executionJournal);
+  const realizedNet = Number(journalMetrics.realizedPnl ?? 0);
+  const feeNet = Number(journalMetrics.totalFees ?? 0);
+  const netResult = Number(journalMetrics.netPnl ?? (realizedNet + feeNet));
   const netResultReady = Number.isFinite(netResult) && (
     Math.abs(netResult) > 1e-9
     || Math.abs(realizedNet) > 1e-9
     || Math.abs(feeNet) > 1e-9
-    || Number(executionJournal.totalOrders || 0) > 0
+    || Number(journalMetrics.totalOrders || 0) > 0
   );
   const analysisNetResult = extractAbilityNetPnl(analysis);
   const analysisNetReady = Number.isFinite(analysisNetResult)

@@ -3021,8 +3021,7 @@ def backfill_paper_execution_metrics(orders: list[dict[str, Any]]) -> list[dict[
         if "fee" not in row or safe_decimal(row.get("fee"), "0") == 0:
             row["fee"] = decimal_to_str(fee)
         row["fillFee"] = decimal_to_str(fee)
-        if "pnl" not in row or safe_decimal(row.get("pnl"), "0") == 0:
-            row["pnl"] = decimal_to_str(realized)
+        row["pnl"] = decimal_to_str(realized)
         row["fillPnl"] = decimal_to_str(realized)
         row["realizedPnl"] = decimal_to_str(realized)
         enriched_by_key[key] = row
@@ -12004,6 +12003,9 @@ class AppHandler(BaseHTTPRequestHandler):
                             remote_automation,
                             CONFIG.current(),
                         )
+                        local_journal = get_execution_journal_snapshot(limit=80)
+                        if (local_journal.get("orders") or local_journal.get("summary")):
+                            payload["state"]["executionJournal"] = local_journal
                     json_response(self, payload, status=response.status_code)
                 elif path == "/api/orders/recent":
                     limit = parse_recent_order_limit(query)
