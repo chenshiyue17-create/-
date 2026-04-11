@@ -2936,15 +2936,15 @@ def backfill_paper_execution_metrics(orders: list[dict[str, Any]]) -> list[dict[
         position_side = str(state.get("positionSide") or "flat")
         position_size = safe_decimal(state.get("positionSize"), "0")
         entry_price = safe_decimal(state.get("entryPrice"), "0")
-        realized = order_realized_pnl(row)
+        realized = Decimal("0")
         fee = order_total_fee(row)
         if inst_type == "SWAP":
             ct_val = safe_decimal(row.get("contractValue"), decimal_to_str(default_swap_contract_value(inst_id)))
             if fee == 0:
                 fee = -(fill_size * ct_val * fill_px * PAPER_SWAP_FEE_RATE)
             if side == "buy":
-                row.setdefault("tradeSubType", "6" if position_side == "short" and position_size > 0 else "3")
-                if realized == 0 and position_side == "short" and position_size > 0:
+                row["tradeSubType"] = "6" if position_side == "short" and position_size > 0 else "3"
+                if position_side == "short" and position_size > 0:
                     close_size = min(position_size, fill_size)
                     realized = (entry_price - fill_px) * close_size * ct_val
                 if position_side == "short":
@@ -2970,8 +2970,8 @@ def backfill_paper_execution_metrics(orders: list[dict[str, Any]]) -> list[dict[
                     else:
                         state["entryPrice"] = fill_px
             else:
-                row.setdefault("tradeSubType", "5" if position_side == "long" and position_size > 0 else "4")
-                if realized == 0 and position_side == "long" and position_size > 0:
+                row["tradeSubType"] = "5" if position_side == "long" and position_size > 0 else "4"
+                if position_side == "long" and position_size > 0:
                     close_size = min(position_size, fill_size)
                     realized = (fill_px - entry_price) * close_size * ct_val
                 if position_side == "long":
@@ -2999,7 +2999,7 @@ def backfill_paper_execution_metrics(orders: list[dict[str, Any]]) -> list[dict[
         else:
             if fee == 0:
                 fee = -(fill_size * fill_px * PAPER_SPOT_FEE_RATE)
-            row.setdefault("tradeSubType", "1" if side == "buy" else "2")
+            row["tradeSubType"] = "1" if side == "buy" else "2"
             if side == "buy":
                 next_size = position_size + fill_size
                 if next_size > 0:
@@ -3011,7 +3011,7 @@ def backfill_paper_execution_metrics(orders: list[dict[str, Any]]) -> list[dict[
                 state["positionSide"] = "flat" if next_size <= 0 else "long"
             else:
                 close_size = min(position_size, fill_size)
-                if realized == 0 and position_size > 0 and entry_price > 0:
+                if position_size > 0 and entry_price > 0:
                     realized = (fill_px - entry_price) * close_size
                 remaining = max(Decimal("0"), position_size - close_size)
                 state["positionSize"] = remaining
@@ -3475,6 +3475,23 @@ def paper_swap_unrealized_pnl(market: dict[str, Any] | None) -> Decimal:
     return direction * (last_price - entry_price) * position_size * ct_val
 
 
+def paper_swap_market_key(inst_id: str) -> str:
+    return f"swap:{str(inst_id or '').strip()}"
+
+
+def iter_paper_swap_markets(markets: dict[str, Any] | None) -> list[dict[str, Any]]:
+    source = markets or {}
+    specific_rows = [
+        copy.deepcopy(value)
+        for key, value in source.items()
+        if str(key).startswith("swap:") and isinstance(value, dict)
+    ]
+    if specific_rows:
+        return specific_rows
+    generic = source.get("swap")
+    return [copy.deepcopy(generic)] if isinstance(generic, dict) and generic else []
+
+
 DEFAULT_RECENT_ORDER_LIMIT = 80
 MAX_RECENT_ORDER_LIMIT = 200
 
@@ -3756,8 +3773,11 @@ class OkxClient:
         state = self._paper_state()
         automation = AUTOMATION_CONFIG.current()
         spot_market = (state.get("markets") or {}).get("spot") or {}
-        swap_market = (state.get("markets") or {}).get("swap") or {}
-        total_eq = self._paper_total_eq() + paper_swap_unrealized_pnl(swap_market)
+        swap_markets = iter_paper_swap_markets((state.get("markets") or {}))
+        total_eq = self._paper_total_eq() + sum(
+            (paper_swap_unrealized_pnl(item) for item in swap_markets),
+            Decimal("0"),
+        )
         spot_inst = str(automation.get("spotInstId") or "BTC-USDT")
         base_ccy = spot_inst.split("-")[0]
         base_size = safe_decimal(spot_market.get("positionSize"), "0")
@@ -3797,20 +3817,34 @@ class OkxClient:
 
     def _paper_positions(self, inst_id: str | None = None) -> dict[str, Any]:
         state = self._paper_state()
-        swap_market = (state.get("markets") or {}).get("swap") or {}
-        position_side = str(swap_market.get("positionSide") or "flat")
-        position_size = safe_decimal(swap_market.get("positionSize"), "0")
-        if position_side == "flat" or position_size <= 0:
-            return {"code": "0", "data": []}
-        signed_pos = position_size if position_side == "long" else -position_size
-        payload = {
-            "instId": inst_id or swap_market.get("instId") or AUTOMATION_CONFIG.current().get("swapInstId") or "",
-            "pos": decimal_to_str(signed_pos),
-            "avgPx": str(swap_market.get("entryPrice") or ""),
-            "posSide": "net",
-            "upl": decimal_to_str(paper_swap_unrealized_pnl(swap_market)),
-        }
-        return {"code": "0", "data": [payload]}
+        markets = (state.get("markets") or {})
+        candidate_markets: list[dict[str, Any]]
+        if inst_id:
+            specific = markets.get(paper_swap_market_key(inst_id))
+            if isinstance(specific, dict) and specific:
+                candidate_markets = [specific]
+            else:
+                generic = markets.get("swap") or {}
+                candidate_markets = [generic] if str(generic.get("instId") or "") == str(inst_id) else []
+        else:
+            candidate_markets = iter_paper_swap_markets(markets)
+        rows: list[dict[str, Any]] = []
+        for swap_market in candidate_markets:
+            position_side = str(swap_market.get("positionSide") or "flat")
+            position_size = safe_decimal(swap_market.get("positionSize"), "0")
+            if position_side == "flat" or position_size <= 0:
+                continue
+            signed_pos = position_size if position_side == "long" else -position_size
+            rows.append(
+                {
+                    "instId": str(swap_market.get("instId") or inst_id or AUTOMATION_CONFIG.current().get("swapInstId") or ""),
+                    "pos": decimal_to_str(signed_pos),
+                    "avgPx": str(swap_market.get("entryPrice") or ""),
+                    "posSide": "net",
+                    "upl": decimal_to_str(paper_swap_unrealized_pnl(swap_market)),
+                }
+            )
+        return {"code": "0", "data": rows}
 
     def _paper_recent_orders(self) -> dict[str, Any]:
         return {"code": "0", "data": get_local_recent_orders(limit=20)}
@@ -3839,7 +3873,12 @@ class OkxClient:
 
         if is_swap:
             market_key = "swap"
-            current = copy.deepcopy(markets.get("swap") or default_market_state())
+            inst_market_key = paper_swap_market_key(inst_id)
+            current = copy.deepcopy(markets.get(inst_market_key) or default_market_state())
+            if not current.get("instId"):
+                generic_current = markets.get("swap") or {}
+                if str(generic_current.get("instId") or "") == inst_id:
+                    current = copy.deepcopy(generic_current)
             current_side = str(current.get("positionSide") or "flat")
             current_size = safe_decimal(current.get("positionSize"), "0")
             current_entry = safe_decimal(current.get("entryPrice"), "0")
@@ -3904,23 +3943,23 @@ class OkxClient:
 
             def mutate(current_state: dict[str, Any]) -> None:
                 market = current_state["markets"].setdefault(market_key, default_market_state())
-                market.update(
-                    {
-                        "enabled": True,
-                        "instId": inst_id,
-                        "positionSide": next_side,
-                        "positionSize": decimal_to_str(next_size),
-                        "positionNotional": decimal_to_str(next_size * fill_px * ct_val),
-                        "entryPrice": "" if next_side == "flat" else decimal_to_str(next_entry),
-                        "lastPrice": decimal_to_str(fill_px),
-                        "floatingPnl": "0",
-                        "floatingPnlPct": "0",
-                        "lastTradeAt": now_local_iso(),
-                        "lastActionAt": now_local_iso(),
-                        "lastOrderId": ord_id,
-                        "contractValue": decimal_to_str(ct_val),
-                    }
-                )
+                patch = {
+                    "enabled": True,
+                    "instId": inst_id,
+                    "positionSide": next_side,
+                    "positionSize": decimal_to_str(next_size),
+                    "positionNotional": decimal_to_str(next_size * fill_px * ct_val),
+                    "entryPrice": "" if next_side == "flat" else decimal_to_str(next_entry),
+                    "lastPrice": decimal_to_str(fill_px),
+                    "floatingPnl": "0",
+                    "floatingPnlPct": "0",
+                    "lastTradeAt": now_local_iso(),
+                    "lastActionAt": now_local_iso(),
+                    "lastOrderId": ord_id,
+                    "contractValue": decimal_to_str(ct_val),
+                }
+                market.update(patch)
+                current_state["markets"].setdefault(inst_market_key, default_market_state()).update(copy.deepcopy(patch))
                 if not current_state.get("sessionStartEq"):
                     current_state["sessionStartEq"] = decimal_to_str(current_eq_before)
                 current_state["currentEq"] = decimal_to_str(current_eq_after)
