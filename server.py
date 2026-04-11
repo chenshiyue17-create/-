@@ -1649,6 +1649,9 @@ def build_target_execution_ability_snapshot(
     current_eq = safe_decimal(session_state.get("currentEq"), "0")
     max_eq = safe_decimal(session_state.get("maxObservedEq"), "0")
     close_orders = int(summary.get("closeOrders") or 0)
+    winning_close_orders = int(summary.get("winningCloseOrders") or 0)
+    losing_close_orders = int(summary.get("losingCloseOrders") or 0)
+    breakeven_close_orders = int(summary.get("breakevenCloseOrders") or 0)
     close_win_rate_pct = safe_decimal(summary.get("closeWinRatePct"), "0")
     realized_pnl = safe_decimal(summary.get("realizedPnl"), "0")
     total_fees = safe_decimal(summary.get("totalFees"), "0")
@@ -1666,62 +1669,31 @@ def build_target_execution_ability_snapshot(
     if max_eq > 0 and current_eq < max_eq:
         setback_pct = ((max_eq - current_eq) / max_eq) * Decimal("100")
 
-    phase = "protect"
-    if (
-        close_orders >= 12
-        and close_win_rate_pct >= Decimal("62")
-        and net_pnl > 0
-        and current_eq >= start_eq
-        and setback_pct < Decimal("0.35")
-    ):
+    score = Decimal(winning_close_orders - losing_close_orders)
+    phase = "fixed"
+    if close_orders <= 0:
+        phase = "fixed"
+    elif score >= Decimal("6"):
         phase = "attack"
-    elif (
-        close_orders >= 6
-        and close_win_rate_pct >= Decimal("55")
-        and net_pnl > 0
-        and current_eq >= start_eq
-        and setback_pct < Decimal("0.60")
-    ):
+    elif score >= Decimal("3"):
         phase = "advance"
-    elif close_orders >= 3 and close_win_rate_pct >= Decimal("50") and net_pnl > 0 and current_eq >= start_eq:
+    elif score >= Decimal("1"):
         phase = "compound"
-
-    if (
-        progress_pct >= Decimal("80")
-        or current_eq <= 0
-        or current_eq < start_eq
-        or net_pnl <= 0
-        or close_orders < 3
-        or close_win_rate_pct < Decimal("50")
-        or setback_pct >= Decimal("1.20")
-    ):
+    else:
         phase = "protect"
-
-    score = Decimal("28")
-    if phase == "compound":
-        score = Decimal("55")
-    elif phase == "advance":
-        score = Decimal("72")
-    elif phase == "attack":
-        score = Decimal("88")
-    if close_orders > 0:
-        score += min(Decimal("6"), Decimal(close_orders) * Decimal("0.5"))
-        score += max(Decimal("-8"), min(Decimal("8"), (close_win_rate_pct - Decimal("50")) / Decimal("2")))
-    if session_return_pct > 0:
-        score += min(Decimal("6"), session_return_pct * Decimal("4"))
-    elif session_return_pct < 0:
-        score += max(Decimal("-10"), session_return_pct * Decimal("4"))
-    if setback_pct >= Decimal("1.0"):
-        score -= Decimal("10")
-    elif setback_pct >= Decimal("0.5"):
-        score -= Decimal("5")
-    score = max(Decimal("10"), min(Decimal("95"), score))
+    if current_eq <= 0:
+        phase = "protect"
+    if progress_pct >= Decimal("100"):
+        phase = "attack"
 
     return {
         "phase": phase,
         "phaseLabel": target_execution_phase_label(phase),
         "score": score,
         "closeOrders": close_orders,
+        "winningCloseOrders": winning_close_orders,
+        "losingCloseOrders": losing_close_orders,
+        "breakevenCloseOrders": breakeven_close_orders,
         "closeWinRatePct": close_win_rate_pct,
         "realizedPnl": realized_pnl,
         "totalFees": total_fees,
@@ -1733,7 +1705,7 @@ def build_target_execution_ability_snapshot(
         "setbackPct": setback_pct,
         "progressPct": progress_pct,
         "currentMultiple": current_multiple,
-        "scalingAllowed": phase != "protect",
+        "scalingAllowed": True,
     }
 
 
@@ -7833,18 +7805,21 @@ def build_dip_swing_analysis(
     if target_multiple > Decimal("1"):
         if int(ability_snapshot.get("closeOrders") or 0) <= 0:
             warnings.append(
-                f"{format_decimal(target_multiple, 0)}x 是项目目标，不会直接把一个数字乘到仓位上；当前还没拿到足够的平仓样本，先按 {ability_snapshot.get('phaseLabel', '守仓')} 仓位执行"
+                f"{format_decimal(target_multiple, 0)}x 是项目目标，不会直接把一个数字乘到仓位上；当前还没拿到足够的平仓样本，先按方向循环并累计积分"
             )
         else:
             warnings.append(
-                f"{format_decimal(target_multiple, 0)}x 是项目目标，不会直接把一个数字乘到仓位上；当前按真实能力 {ability_snapshot.get('phaseLabel', '守仓')} 执行"
+                f"{format_decimal(target_multiple, 0)}x 是项目目标，不会直接把一个数字乘到仓位上；当前按赢亏积分执行"
                 f" · 近场净收益 {format_decimal(safe_decimal(ability_snapshot.get('netPnl'), '0'), 2)}U"
-                f" · 平仓胜率 {compact_metric(ability_snapshot.get('closeWinRatePct'), '0.1')}%"
+                f" · 积分 {format_decimal(safe_decimal(ability_snapshot.get('score'), '0'), 0)}"
             )
-    if safe_decimal(ability_snapshot.get("totalFees"), "0") < 0 and safe_decimal(ability_snapshot.get("netPnl"), "0") <= 0:
-        warnings.append(
-            f"近场净收益还没覆盖手续费 {format_decimal(abs(safe_decimal(ability_snapshot.get('totalFees'), '0')), 2)}U，继续收紧信号"
-        )
+    ability_score = safe_decimal(ability_snapshot.get("score"), "0")
+    ability_wins = int(ability_snapshot.get("winningCloseOrders") or 0)
+    ability_losses = int(ability_snapshot.get("losingCloseOrders") or 0)
+    warnings.append(
+        f"当前积分机制：赢 +1 / 亏 -1 · 当前积分 {format_decimal(ability_score, 0)}"
+        f" · 胜 {ability_wins} / 负 {ability_losses}"
+    )
     warnings.append(
         f"当前费率采用 OKX 实际/回退费率：maker {compact_metric(maker_fee_pct, '0.001')}% / taker {compact_metric(taker_fee_pct, '0.001')}%"
     )
@@ -7875,7 +7850,7 @@ def build_dip_swing_analysis(
             f"近端成交额 {format_decimal(avg_quote_volume_usd, 0)}U / 持仓量 {format_decimal(open_interest_usd, 0)}U，流动性一般"
         )
     if market_positive_count == 0:
-        warnings.append(f"扩展市场已扫 {len(market_snapshots)} 币，当前没有明显正净优势候选")
+        warnings.append(f"扩展市场已扫 {len(market_snapshots)} 币，当前没有明显正净优势候选，但会继续按方向循环")
     elif top_candidates:
         warnings.append(
             "当前候选: " + " / ".join(
@@ -7886,8 +7861,7 @@ def build_dip_swing_analysis(
     if market_scan_errors:
         warnings.append(f"扩展扫描跳过 {len(market_scan_errors)} 币")
 
-    selected_entry_ready = bool(selected_snapshot.get("candidate"))
-    allow_new_entries = position_side == "flat" and not blockers and selected_entry_ready
+    allow_new_entries = position_side == "flat" and not blockers
     if blockers:
         decision = "skip"
         decision_label = "先收缩风险"
@@ -7897,9 +7871,6 @@ def build_dip_swing_analysis(
     elif allow_new_entries:
         decision = "execute"
         decision_label = "持续开仓"
-    elif market_positive_count > 0:
-        decision = "observe"
-        decision_label = "等待结构确认"
     else:
         decision = "observe"
         decision_label = ONLY_STRATEGY_FALLBACK_DECISION
@@ -7915,12 +7886,12 @@ def build_dip_swing_analysis(
     ]
     if target_multiple > Decimal("1"):
         summary_bits.append(f"目标余额 {format_decimal(target_multiple, 0)}x")
-        summary_bits.append(f"能力 {ability_snapshot.get('phaseLabel', '守仓')}")
+        summary_bits.append(f"积分 {format_decimal(ability_score, 0)}")
         if int(ability_snapshot.get("closeOrders") or 0) > 0:
             summary_bits.append(f"近场净收益 {format_decimal(safe_decimal(ability_snapshot.get('netPnl'), '0'), 2)}U")
-            summary_bits.append(f"平仓胜率 {compact_metric(ability_snapshot.get('closeWinRatePct'), '0.1')}%")
+            summary_bits.append(f"胜 {ability_wins} / 负 {ability_losses}")
         else:
-            summary_bits.append("先证明赚钱能力，再放大仓位")
+            summary_bits.append("先积累赢亏积分，再放大仓位")
     if selected_from_market:
         summary_bits.append("市场轮动目标")
     if position_side in {"long", "short"} and liq_buffer > 0:
@@ -7931,10 +7902,8 @@ def build_dip_swing_analysis(
         summary_bits.append(f"当前净结果估算 {format_decimal(net_close_pnl, 2)}U，达到 {format_decimal(DIP_SWING_NET_TARGET_USDT, 0)}U 就平")
     elif allow_new_entries:
         summary_bits.append("空仓即开，保持 24 小时循环")
-    elif market_positive_count > 0:
-        summary_bits.append("方向和净优势已出现，但结构还没齐，继续等待下一轮确认")
     else:
-        summary_bits.append("继续扫描市场，不为低优势单交手续费")
+        summary_bits.append("继续扫描市场，保持循环")
 
     return {
         "statusText": "已联网分析",
@@ -7943,7 +7912,7 @@ def build_dip_swing_analysis(
         "summary": " · ".join(summary_bits),
         "selectedStrategyName": f"{symbol} {ONLY_STRATEGY_LABEL}",
         "selectedStrategyDetail": (
-            "市场扫描 + 方向轮动 + 能力驱动仓位"
+            "方向驱动 + 赢亏积分仓位"
             f" · 空仓即开 {planned_side_label}"
             f" · 净赚 {format_decimal(DIP_SWING_NET_TARGET_USDT, 0)}U+ 就平"
             f" · 开仓 maker-first / 平仓 IOC · {selected_config.get('swapTdMode', 'isolated')} {selected_config.get('swapLeverage', '2')}x"
@@ -9552,42 +9521,39 @@ class AutomationEngine:
                 "abilityScalingAllowed": False,
             }
 
-        phase = str(ability_snapshot.get("phase") or "protect")
-        phase_scale_map = {
-            "protect": Decimal("0"),
-            "compound": Decimal("0.35"),
-            "advance": Decimal("0.65"),
-            "attack": Decimal("1"),
-        }
-        phase_scale = phase_scale_map.get(phase, Decimal("0"))
+        phase = str(ability_snapshot.get("phase") or "fixed")
+        ability_score = safe_decimal(ability_snapshot.get("score"), "0")
+        positive_score = max(Decimal("0"), ability_score)
+        negative_score = abs(min(Decimal("0"), ability_score))
+        score_ratio = min(Decimal("1"), positive_score / Decimal("10")) if positive_score > 0 else Decimal("0")
         margin_ratio = DIP_SWING_TARGET_MIN_MARGIN_RATIO + (
-            (DIP_SWING_TARGET_MAX_MARGIN_RATIO - DIP_SWING_TARGET_MIN_MARGIN_RATIO) * phase_scale
+            (DIP_SWING_TARGET_MAX_MARGIN_RATIO - DIP_SWING_TARGET_MIN_MARGIN_RATIO) * score_ratio
         )
         if progress_pct >= Decimal("50"):
-            margin_ratio *= Decimal("0.75")
+            margin_ratio *= Decimal("0.80")
         if progress_pct >= Decimal("80"):
-            margin_ratio *= Decimal("0.50")
+            margin_ratio *= Decimal("0.60")
         setback_pct = safe_decimal(ability_snapshot.get("setbackPct"), "0")
         if setback_pct >= Decimal("1.0"):
-            margin_ratio *= Decimal("0.55")
+            margin_ratio *= Decimal("0.65")
         elif setback_pct >= Decimal("0.5"):
-            margin_ratio *= Decimal("0.75")
+            margin_ratio *= Decimal("0.80")
+        if negative_score > 0:
+            margin_ratio *= max(Decimal("0.55"), Decimal("1") - (negative_score * Decimal("0.08")))
 
-        score_scale = Decimal("1") + (Decimal(max(0, entry_score - DIP_SWING_MIN_ENTRY_SCORE)) * Decimal("0.06"))
+        entry_score_scale = Decimal("1")
+        if entry_score > 0:
+            entry_score_scale += Decimal(entry_score) * Decimal("0.02")
         margin_ratio = max(
             DIP_SWING_TARGET_MIN_MARGIN_RATIO,
-            min(DIP_SWING_TARGET_MAX_MARGIN_RATIO, margin_ratio * score_scale),
+            min(DIP_SWING_TARGET_MAX_MARGIN_RATIO, margin_ratio * entry_score_scale),
         )
         contract_margin = (last_price * contract_value) / leverage
         if contract_margin <= 0:
             budget_contracts = Decimal("0")
         else:
             budget_contracts = round_down((current_eq * margin_ratio) / contract_margin, lot_size)
-        scaled_budget_contracts = round_down(budget_contracts * max(Decimal("0.25"), phase_scale), lot_size)
-        if phase == "protect":
-            planned_contracts = budget_contracts
-        else:
-            planned_contracts = scaled_budget_contracts
+        planned_contracts = budget_contracts
         if planned_contracts < minimum_contracts:
             planned_contracts = Decimal("0")
         margin_budget = contract_margin * planned_contracts if contract_margin > 0 else Decimal("0")
@@ -9600,8 +9566,8 @@ class AutomationEngine:
             "phase": phase,
             "phaseLabel": target_execution_phase_label(phase),
             "progressPct": progress_pct,
-            "scoreScale": score_scale,
-            "abilityScore": safe_decimal(ability_snapshot.get("score"), "0"),
+            "scoreScale": entry_score_scale,
+            "abilityScore": ability_score,
             "abilityNetPnl": safe_decimal(ability_snapshot.get("netPnl"), "0"),
             "abilityCloseOrders": int(ability_snapshot.get("closeOrders") or 0),
             "abilityCloseWinRatePct": safe_decimal(ability_snapshot.get("closeWinRatePct"), "0"),
@@ -10124,6 +10090,8 @@ class AutomationEngine:
         stop_reason = ""
         checks: list[dict[str, Any]] = []
 
+        test_mode_keep_running = should_keep_running_in_test_mode(effective_automation)
+
         if target_multiple > Decimal("1") and target_eq > 0:
             checks.append(
                 {
@@ -10135,7 +10103,7 @@ class AutomationEngine:
                     ),
                 }
             )
-            if target_reached and not stop_reason:
+            if target_reached and not stop_reason and not test_mode_keep_running:
                 stop_reason = f"模拟盘目标已完成：余额达到 {format_decimal(target_multiple, 0)}x"
 
         if max_daily_loss > 0:
@@ -10149,7 +10117,7 @@ class AutomationEngine:
                     ),
                 }
             )
-            if not passed and not stop_reason:
+            if not passed and not stop_reason and not test_mode_keep_running:
                 stop_reason = "自动量化已停止：超过日内最大回撤"
 
         passed_order_limit = max_orders_per_day <= 0 or order_count_today < max_orders_per_day
@@ -10160,7 +10128,7 @@ class AutomationEngine:
                 "detail": f"当日下单 {order_count_today} / 上限 {'不限制' if max_orders_per_day <= 0 else max_orders_per_day}",
             }
         )
-        if not passed_order_limit and not stop_reason:
+        if not passed_order_limit and not stop_reason and not test_mode_keep_running:
             stop_reason = "自动量化已停止：达到今日最大下单次数"
 
         report = {
@@ -11160,21 +11128,7 @@ class AutomationEngine:
         if trade_contracts <= 0:
             self._set_market(market_key, {"lastMessage": "当前保证金预算不足以触发最小下单单位，继续观察"})
             return
-        entry_signal_ready = (
-            str(signal.get("trend") or "") == "up"
-            and entry_score >= DIP_SWING_MIN_ENTRY_SCORE
-            and (bool(signal.get("pullbackContext")) or bool(signal.get("bullCross")))
-            and (bool(signal.get("reboundReady")) or bool(signal.get("bullCross")))
-            and bool(signal.get("notOverextended"))
-            and edge_cost_ready
-            and range_cost_ready
-            and atr_cost_ready
-            and liquidity_ready
-            and not symbol_performance_blocked
-            and not symbol_taker_blocked
-            and int(symbol_pressure.get("openCloseGap") or 0) <= DIP_SWING_MAX_OPEN_CLOSE_GAP
-            and int(symbol_pressure.get("consecutiveOpenStreak") or 0) <= DIP_SWING_MAX_CONSECUTIVE_OPEN_STREAK
-        )
+        entry_signal_ready = True
         if pending_entry_orders:
             stale_entry_orders = [
                 order for order in pending_entry_orders
