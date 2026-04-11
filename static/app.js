@@ -2109,7 +2109,7 @@ function renderDeskOverview() {
   );
   const paperEquityMode = journalUsesPaperEquity(executionJournal, dashboardState.recentOrdersAll || [])
     || journalUsesPaperEquity(dashboardState.orderJournal || {}, dashboardState.recentOrdersAll || []);
-  const sessionEquityMode = currentEq > 0 && startEq > 0;
+  const sessionEquityMode = currentEq > 0;
   const journalMetrics = getJournalSummaryMetrics(executionJournal);
   const realizedNet = Number(journalMetrics.realizedPnl ?? 0);
   const feeNet = Number(journalMetrics.totalFees ?? 0);
@@ -2138,7 +2138,9 @@ function renderDeskOverview() {
   const preferredTotalEq = sessionEquityMode
     ? currentEq
     : (paperEquityMode && currentEq > 0 ? currentEq : totalEq);
-  const balanceGoalBase = sessionEquityMode ? startEq : (startEq > 0 ? startEq : preferredTotalEq);
+  const balanceGoalBase = sessionEquityMode
+    ? (startEq > 0 ? startEq : currentEq)
+    : (startEq > 0 ? startEq : preferredTotalEq);
   const balanceTargetEq = stateTargetEq > 0 ? stateTargetEq : (balanceGoalBase > 0 ? balanceGoalBase * 10 : 0);
   const balanceTargetProgressPct = stateTargetEq > 0
     ? stateTargetProgressPct
