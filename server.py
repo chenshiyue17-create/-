@@ -1963,6 +1963,35 @@ def sanitize_only_dip_swing_analysis(analysis: dict[str, Any], automation: dict[
         sanitized["marketRegime"] = "24h 利润循环"
         sanitized["warnings"] = []
         sanitized["blockers"] = []
+    detail_text = " ".join(
+        str(item or "")
+        for item in (
+            sanitized.get("selectedStrategyName"),
+            sanitized.get("selectedStrategyDetail"),
+            sanitized.get("summary"),
+            sanitized.get("marketRegime"),
+            sanitized.get("decisionLabel"),
+        )
+    )
+    aggressive_scalp_mode = any(
+        marker in detail_text
+        for marker in (
+            "利润循环",
+            "24h 利润循环",
+            "每单净利目标 1U",
+            "每单净赚 1U",
+            "空仓直开",
+            "无脑直开",
+            "持续开仓",
+            "当前为超短直开模式",
+        )
+    )
+    if aggressive_scalp_mode:
+        sanitized["executionAbilityPhase"] = "attack"
+        sanitized["executionAbilityPhaseLabel"] = "直开"
+        sanitized["fundingRatePct"] = ""
+        sanitized["basisPct"] = ""
+        sanitized["liquidationPrice"] = ""
     return sanitized
 
 
@@ -1970,6 +1999,10 @@ def sanitize_only_dip_swing_runtime_state(state: dict[str, Any], automation: dic
     effective = enforce_only_dip_swing_strategy(deep_merge(default_automation_config(), automation or {}))
     sanitized = reconcile_runtime_state_with_automation(copy.deepcopy(state or {}), effective)
     sanitized["analysis"] = sanitize_only_dip_swing_analysis(sanitized.get("analysis") or {}, effective)
+    if not sanitized["analysis"].get("lastAnalyzedAt") and sanitized.get("lastCycleAt"):
+        sanitized["analysis"]["lastAnalyzedAt"] = sanitized.get("lastCycleAt")
+    if sanitized["analysis"].get("executionAbilityPhaseLabel") == "直开":
+        sanitized["analysis"]["lastAnalyzedAt"] = sanitized.get("lastCycleAt") or sanitized["analysis"].get("lastAnalyzedAt") or ""
     raw_last_error = str(sanitized.get("lastError") or "").strip()
     if "exit_score" in raw_last_error:
         sanitized["lastError"] = ""

@@ -1783,6 +1783,11 @@ function sanitizeAnalysisForSwingOnly(analysis = {}) {
       ? "空仓直开，持仓同向继续循环，单笔净赚 1U+ 就平。"
       : "等待本轮方向确认。";
     data.marketRegime = "24h 利润循环";
+    data.executionAbilityPhase = "attack";
+    data.executionAbilityPhaseLabel = "直开";
+    data.fundingRatePct = "";
+    data.basisPct = "";
+    data.liquidationPrice = "";
     data.warnings = (data.warnings || []).filter((item) => {
       const text = String(item || "");
       return !["安全缓冲", "收缩风险", "跳过新开仓", "阻断:"].some((marker) => text.includes(marker));
@@ -1844,8 +1849,10 @@ function mergeAutomationRuntimeState(previous = {}, incoming = {}) {
   };
 }
 
-function renderAnalysisState(analysis) {
+function renderAnalysisState(analysis, runtimeState = {}) {
   const data = sanitizeAnalysisForSwingOnly(analysis || {});
+  const runtime = runtimeState && typeof runtimeState === "object" ? runtimeState : {};
+  const refreshAt = data.lastAnalyzedAt || runtime.lastCycleAt || "";
   $("analysis-decision").textContent =
     data.decisionLabel
       ? `${data.decisionLabel}${data.selectedScore ? ` · 分数 ${data.selectedScore}` : ""}`
@@ -1865,9 +1872,9 @@ function renderAnalysisState(analysis) {
         ].filter(Boolean).join(" · ")
       : "等待方向、净优势和强平缓冲分析";
   $("analysis-refresh").textContent =
-    data.lastAnalyzedAt
+    refreshAt
       ? [
-          data.lastAnalyzedAt,
+          refreshAt,
           data.executionAbilityPhaseLabel
             ? `${data.executionAbilityPhaseLabel === "直开" ? "模式" : "能力"} ${data.executionAbilityPhaseLabel}`
             : "",
@@ -5524,23 +5531,24 @@ async function loadMinerConfig() {
 
 function renderAutomationState(state) {
   const mergedState = mergeAutomationRuntimeState(dashboardState.automation || {}, state || {});
-  dashboardState.automation = sanitizeAutomationStateForSwingOnly(mergedState);
+  const sanitizedState = sanitizeAutomationStateForSwingOnly(mergedState);
+  dashboardState.automation = sanitizedState;
   if (mergedState?.executionJournal) {
     dashboardState.orderJournal = mergedState.executionJournal;
     dashboardState.orderJournalSymbols = Array.isArray(mergedState.executionJournal.symbols) ? mergedState.executionJournal.symbols : [];
   }
-  renderResearchState(mergedState?.research || {});
-  renderAnalysisState(mergedState?.analysis || {});
-  const running = Boolean(mergedState?.running);
+  renderResearchState(sanitizedState?.research || {});
+  renderAnalysisState(sanitizedState?.analysis || {}, sanitizedState);
+  const running = Boolean(sanitizedState?.running);
   $("bot-dot").style.background = running ? "var(--success)" : "#59636f";
-  $("bot-status").textContent = mergedState?.statusText || "未启动";
-  $("bot-mode").textContent = mergedState?.modeText || "等待配置";
-  $("bot-last-cycle").textContent = mergedState?.lastCycleAt || "-";
-  $("bot-order-count").textContent = mergedState?.orderCountToday ?? 0;
-  $("bot-drawdown").textContent = `${mergedState?.dailyDrawdownPct || "0"}%`;
-  renderBotMarket("bot-spot-state", mergedState?.markets?.spot, mergedState?.watchlist || [], "spot");
-  renderBotMarket("bot-swap-state", mergedState?.markets?.swap, mergedState?.watchlist || [], "swap");
-  renderLogs(mergedState?.logs || []);
+  $("bot-status").textContent = sanitizedState?.statusText || "未启动";
+  $("bot-mode").textContent = sanitizedState?.modeText || "等待配置";
+  $("bot-last-cycle").textContent = sanitizedState?.lastCycleAt || "-";
+  $("bot-order-count").textContent = sanitizedState?.orderCountToday ?? 0;
+  $("bot-drawdown").textContent = `${sanitizedState?.dailyDrawdownPct || "0"}%`;
+  renderBotMarket("bot-spot-state", sanitizedState?.markets?.spot, sanitizedState?.watchlist || [], "spot");
+  renderBotMarket("bot-swap-state", sanitizedState?.markets?.swap, sanitizedState?.watchlist || [], "swap");
+  renderLogs(sanitizedState?.logs || []);
   renderDeskOverview();
   renderRailStrategyControls();
   renderStrategyPortfolio();
