@@ -103,8 +103,8 @@ BASIS_ARB_PREFERRED_SYMBOLS = (
 BASIS_ARB_SCAN_LOCK = threading.RLock()
 BASIS_ARB_MARKET_UNIVERSE_CACHE: dict[str, Any] = {"ts": 0.0, "symbols": []}
 BASIS_ARB_MARKET_SCAN_CACHE: dict[str, Any] = {"ts": 0.0, "key": "", "rows": []}
-DIP_SWING_SCAN_SYMBOL_LIMIT = 24
-DIP_SWING_EXECUTION_TARGET_LIMIT = 24
+DIP_SWING_SCAN_SYMBOL_LIMIT = 64
+DIP_SWING_EXECUTION_TARGET_LIMIT = 64
 DIP_SWING_SCAN_LOCK = threading.RLock()
 DIP_SWING_MARKET_UNIVERSE_CACHE: dict[str, Any] = {"ts": 0.0, "symbols": []}
 DIP_SWING_MARKET_SCAN_CACHE: dict[str, Any] = {"ts": 0.0, "key": "", "rows": []}
@@ -115,11 +115,12 @@ REMOTE_AUTOMATION_CONFIG_CACHE: dict[str, Any] = {"ts": 0.0, "url": "", "config"
 ONLY_STRATEGY_PRESET = "dip_swing"
 ONLY_STRATEGY_LABEL = "利润循环"
 ONLY_STRATEGY_FALLBACK_DECISION = "持续开仓"
+DIP_SWING_AGGRESSIVE_SCALP_MODE = True
 DIP_SWING_NET_TARGET_USDT = Decimal("1")
 DIP_SWING_MIN_NET_HOLD_USDT = Decimal("-999999")
 DIP_SWING_ENTRY_ORDER_MAX_AGE_SECONDS = 4
 DIP_SWING_EXIT_ORDER_MAX_AGE_SECONDS = 4
-DIP_SWING_MAX_PENDING_ENTRY_ORDERS_PER_SYMBOL = 10
+DIP_SWING_MAX_PENDING_ENTRY_ORDERS_PER_SYMBOL = 64
 DIP_SWING_DIRECTION_LOOKBACK_BARS = 6
 DIP_SWING_MIN_PULLBACK_PCT = Decimal("0.45")
 DIP_SWING_MAX_PULLBACK_PCT = Decimal("1.60")
@@ -7475,6 +7476,7 @@ def build_basis_arb_analysis(
     require_funding_alignment = bool(selected_snapshot.get("requireFundingAlignment"))
     funding_aligned = bool(selected_snapshot.get("fundingAligned"))
 
+    aggressive_scalp_mode = DIP_SWING_AGGRESSIVE_SCALP_MODE
     blockers: list[str] = []
     warnings: list[str] = []
     reverse_basis = bool(selected_snapshot.get("reverseBasis"))
@@ -7924,6 +7926,8 @@ def build_dip_swing_analysis(
         f"当前积分机制：赢 +1 / 亏 -1 · 当前积分 {format_decimal(ability_score, 0)}"
         f" · 胜 {ability_wins} / 负 {ability_losses}"
     )
+    if aggressive_scalp_mode:
+        warnings.append("当前为超短直开模式：分析只负责方向，执行层直接开单，单笔净赚 1U 就平")
     warnings.append(
         f"当前费率采用 OKX 实际/回退费率：maker {compact_metric(maker_fee_pct, '0.001')}% / taker {compact_metric(taker_fee_pct, '0.001')}%"
     )
@@ -7979,7 +7983,7 @@ def build_dip_swing_analysis(
             decision_label = "持仓中观察平仓"
     elif allow_new_entries:
         decision = "execute"
-        decision_label = "持续开仓"
+        decision_label = "直接开单"
     else:
         decision = "observe"
         decision_label = ONLY_STRATEGY_FALLBACK_DECISION
@@ -8014,7 +8018,7 @@ def build_dip_swing_analysis(
         if allow_new_entries and holding_same_direction:
             summary_bits.append("同方向持仓不中断，继续循环开仓")
     elif allow_new_entries:
-        summary_bits.append("空仓即开，保持 24 小时循环")
+        summary_bits.append("空仓直开，盈利即平，保持 24 小时循环")
     else:
         summary_bits.append("继续扫描市场，保持循环")
 
@@ -8025,10 +8029,10 @@ def build_dip_swing_analysis(
         "summary": " · ".join(summary_bits),
         "selectedStrategyName": f"{symbol} {ONLY_STRATEGY_LABEL}",
         "selectedStrategyDetail": (
-            "方向驱动 + 赢亏积分仓位"
+            "方向驱动 + 超短直开"
             f" · 空仓即开 {planned_side_label}"
             f" · 每单净赚 {format_decimal(DIP_SWING_NET_TARGET_USDT, 0)}U+ 就平"
-            f" · 开仓 maker-first / 平仓 IOC · {selected_config.get('swapTdMode', 'isolated')} {selected_config.get('swapLeverage', '2')}x"
+            f" · 开仓直开 / 平仓 IOC · {selected_config.get('swapTdMode', 'isolated')} {selected_config.get('swapLeverage', '2')}x"
         ),
         "selectedReturnPct": "",
         "selectedDrawdownPct": "",
@@ -11051,6 +11055,7 @@ class AutomationEngine:
         signal = build_pullback_signal(candles, int(automation["fastEma"]), int(automation["slowEma"]))
         desired_side = profit_loop_trade_side(signal, candles)
         desired_side_label = profit_loop_trade_side_label(desired_side)
+        aggressive_scalp_mode = DIP_SWING_AGGRESSIVE_SCALP_MODE
         volatility_pct = safe_decimal(signal.get("volatilityPct"), decimal_to_str(recent_range_pct(candles)))
         avg_quote_volume_usd = average_quote_volume_usd(candles)
         positions = client.get_positions(inst_id).get("data", [])
@@ -11123,10 +11128,11 @@ class AutomationEngine:
         )
         configured_target_count = max(1, len(build_execution_targets(automation)))
         force_market_entry_by_mode = (
-            int(automation.get("pollSeconds", 0) or 0) <= DIP_SWING_FORCE_MARKET_ENTRY_POLL_SECONDS
+            aggressive_scalp_mode
+            or int(automation.get("pollSeconds", 0) or 0) <= DIP_SWING_FORCE_MARKET_ENTRY_POLL_SECONDS
             or configured_target_count >= DIP_SWING_FORCE_MARKET_ENTRY_TARGET_COUNT
         )
-        effective_cooldown_seconds = min(max(0, int(automation.get("cooldownSeconds", 0))), 2)
+        effective_cooldown_seconds = 0 if aggressive_scalp_mode else min(max(0, int(automation.get("cooldownSeconds", 0))), 2)
         pending_entry_orders = self._working_swap_orders(inst_id, side="buy", reduce_only=False)
         pending_entry_orders += self._working_swap_orders(inst_id, side="sell", reduce_only=False)
         pending_entry_capacity = max(1, DIP_SWING_MAX_PENDING_ENTRY_ORDERS_PER_SYMBOL)
@@ -11153,6 +11159,9 @@ class AutomationEngine:
             and recent_net_pnl <= Decimal("0")
             and recent_taker_fill_pct >= DIP_SWING_SYMBOL_MAX_TAKER_FILL_PCT
         )
+        if aggressive_scalp_mode:
+            symbol_performance_blocked = False
+            symbol_taker_blocked = False
         estimated_cost_pct = max(
             estimated_cost_pct,
             execution_cost_floor_pct + safe_decimal(cost_snapshot.get("fundingDragPct"), "0"),
@@ -11253,18 +11262,23 @@ class AutomationEngine:
                 pending_entry_orders = [order for order in pending_entry_orders if order not in stale_entry_orders]
                 prefer_aggressive_entry = True
             elif pending_entry_orders and len(pending_entry_orders) >= pending_entry_capacity:
-                oldest_age = max(self._order_age_seconds(order) for order in pending_entry_orders)
-                self._set_market(
-                    market_key,
-                    {
-                        "lastMessage": (
-                            f"{ONLY_STRATEGY_LABEL}同向持仓继续挂单中 · 已挂 {len(pending_entry_orders)} / 上限 {pending_entry_capacity} 笔"
-                            f" / {int(oldest_age)} 秒"
-                            f" · {status_text}"
-                        )
-                    },
-                )
-                return
+                if aggressive_scalp_mode:
+                    oldest_order = max(pending_entry_orders, key=self._order_age_seconds)
+                    self._cancel_swap_orders(client, inst_id, [oldest_order], "超短循环释放挂单槽位", market_key=market_key)
+                    pending_entry_orders = [order for order in pending_entry_orders if order != oldest_order]
+                else:
+                    oldest_age = max(self._order_age_seconds(order) for order in pending_entry_orders)
+                    self._set_market(
+                        market_key,
+                        {
+                            "lastMessage": (
+                                f"{ONLY_STRATEGY_LABEL}同向持仓继续挂单中 · 已挂 {len(pending_entry_orders)} / 上限 {pending_entry_capacity} 笔"
+                                f" / {int(oldest_age)} 秒"
+                                f" · {status_text}"
+                            )
+                        },
+                    )
+                    return
             if liq_buffer > 0 and liq_buffer <= DIP_SWING_MIN_LIQ_BUFFER_PCT:
                 if pending_exit_orders:
                     self._cancel_swap_orders(client, inst_id, pending_exit_orders, "强平缓冲不足，撤掉旧平仓单后紧急退出", market_key=market_key)
@@ -11314,7 +11328,7 @@ class AutomationEngine:
                 self._cancel_swap_orders(client, inst_id, pending_exit_orders, "这单净利目标未到，撤掉旧平仓单继续持有", market_key=market_key)
             if allow_new_entries and holding_same_direction and trade_contracts > 0:
                 cooldown_ready, reason = self._cooldown_ready(market_key, effective_cooldown_seconds)
-                if not cooldown_ready:
+                if not cooldown_ready and not aggressive_scalp_mode:
                     self._set_market(
                         market_key,
                         {
@@ -11337,7 +11351,7 @@ class AutomationEngine:
                     (
                         f"{ONLY_STRATEGY_LABEL}同向加仓循环 · {desired_side_label}"
                         f" · 动态仓位 {decimal_to_str(trade_contracts)} 张"
-                        f" · {'市价补开' if force_market_entry else 'maker-first'}"
+                        f" · {'市价直开' if force_market_entry else 'maker-first'}"
                         f" · 并发挂单 {len(pending_entry_orders) + 1}/{pending_entry_capacity}"
                     ),
                     passive_entry=not force_market_entry,
@@ -11377,22 +11391,27 @@ class AutomationEngine:
                 pending_entry_orders = [order for order in pending_entry_orders if order not in stale_entry_orders]
                 prefer_aggressive_entry = True
             elif len(pending_entry_orders) >= pending_entry_capacity:
-                oldest_age = max(self._order_age_seconds(order) for order in pending_entry_orders)
-                self._set_market(
-                    market_key,
-                    {
-                        "lastMessage": (
-                            f"maker-first 挂单等待成交 · 已挂 {len(pending_entry_orders)} / 上限 {pending_entry_capacity} 笔"
-                            f" / {int(oldest_age)} 秒"
-                            f" · {status_text}"
-                        )
-                    },
-                )
-                return
-        if not allow_new_entries:
+                if aggressive_scalp_mode:
+                    oldest_order = max(pending_entry_orders, key=self._order_age_seconds)
+                    self._cancel_swap_orders(client, inst_id, [oldest_order], "超短循环释放挂单槽位", market_key=market_key)
+                    pending_entry_orders = [order for order in pending_entry_orders if order != oldest_order]
+                else:
+                    oldest_age = max(self._order_age_seconds(order) for order in pending_entry_orders)
+                    self._set_market(
+                        market_key,
+                        {
+                            "lastMessage": (
+                                f"maker-first 挂单等待成交 · 已挂 {len(pending_entry_orders)} / 上限 {pending_entry_capacity} 笔"
+                                f" / {int(oldest_age)} 秒"
+                                f" · {status_text}"
+                            )
+                        },
+                    )
+                    return
+        if not allow_new_entries and not aggressive_scalp_mode:
             self._set_market(market_key, {"lastMessage": f"{ONLY_STRATEGY_LABEL}准备开仓，但当前联网决策层为“{analysis_label}”，本轮不新开仓"})
             return
-        if not entry_signal_ready:
+        if not entry_signal_ready and not aggressive_scalp_mode:
             reasons: list[str] = []
             if not edge_cost_ready:
                 reasons.append(f"结构优势/成本比不足 {compact_metric(edge_cost_ratio, '0.01')}x")
@@ -11425,7 +11444,7 @@ class AutomationEngine:
             )
             return
         cooldown_ready, reason = self._cooldown_ready(market_key, effective_cooldown_seconds)
-        if not cooldown_ready:
+        if not cooldown_ready and not aggressive_scalp_mode:
             self._set_market(market_key, {"lastMessage": f"{ONLY_STRATEGY_LABEL}准备开仓，但{reason}"})
             return
         force_market_entry = (
@@ -11443,7 +11462,7 @@ class AutomationEngine:
             (
                 f"{ONLY_STRATEGY_LABEL}开仓 · {desired_side_label}"
                 f" · 动态仓位 {decimal_to_str(trade_contracts)} 张"
-                f" · {'市价补开' if force_market_entry else 'maker-first'}"
+                f" · {'市价直开' if force_market_entry else 'maker-first'}"
                 f" · 并发挂单 {len(pending_entry_orders) + 1}/{pending_entry_capacity}"
             ),
             passive_entry=not force_market_entry,
