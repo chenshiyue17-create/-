@@ -5011,6 +5011,26 @@ def estimate_profit_loop_position_net_pnl(
     }
 
 
+def estimate_profit_loop_entry_net_pnl(
+    *,
+    planned_contracts: Decimal,
+    last_price: Decimal,
+    contract_value: Decimal,
+    predicted_net_pct: Decimal,
+) -> dict[str, Decimal]:
+    if planned_contracts <= 0 or last_price <= 0 or contract_value <= 0:
+        return {
+            "entryNotional": Decimal("0"),
+            "projectedNetPnl": Decimal("0"),
+        }
+    entry_notional = planned_contracts * last_price * contract_value
+    projected_net_pnl = entry_notional * (predicted_net_pct / Decimal("100"))
+    return {
+        "entryNotional": entry_notional,
+        "projectedNetPnl": projected_net_pnl,
+    }
+
+
 def liquidation_buffer_pct(last_price: Decimal, liq_price: Decimal, position_side: str) -> Decimal:
     if liq_price <= 0 or last_price <= 0:
         return Decimal("0")
@@ -7967,6 +7987,22 @@ def build_dip_swing_analysis(
         taker_fee_pct=taker_fee_pct,
     )
     net_close_pnl = safe_decimal(net_close_snapshot.get("netClosePnl"), "0")
+    planned_contracts_for_analysis = Decimal("0")
+    projected_entry_notional = Decimal("0")
+    projected_entry_net_pnl = Decimal("0")
+    if position_side == "flat":
+        contract_margin = (last_price * contract_value) / leverage if leverage > 0 and last_price > 0 and contract_value > 0 else Decimal("0")
+        current_eq = safe_decimal(AUTOMATION_STATE.current().get("currentEq"), "0")
+        if aggressive_scalp_mode and current_eq > 0 and contract_margin > 0:
+            planned_contracts_for_analysis = round_down((current_eq * DIP_SWING_TARGET_MAX_MARGIN_RATIO) / contract_margin, safe_decimal(swap_meta.get("lotSz"), "1"))
+        entry_projection = estimate_profit_loop_entry_net_pnl(
+            planned_contracts=planned_contracts_for_analysis,
+            last_price=last_price,
+            contract_value=contract_value,
+            predicted_net_pct=predicted_net_pct,
+        )
+        projected_entry_notional = safe_decimal(entry_projection.get("entryNotional"), "0")
+        projected_entry_net_pnl = safe_decimal(entry_projection.get("projectedNetPnl"), "0")
 
     blockers: list[str] = []
     warnings: list[str] = []
@@ -8055,16 +8091,27 @@ def build_dip_swing_analysis(
         )
     if market_scan_errors:
         warnings.append(f"扩展扫描跳过 {len(market_scan_errors)} 币")
+    if position_side == "flat":
+        warnings.append(
+            f"预计这单净结果 {format_decimal(projected_entry_net_pnl, 2)}U / 目标 {format_decimal(DIP_SWING_NET_TARGET_USDT, 0)}U"
+        )
 
     ignored_blockers = list(blockers)
     if aggressive_scalp_mode and blockers:
         warnings.append("超短直开模式已忽略风险闸门：" + " / ".join(ignored_blockers[:3]))
         blockers = []
 
+    if position_side == "flat" and projected_entry_net_pnl < DIP_SWING_NET_TARGET_USDT:
+        blockers.append(
+            f"预计这单净赚只有 {format_decimal(projected_entry_net_pnl, 2)}U，达不到每单 {format_decimal(DIP_SWING_NET_TARGET_USDT, 0)}U"
+        )
+
     allow_new_entries = True if aggressive_scalp_mode else (not blockers)
+    if aggressive_scalp_mode and position_side == "flat":
+        allow_new_entries = projected_entry_net_pnl >= DIP_SWING_NET_TARGET_USDT
     if blockers:
         decision = "skip"
-        decision_label = "先收缩风险"
+        decision_label = "这单预计净利不够"
     elif position_side in {"long", "short"}:
         decision = "manage"
         if net_close_pnl >= DIP_SWING_NET_TARGET_USDT:
@@ -8112,9 +8159,9 @@ def build_dip_swing_analysis(
         if allow_new_entries and holding_same_direction:
             summary_bits.append("同方向持仓不中断，继续循环开仓")
     elif allow_new_entries:
-        summary_bits.append("空仓直开，盈利即平，保持 24 小时循环")
+        summary_bits.append(f"空仓直开，预计这单净赚 {format_decimal(projected_entry_net_pnl, 2)}U，达到 {format_decimal(DIP_SWING_NET_TARGET_USDT, 0)}U 就平")
     else:
-        summary_bits.append("继续扫描市场，保持循环")
+        summary_bits.append(f"预计这单净赚 {format_decimal(projected_entry_net_pnl, 2)}U，不够每单 {format_decimal(DIP_SWING_NET_TARGET_USDT, 0)}U")
 
     return {
         "statusText": "已联网分析",
@@ -8163,6 +8210,8 @@ def build_dip_swing_analysis(
         "plannedSideLabel": planned_side_label,
         "predictedMovePct": compact_metric(predicted_move_pct, "0.01"),
         "predictedNetPct": compact_metric(predicted_net_pct, "0.01"),
+        "projectedEntryNetPnl": compact_metric(projected_entry_net_pnl, "0.01"),
+        "projectedEntryNotional": compact_metric(projected_entry_notional, "0.01"),
         "profitTargetUsdt": format_decimal(DIP_SWING_NET_TARGET_USDT, 0),
         "loopQualityScore": compact_metric(loop_quality_score, "0.1"),
         "pullbackPct": compact_metric(pullback_pct, "0.1"),
@@ -11175,6 +11224,22 @@ class AutomationEngine:
         signal = build_pullback_signal(candles, int(automation["fastEma"]), int(automation["slowEma"]))
         desired_side = profit_loop_trade_side(signal, candles)
         desired_side_label = profit_loop_trade_side_label(desired_side)
+        loop_snapshot = build_profit_loop_snapshot_metrics(
+            {
+                "signal": signal,
+                "candles": candles,
+                "emaSpreadPct": signal.get("emaSpreadPct"),
+                "fastSlopePct": signal.get("fastSlopePct"),
+                "atrPct": signal.get("atrPct"),
+                "volatilityPct": signal.get("volatilityPct"),
+                "estimatedCostPct": signal.get("estimatedCostPct"),
+                "liquidityScore": Decimal("0"),
+                "executionQualityScore": Decimal("0"),
+                "symbolPerformancePenalty": Decimal("0"),
+                "basisPct": Decimal("0"),
+            }
+        )
+        predicted_net_pct = safe_decimal(loop_snapshot.get("predictedNetPct"), "0")
         aggressive_scalp_mode = DIP_SWING_AGGRESSIVE_SCALP_MODE
         volatility_pct = safe_decimal(signal.get("volatilityPct"), decimal_to_str(recent_range_pct(candles)))
         avg_quote_volume_usd = average_quote_volume_usd(candles)
@@ -11237,6 +11302,13 @@ class AutomationEngine:
         )
         target_snapshot = self._target_balance_snapshot(automation)
         planned_trade_contracts = safe_decimal(target_plan.get("plannedContracts"), "0")
+        entry_projection = estimate_profit_loop_entry_net_pnl(
+            planned_contracts=planned_trade_contracts,
+            last_price=last_price,
+            contract_value=contract_value,
+            predicted_net_pct=predicted_net_pct,
+        )
+        projected_entry_net_pnl = safe_decimal(entry_projection.get("projectedNetPnl"), "0")
         position_side = "flat"
         if pos_value > 0:
             position_side = "long"
@@ -11316,6 +11388,7 @@ class AutomationEngine:
             f"方向 {desired_side_label} / "
             f"每单净利目标 {format_decimal(DIP_SWING_NET_TARGET_USDT, 0)}U / "
             f"当前这单净结果 {format_decimal(net_close_pnl, 2)}U / "
+            f"预计这单净结果 {format_decimal(projected_entry_net_pnl, 2)}U / "
             f"预期净优势 {compact_metric(net_edge_pct, '0.01')}% / "
             f"ATR {compact_metric(atr_pct, '0.01')}% / "
             f"maker {compact_metric(maker_fee_pct, '0.001')}% / taker {compact_metric(taker_fee_pct, '0.001')}% / "
@@ -11511,6 +11584,17 @@ class AutomationEngine:
         trade_contracts = planned_trade_contracts
         if trade_contracts <= 0:
             self._set_market(market_key, {"lastMessage": "当前保证金预算不足以触发最小下单单位，继续观察"})
+            return
+        if projected_entry_net_pnl < DIP_SWING_NET_TARGET_USDT:
+            self._set_market(
+                market_key,
+                {
+                    "lastMessage": (
+                        f"{ONLY_STRATEGY_LABEL}预计这单净赚只有 {format_decimal(projected_entry_net_pnl, 2)}U"
+                        f"，达不到每单 {format_decimal(DIP_SWING_NET_TARGET_USDT, 0)}U，不开仓"
+                    )
+                },
+            )
             return
         entry_signal_ready = True
         if pending_entry_orders:
