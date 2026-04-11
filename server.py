@@ -1619,6 +1619,10 @@ def target_execution_phase_label(phase: str) -> str:
     return mapping.get(normalized, normalized or "待机")
 
 
+def should_keep_running_in_test_mode(automation: dict[str, Any]) -> bool:
+    return not bool(automation.get("allowLiveTrading"))
+
+
 def build_target_execution_ability_snapshot(
     automation: dict[str, Any],
     *,
@@ -9701,8 +9705,19 @@ class AutomationEngine:
                 )
                 self._log("error", message)
                 if int(state.get("consecutiveErrors", 0)) >= 5:
-                    self.stop("自动量化已停止：连续错误过多")
-                    return
+                    if should_keep_running_in_test_mode(automation):
+                        self._update_state(
+                            lambda current: current.update(
+                                {
+                                    "statusText": "测试阶段连续错误，但保持运行",
+                                    "lastError": message,
+                                    "modeText": f"{ONLY_STRATEGY_LABEL} · 测试阶段不中断",
+                                }
+                            )
+                        )
+                    else:
+                        self.stop("自动量化已停止：连续错误过多")
+                        return
             wait_seconds = max(5, int(automation.get("pollSeconds", 20)))
             if self.stop_event.wait(wait_seconds):
                 return
@@ -10400,6 +10415,11 @@ class AutomationEngine:
             self._update_state(
                 lambda current: current.update(
                     {
+                        "statusText": (
+                            f"{risk_stop_reason} · 测试继续"
+                            if should_keep_running_in_test_mode(effective_automation)
+                            else risk_stop_reason
+                        ),
                         "lastPipeline": {
                             "signal": "ok",
                             "portfolio": "ok",
@@ -10414,6 +10434,9 @@ class AutomationEngine:
                     }
                 )
             )
+            if should_keep_running_in_test_mode(effective_automation):
+                self._log("warning", f"{risk_stop_reason} · 测试阶段继续运行")
+                return
             self.stop(risk_stop_reason)
             return
 
@@ -10581,6 +10604,7 @@ class AutomationEngine:
         maker_fee_pct = safe_decimal(fee_rates.get("makerFeePct"), decimal_to_str(OKX_DEFAULT_SWAP_MAKER_FEE_PCT))
         taker_fee_pct = safe_decimal(fee_rates.get("takerFeePct"), decimal_to_str(OKX_DEFAULT_SWAP_TAKER_FEE_PCT))
         entry_score = int(signal.get("entryScore") or 0)
+        exit_score = int(signal.get("exitScore") or 0)
         cost_snapshot = estimate_dip_swing_cost_snapshot(
             volatility_pct,
             funding_rate_pct=max(Decimal("0"), safe_decimal(extract_first_row(client.get_funding_rate(inst_id)).get("fundingRate"), "0") * Decimal("100")),
