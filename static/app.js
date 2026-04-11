@@ -1871,18 +1871,30 @@ function renderAnalysisState(analysis, runtimeState = {}) {
           data.liquidationBufferPct ? `强平缓冲 ${data.liquidationBufferPct}%` : "",
         ].filter(Boolean).join(" · ")
       : "等待方向、净优势和强平缓冲分析";
+  const scalpRefreshMode = data.executionAbilityPhaseLabel === "直开";
   $("analysis-refresh").textContent =
     refreshAt
-      ? [
-          refreshAt,
-          data.executionAbilityPhaseLabel
-            ? `${data.executionAbilityPhaseLabel === "直开" ? "模式" : "能力"} ${data.executionAbilityPhaseLabel}`
-            : "",
-          data.executionAbilityNetPnl ? `近场净收益 ${formatSignedMoney(data.executionAbilityNetPnl)}U` : "",
-          data.fundingRatePct ? `资金费 ${data.fundingRatePct}%` : "",
-          data.basisPct ? `基差 ${data.basisPct}%` : "",
-          data.liquidationPrice ? `强平价 ${data.liquidationPrice}` : "",
-        ].filter(Boolean).join(" · ")
+      ? (
+          scalpRefreshMode
+            ? [
+                refreshAt,
+                data.plannedSideLabel ? `方向 ${data.plannedSideLabel}` : "",
+                data.executionAbilityNetPnl !== undefined && data.executionAbilityNetPnl !== null && data.executionAbilityNetPnl !== ""
+                  ? `当前净结果 ${formatSignedMoney(data.executionAbilityNetPnl)}U`
+                  : "",
+                data.profitTargetUsdt ? `每单目标 ${data.profitTargetUsdt}U` : "",
+              ].filter(Boolean).join(" · ")
+            : [
+                refreshAt,
+                data.executionAbilityPhaseLabel
+                  ? `${data.executionAbilityPhaseLabel === "直开" ? "模式" : "能力"} ${data.executionAbilityPhaseLabel}`
+                  : "",
+                data.executionAbilityNetPnl ? `近场净收益 ${formatSignedMoney(data.executionAbilityNetPnl)}U` : "",
+                data.fundingRatePct ? `资金费 ${data.fundingRatePct}%` : "",
+                data.basisPct ? `基差 ${data.basisPct}%` : "",
+                data.liquidationPrice ? `强平价 ${data.liquidationPrice}` : "",
+              ].filter(Boolean).join(" · ")
+        )
       : "等待最新分析时间";
   const reasonBits = [];
   if (data.summary) reasonBits.push(data.summary);
