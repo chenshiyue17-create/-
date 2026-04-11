@@ -1994,6 +1994,27 @@ def sanitize_only_dip_swing_analysis(analysis: dict[str, Any], automation: dict[
         sanitized["fundingRatePct"] = ""
         sanitized["basisPct"] = ""
         sanitized["liquidationPrice"] = ""
+        sanitized["allowNewEntries"] = True
+        sanitized["decision"] = "execute"
+        sanitized["decisionLabel"] = "直接开单"
+        sanitized["summary"] = "空仓直开，持仓同向继续循环，单笔净赚 1U+ 就平。"
+        sanitized["blockers"] = []
+        sanitized["warnings"] = [
+            item for item in list(sanitized.get("warnings") or [])
+            if not any(
+                marker in str(item or "")
+                for marker in (
+                    "安全缓冲",
+                    "收缩风险",
+                    "跳过新开仓",
+                    "阻断:",
+                    "临时禁开新仓",
+                    "结构裁判快照",
+                    "等待本轮方向确认",
+                    "taker 占比偏高",
+                )
+            )
+        ]
     return sanitized
 
 
@@ -7843,6 +7864,7 @@ def build_dip_swing_analysis(
     open_interest = selected_snapshot.get("openInterest") or "--"
     leverage = safe_decimal(selected_target.get("swapLeverage"), "1")
     target_multiple = resolve_target_balance_multiple(selected_target)
+    aggressive_scalp_mode = DIP_SWING_AGGRESSIVE_SCALP_MODE
     target_balance = build_target_balance_snapshot(
         safe_decimal(AUTOMATION_STATE.current().get("sessionStartEq"), "0"),
         safe_decimal(AUTOMATION_STATE.current().get("currentEq"), "0"),
@@ -7860,6 +7882,11 @@ def build_dip_swing_analysis(
         (position_side == "long" and planned_side == "buy")
         or (position_side == "short" and planned_side == "sell")
     )
+    if aggressive_scalp_mode:
+        symbol_performance_blocked = False
+        symbol_taker_blocked = False
+        symbol_pressure_blocked = False
+        entry_vetoes = []
     predicted_move_pct = safe_decimal(loop_metrics.get("predictedMovePct"), "0")
     predicted_net_pct = safe_decimal(loop_metrics.get("predictedNetPct"), "0")
     loop_quality_score = safe_decimal(loop_metrics.get("loopQualityScore"), "0")
@@ -8000,13 +8027,13 @@ def build_dip_swing_analysis(
         warnings.append(
             f"{selected_symbol} 近场净结果 {format_decimal(recent_symbol_net_pnl, 2)}U / 平仓 {recent_symbol_close_orders} 笔，先降权处理"
         )
-    if symbol_performance_blocked:
+    if symbol_performance_blocked and not aggressive_scalp_mode:
         warnings.append(f"{selected_symbol} 最近净亏偏大，已临时禁开新仓")
-    if symbol_taker_blocked:
+    if symbol_taker_blocked and not aggressive_scalp_mode:
         warnings.append(f"{selected_symbol} 近期 taker 占比偏高，已临时禁开新仓")
-    if symbol_pressure_blocked:
+    if symbol_pressure_blocked and not aggressive_scalp_mode:
         warnings.append(f"{selected_symbol} 开平结构失衡，先等平仓闭环")
-    if entry_vetoes:
+    if entry_vetoes and not aggressive_scalp_mode:
         warnings.append("结构裁判快照: " + " / ".join(entry_vetoes[:4]))
     warnings.append(
         f"当前方向 {planned_side_label} · 预期波动 {compact_metric(predicted_move_pct, '0.01')}% / 预期净优势 {compact_metric(predicted_net_pct, '0.01')}%"

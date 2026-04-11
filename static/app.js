@@ -1790,7 +1790,16 @@ function sanitizeAnalysisForSwingOnly(analysis = {}) {
     data.liquidationPrice = "";
     data.warnings = (data.warnings || []).filter((item) => {
       const text = String(item || "");
-      return !["安全缓冲", "收缩风险", "跳过新开仓", "阻断:"].some((marker) => text.includes(marker));
+      return ![
+        "安全缓冲",
+        "收缩风险",
+        "跳过新开仓",
+        "阻断:",
+        "临时禁开新仓",
+        "结构裁判快照",
+        "等待本轮方向确认",
+        "taker 占比偏高",
+      ].some((marker) => text.includes(marker));
     });
     data.blockers = [];
   }
