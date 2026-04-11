@@ -156,6 +156,8 @@ DIP_SWING_POST_ONLY_ENTRY_EXTRA_TICKS = Decimal("2")
 DIP_SWING_POST_ONLY_EXIT_EXTRA_TICKS = Decimal("2")
 DIP_SWING_MARKET_FALLBACK_OPEN_GAP = 12
 DIP_SWING_MARKET_FALLBACK_OPEN_STREAK = 6
+DIP_SWING_FORCE_MARKET_ENTRY_POLL_SECONDS = 1
+DIP_SWING_FORCE_MARKET_ENTRY_TARGET_COUNT = 8
 DIP_SWING_EXIT_PROTECTION_PCT = Decimal("0.08")
 DIP_SWING_TARGET_MIN_MARGIN_RATIO = Decimal("0.012")
 DIP_SWING_TARGET_MAX_MARGIN_RATIO = Decimal("0.050")
@@ -11093,6 +11095,11 @@ class AutomationEngine:
             (position_side == "long" and desired_side == "buy")
             or (position_side == "short" and desired_side == "sell")
         )
+        configured_target_count = max(1, len(build_execution_targets(automation)))
+        force_market_entry_by_mode = (
+            int(automation.get("pollSeconds", 0) or 0) <= DIP_SWING_FORCE_MARKET_ENTRY_POLL_SECONDS
+            or configured_target_count >= DIP_SWING_FORCE_MARKET_ENTRY_TARGET_COUNT
+        )
         effective_cooldown_seconds = min(max(0, int(automation.get("cooldownSeconds", 0))), 2)
         pending_entry_orders = self._working_swap_orders(inst_id, side="buy", reduce_only=False)
         pending_entry_orders += self._working_swap_orders(inst_id, side="sell", reduce_only=False)
@@ -11290,7 +11297,8 @@ class AutomationEngine:
                     )
                     return
                 force_market_entry = (
-                    prefer_aggressive_entry
+                    force_market_entry_by_mode
+                    or prefer_aggressive_entry
                     or int(symbol_pressure.get("openCloseGap") or 0) >= DIP_SWING_MARKET_FALLBACK_OPEN_GAP
                     or int(symbol_pressure.get("consecutiveOpenStreak") or 0) >= DIP_SWING_MARKET_FALLBACK_OPEN_STREAK
                 )
@@ -11395,7 +11403,8 @@ class AutomationEngine:
             self._set_market(market_key, {"lastMessage": f"{ONLY_STRATEGY_LABEL}准备开仓，但{reason}"})
             return
         force_market_entry = (
-            prefer_aggressive_entry
+            force_market_entry_by_mode
+            or prefer_aggressive_entry
             or int(symbol_pressure.get("openCloseGap") or 0) >= DIP_SWING_MARKET_FALLBACK_OPEN_GAP
             or int(symbol_pressure.get("consecutiveOpenStreak") or 0) >= DIP_SWING_MARKET_FALLBACK_OPEN_STREAK
         )
