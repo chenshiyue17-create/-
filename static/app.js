@@ -4452,7 +4452,7 @@ function renderOrderSymbolOverview(groups, meta = {}) {
   if (!target) return;
   if (!groups.length) {
     target.className = "order-symbol-overview empty";
-    target.textContent = "更多币种订单进来后，这里会按币显示独立订单流和收益汇总。";
+    target.textContent = "更多币种订单进来后，这里会按币显示独立订单流和净结果总览。";
     return;
   }
 
@@ -4470,8 +4470,8 @@ function renderOrderSymbolOverview(groups, meta = {}) {
           <span class="order-state-pill ${group.working ? "tone-live" : group.filled ? "tone-done" : "tone-cancel"}">${group.orderCount} 笔</span>
         </div>
         <div class="order-symbol-metrics">
-          <div><b>收益汇总</b><span class="tone-${pnlClass}">${group.hasPnl ? `${formatSignedMoney(group.pnlTotal)} USDT` : "--"}</span></div>
-          <div><b>收益口径</b><span>${escapeHtml(group.scopeLabel)}</span></div>
+          <div><b>净结果</b><span class="tone-${pnlClass}">${group.hasPnl ? `${formatSignedMoney(group.pnlTotal)} USDT` : "--"}</span></div>
+          <div><b>净结果口径</b><span>${escapeHtml(group.scopeLabel)}</span></div>
           <div><b>套利净收益</b><span>${group.arbOrderCount ? `${formatSignedMoney(group.arbNetPnl)} USDT` : "--"}</span></div>
           <div><b>工作中 / 已成交 / 异常</b><span>${group.working} / ${group.filled} / ${group.riskCount}</span></div>
           <div><b>成交率</b><span>${group.orderCount ? formatPercentValue(group.successRate) : "--"}</span></div>
@@ -4587,7 +4587,7 @@ function renderOrderTerminalFocus(selectedGroup, meta = {}) {
       </div>
     </div>
     <div class="order-terminal-focus-meta">
-      <div><b>收益口径</b><span>${escapeHtml(selectedGroup.scopeLabel)}</span></div>
+      <div><b>净结果口径</b><span>${escapeHtml(selectedGroup.scopeLabel)}</span></div>
       <div><b>待成交 / 待补口径</b><span>${selectedGroup.pendingCount} / ${selectedGroup.unresolvedCount}</span></div>
       <div><b>watchlist</b><span>${escapeHtml(watchlistLabel)}</span></div>
       <div><b>工作中 / 已成交</b><span>${selectedGroup.working} / ${selectedGroup.filled}</span></div>
@@ -5015,8 +5015,8 @@ function renderOrderFeed(data) {
               </button>
             </div>
             <div class="orders-group-metrics">
-              <div><b>收益汇总</b><span class="tone-${pnlClass}">${group.hasPnl ? `${formatSignedMoney(group.pnlTotal)} USDT` : "--"}</span></div>
-              <div><b>收益口径</b><span>${escapeHtml(group.scopeLabel)}</span></div>
+              <div><b>净结果</b><span class="tone-${pnlClass}">${group.hasPnl ? `${formatSignedMoney(group.pnlTotal)} USDT` : "--"}</span></div>
+              <div><b>净结果口径</b><span>${escapeHtml(group.scopeLabel)}</span></div>
               <div><b>工作中 / 已成交 / 异常</b><span>${group.working} / ${group.filled} / ${group.riskCount}</span></div>
               <div><b>成交率</b><span>${group.orderCount ? formatPercentValue(group.successRate) : "--"}</span></div>
               <div><b>最近更新时间</b><span>${escapeHtml(group.latestAt)}</span></div>
