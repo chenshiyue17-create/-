@@ -1648,6 +1648,9 @@ def build_target_execution_ability_snapshot(
     realized_pnl = safe_decimal(summary.get("realizedPnl"), "0")
     total_fees = safe_decimal(summary.get("totalFees"), "0")
     net_pnl = safe_decimal(summary.get("netPnl"), decimal_to_str(realized_pnl + total_fees))
+    avg_abs_slip_mark_pct = safe_decimal(summary.get("avgAbsSlipMarkPct"), "0")
+    taker_fill_pct = safe_decimal(summary.get("takerFillPct"), "0")
+    execution_cost_floor_pct = safe_decimal(summary.get("executionCostFloorPct"), "0")
     progress_pct = safe_decimal(target_balance.get("progressPct"), "0")
     current_multiple = safe_decimal(target_balance.get("currentMultiple"), "1")
 
@@ -1718,6 +1721,9 @@ def build_target_execution_ability_snapshot(
         "realizedPnl": realized_pnl,
         "totalFees": total_fees,
         "netPnl": net_pnl,
+        "avgAbsSlipMarkPct": avg_abs_slip_mark_pct,
+        "takerFillPct": taker_fill_pct,
+        "executionCostFloorPct": execution_cost_floor_pct,
         "sessionReturnPct": session_return_pct,
         "setbackPct": setback_pct,
         "progressPct": progress_pct,
@@ -2571,6 +2577,17 @@ def normalize_execution_order(order: dict[str, Any]) -> dict[str, Any]:
         "fillPnl",
         "realizedPnl",
         "fillFee",
+        "fillNotionalUsd",
+        "notionalUsd",
+        "fillMarkPx",
+        "fillIdxPx",
+        "execType",
+        "accFillSz",
+        "fillSz",
+        "sz",
+        "lever",
+        "contractValue",
+        "ctVal",
         "px",
         "fee",
         "pnl",
@@ -2617,6 +2634,105 @@ def order_total_fee(order: dict[str, Any]) -> Decimal:
     return order_decimal_metric(order, "fillFee", "fee")
 
 
+def order_execution_type(order: dict[str, Any]) -> str:
+    return str(order.get("execType") or "").strip().upper()
+
+
+def order_contract_value(order: dict[str, Any]) -> Decimal:
+    inst_id = str(order.get("instId") or "")
+    raw = order_decimal_metric(order, "contractValue", "ctVal")
+    if raw > 0:
+        return raw
+    if str(order.get("instType") or ("SWAP" if inst_id.endswith("-SWAP") else "")).upper() == "SWAP":
+        return default_swap_contract_value(inst_id)
+    return Decimal("1")
+
+
+def order_fill_notional_usd(order: dict[str, Any]) -> Decimal:
+    direct = abs(order_decimal_metric(order, "fillNotionalUsd", "notionalUsd"))
+    if direct > 0:
+        return direct
+    fill_px = order_decimal_metric(order, "fillPx", "avgPx", "px")
+    fill_size = abs(order_decimal_metric(order, "accFillSz", "fillSz", "sz"))
+    if fill_px <= 0 or fill_size <= 0:
+        return Decimal("0")
+    inst_type = str(order.get("instType") or ("SWAP" if str(order.get("instId") or "").endswith("-SWAP") else "")).upper()
+    if inst_type == "SWAP":
+        return abs(fill_px * fill_size * order_contract_value(order))
+    return abs(fill_px * fill_size)
+
+
+def order_slippage_cost_pct(order: dict[str, Any], *, benchmark: str = "mark") -> Decimal:
+    fill_px = order_decimal_metric(order, "fillPx", "avgPx", "px")
+    if fill_px <= 0:
+        return Decimal("0")
+    if benchmark == "index":
+        reference_px = order_decimal_metric(order, "fillIdxPx")
+    else:
+        reference_px = order_decimal_metric(order, "fillMarkPx")
+    if reference_px <= 0:
+        return Decimal("0")
+    side = str(order.get("side") or "").strip().lower()
+    if side == "buy":
+        return ((fill_px - reference_px) / reference_px) * Decimal("100")
+    if side == "sell":
+        return ((reference_px - fill_px) / reference_px) * Decimal("100")
+    return Decimal("0")
+
+
+def build_execution_cost_aggregate(orders: list[dict[str, Any]]) -> dict[str, Decimal | int]:
+    maker_orders = 0
+    taker_orders = 0
+    filled_notional_usd = Decimal("0")
+    weighted_abs_slip_mark = Decimal("0")
+    weighted_abs_slip_index = Decimal("0")
+    total_fees = Decimal("0")
+
+    for order in orders or []:
+        if classify_execution_order_state(order) != "filled":
+            continue
+        exec_type = order_execution_type(order)
+        if exec_type == "M":
+            maker_orders += 1
+        elif exec_type == "T":
+            taker_orders += 1
+        fee_value = order_total_fee(order)
+        total_fees += fee_value
+        notional_usd = order_fill_notional_usd(order)
+        if notional_usd <= 0:
+            continue
+        filled_notional_usd += notional_usd
+        weighted_abs_slip_mark += abs(order_slippage_cost_pct(order, benchmark="mark")) * notional_usd
+        weighted_abs_slip_index += abs(order_slippage_cost_pct(order, benchmark="index")) * notional_usd
+
+    avg_abs_slip_mark_pct = (
+        weighted_abs_slip_mark / filled_notional_usd if filled_notional_usd > 0 else Decimal("0")
+    )
+    avg_abs_slip_index_pct = (
+        weighted_abs_slip_index / filled_notional_usd if filled_notional_usd > 0 else Decimal("0")
+    )
+    recent_fee_pct_on_notional = (
+        (abs(total_fees) / filled_notional_usd) * Decimal("100") if filled_notional_usd > 0 else Decimal("0")
+    )
+    roundtrip_fee_floor_pct = recent_fee_pct_on_notional * Decimal("2")
+    execution_cost_floor_pct = roundtrip_fee_floor_pct + max(avg_abs_slip_mark_pct, avg_abs_slip_index_pct)
+    filled_count = maker_orders + taker_orders
+    maker_fill_pct = (Decimal(maker_orders) / Decimal(filled_count) * Decimal("100")) if filled_count > 0 else Decimal("0")
+    taker_fill_pct = (Decimal(taker_orders) / Decimal(filled_count) * Decimal("100")) if filled_count > 0 else Decimal("0")
+    return {
+        "makerOrders": maker_orders,
+        "takerOrders": taker_orders,
+        "makerFillPct": maker_fill_pct,
+        "takerFillPct": taker_fill_pct,
+        "filledNotionalUsd": filled_notional_usd,
+        "avgAbsSlipMarkPct": avg_abs_slip_mark_pct,
+        "avgAbsSlipIndexPct": avg_abs_slip_index_pct,
+        "feePctOnNotional": recent_fee_pct_on_notional,
+        "roundtripFeeFloorPct": roundtrip_fee_floor_pct,
+        "executionCostFloorPct": execution_cost_floor_pct,
+    }
+
+
 def is_close_like_execution_order(order: dict[str, Any]) -> bool:
     inst_type = str(order.get("instType") or "").upper()
     side = str(order.get("side") or "").lower()
@@ -2652,10 +2768,18 @@ def build_execution_journal_insight(orders: list[dict[str, Any]], summary: dict[
             message += f" 当前已累计手续费 {format_decimal(fee_value, 4)} USDT。"
         return message
     if close_count > 0 and realized_value > 0 and net_value < 0:
-        return (
+        message = (
             f"当前已实现盈利 {format_decimal(realized_value, 4)} USDT，"
             f"但手续费 {format_decimal(fee_value, 4)} USDT 已把净结果压到 {format_decimal(net_value, 4)} USDT。"
         )
+        slip_mark_pct = safe_decimal((summary or {}).get("avgAbsSlipMarkPct"), "0")
+        taker_fill_pct = safe_decimal((summary or {}).get("takerFillPct"), "0")
+        if slip_mark_pct > 0 or taker_fill_pct > 0:
+            message += (
+                f" 近期加权滑点约 {format_decimal(slip_mark_pct, 4)}% / "
+                f"taker 占比 {format_decimal(taker_fill_pct, 1)}%。"
+            )
+        return message
     if realized_value != 0:
         direction = "盈利" if realized_value > 0 else "亏损"
         return f"当前已实现{direction} {format_decimal(realized_value, 4)} USDT。"
@@ -2731,6 +2855,7 @@ def build_execution_symbol_pressure_snapshot(
         if close_like:
             break
         consecutive_open_streak += 1
+    cost_snapshot = build_execution_cost_aggregate(filtered)
     return {
         "instId": str(inst_id),
         "windowMinutes": int(window_minutes),
@@ -2742,6 +2867,16 @@ def build_execution_symbol_pressure_snapshot(
         "recentRealizedPnl": recent_realized,
         "recentTotalFees": recent_fees,
         "recentNetPnl": recent_realized + recent_fees,
+        "makerOrders": int(cost_snapshot.get("makerOrders") or 0),
+        "takerOrders": int(cost_snapshot.get("takerOrders") or 0),
+        "makerFillPct": safe_decimal(cost_snapshot.get("makerFillPct"), "0"),
+        "takerFillPct": safe_decimal(cost_snapshot.get("takerFillPct"), "0"),
+        "filledNotionalUsd": safe_decimal(cost_snapshot.get("filledNotionalUsd"), "0"),
+        "avgAbsSlipMarkPct": safe_decimal(cost_snapshot.get("avgAbsSlipMarkPct"), "0"),
+        "avgAbsSlipIndexPct": safe_decimal(cost_snapshot.get("avgAbsSlipIndexPct"), "0"),
+        "feePctOnNotional": safe_decimal(cost_snapshot.get("feePctOnNotional"), "0"),
+        "roundtripFeeFloorPct": safe_decimal(cost_snapshot.get("roundtripFeeFloorPct"), "0"),
+        "executionCostFloorPct": safe_decimal(cost_snapshot.get("executionCostFloorPct"), "0"),
     }
 
 
@@ -3042,12 +3177,29 @@ def build_execution_journal_summary(orders: list[dict[str, Any]]) -> dict[str, A
     if close_orders > 0:
         close_win_rate = (Decimal(winning_close_orders) / Decimal(close_orders)) * Decimal("100")
     net_pnl = realized_pnl + total_fees
+    cost_aggregate = build_execution_cost_aggregate(normalized_orders)
+    orders_by_symbol: dict[str, list[dict[str, Any]]] = {}
+    for order in normalized_orders:
+        symbol = str(order.get("instId") or "UNKNOWN").strip() or "UNKNOWN"
+        orders_by_symbol.setdefault(symbol, []).append(order)
 
     symbols = list(symbol_rows.values())
+    for row in symbols:
+        symbol_cost_aggregate = build_execution_cost_aggregate(orders_by_symbol.get(str(row.get("symbol") or "UNKNOWN"), []))
+        row["makerOrders"] = int(symbol_cost_aggregate.get("makerOrders") or 0)
+        row["takerOrders"] = int(symbol_cost_aggregate.get("takerOrders") or 0)
+        row["makerFillPct"] = decimal_to_str(safe_decimal(symbol_cost_aggregate.get("makerFillPct"), "0"))
+        row["takerFillPct"] = decimal_to_str(safe_decimal(symbol_cost_aggregate.get("takerFillPct"), "0"))
+        row["avgAbsSlipMarkPct"] = decimal_to_str(safe_decimal(symbol_cost_aggregate.get("avgAbsSlipMarkPct"), "0"))
+        row["avgAbsSlipIndexPct"] = decimal_to_str(safe_decimal(symbol_cost_aggregate.get("avgAbsSlipIndexPct"), "0"))
+        row["feePctOnNotional"] = decimal_to_str(safe_decimal(symbol_cost_aggregate.get("feePctOnNotional"), "0"))
+        row["executionCostFloorPct"] = decimal_to_str(safe_decimal(symbol_cost_aggregate.get("executionCostFloorPct"), "0"))
     symbols.sort(key=lambda row: int(row.get("lastTime") or 0), reverse=True)
     insight = build_execution_journal_insight(normalized_orders, {
         "realizedPnl": decimal_to_str(realized_pnl),
         "totalFees": decimal_to_str(total_fees),
+        "avgAbsSlipMarkPct": decimal_to_str(safe_decimal(cost_aggregate.get("avgAbsSlipMarkPct"), "0")),
+        "takerFillPct": decimal_to_str(safe_decimal(cost_aggregate.get("takerFillPct"), "0")),
     })
     return {
         "totalOrders": total_orders,
@@ -3065,6 +3217,16 @@ def build_execution_journal_summary(orders: list[dict[str, Any]]) -> dict[str, A
         "realizedPnl": decimal_to_str(realized_pnl),
         "totalFees": decimal_to_str(total_fees),
         "netPnl": decimal_to_str(net_pnl),
+        "makerOrders": int(cost_aggregate.get("makerOrders") or 0),
+        "takerOrders": int(cost_aggregate.get("takerOrders") or 0),
+        "makerFillPct": decimal_to_str(safe_decimal(cost_aggregate.get("makerFillPct"), "0")),
+        "takerFillPct": decimal_to_str(safe_decimal(cost_aggregate.get("takerFillPct"), "0")),
+        "filledNotionalUsd": decimal_to_str(safe_decimal(cost_aggregate.get("filledNotionalUsd"), "0")),
+        "avgAbsSlipMarkPct": decimal_to_str(safe_decimal(cost_aggregate.get("avgAbsSlipMarkPct"), "0")),
+        "avgAbsSlipIndexPct": decimal_to_str(safe_decimal(cost_aggregate.get("avgAbsSlipIndexPct"), "0")),
+        "feePctOnNotional": decimal_to_str(safe_decimal(cost_aggregate.get("feePctOnNotional"), "0")),
+        "roundtripFeeFloorPct": decimal_to_str(safe_decimal(cost_aggregate.get("roundtripFeeFloorPct"), "0")),
+        "executionCostFloorPct": decimal_to_str(safe_decimal(cost_aggregate.get("executionCostFloorPct"), "0")),
         "lastCancelReason": last_cancel_reason,
         "arbOrderCount": arb_order_count,
         "arbEntryOrders": arb_entry_orders,
@@ -6535,6 +6697,8 @@ def evaluate_dip_swing_target_snapshot(
     open_interest_row: dict[str, Any],
     candles: list[dict[str, Any]],
     positions: list[dict[str, Any]],
+    *,
+    execution_journal: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     signal = build_pullback_signal(candles, int(target["fastEma"]), int(target["slowEma"]))
     last_price = safe_decimal(signal.get("lastClose"), "0")
@@ -6556,6 +6720,17 @@ def evaluate_dip_swing_target_snapshot(
     entry_score = int(signal.get("entryScore") or 0)
     exit_score = int(signal.get("exitScore") or 0)
     estimated_cost_pct = safe_decimal(signal.get("estimatedCostPct"), decimal_to_str(DIP_SWING_EST_ROUNDTRIP_COST_PCT + min(Decimal("0.12"), volatility_pct * Decimal("0.04"))))
+    symbol_pressure = build_execution_symbol_pressure_snapshot(
+        str(target.get("swapInstId") or ""),
+        journal=execution_journal,
+        limit=160,
+    )
+    recent_avg_abs_slip_mark_pct = safe_decimal(symbol_pressure.get("avgAbsSlipMarkPct"), "0")
+    recent_avg_abs_slip_index_pct = safe_decimal(symbol_pressure.get("avgAbsSlipIndexPct"), "0")
+    recent_taker_fill_pct = safe_decimal(symbol_pressure.get("takerFillPct"), "0")
+    recent_execution_cost_floor_pct = safe_decimal(symbol_pressure.get("executionCostFloorPct"), "0")
+    funding_drag_pct = max(Decimal("0"), funding_rate_pct) * Decimal("0.35")
+    estimated_cost_pct = max(estimated_cost_pct, recent_execution_cost_floor_pct + funding_drag_pct)
     setup_edge_pct = max(ema_spread_pct, Decimal("0")) + max(fast_slope_pct, Decimal("0")) + max(rebound_pct, Decimal("0"))
     net_edge_pct = setup_edge_pct - estimated_cost_pct
     edge_cost_ratio = (setup_edge_pct / estimated_cost_pct) if estimated_cost_pct > 0 else Decimal("0")
@@ -6654,6 +6829,11 @@ def evaluate_dip_swing_target_snapshot(
         "liquidityScore": liquidity_score,
         "executionQualityScore": execution_quality_score,
         "factorBundle": factor_bundle,
+        "symbolPressure": symbol_pressure,
+        "recentAvgAbsSlipMarkPct": recent_avg_abs_slip_mark_pct,
+        "recentAvgAbsSlipIndexPct": recent_avg_abs_slip_index_pct,
+        "recentTakerFillPct": recent_taker_fill_pct,
+        "executionCostFloorPct": recent_execution_cost_floor_pct,
         "positionSide": position_side,
         "positionSize": position_size,
         "entryPrice": entry_price,
@@ -6665,7 +6845,11 @@ def evaluate_dip_swing_target_snapshot(
     }
 
 
-def fetch_dip_swing_target_snapshot(client: OkxClient, target: dict[str, Any]) -> dict[str, Any]:
+def fetch_dip_swing_target_snapshot(
+    client: OkxClient,
+    target: dict[str, Any],
+    execution_journal: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     inst_id = str(target.get("swapInstId") or "")
     jobs: dict[str, Any] = {
         "swapTicker": lambda: extract_first_row(client.get_ticker(inst_id)),
@@ -6700,6 +6884,7 @@ def fetch_dip_swing_target_snapshot(client: OkxClient, target: dict[str, Any]) -
         fetched["openInterest"],
         fetched["swapCandles"],
         fetched["positions"],
+        execution_journal=execution_journal,
     )
 
 
@@ -6789,6 +6974,8 @@ def scan_dip_swing_market_snapshots(
     client: OkxClient,
     config: dict[str, Any],
     symbols: list[str],
+    *,
+    execution_journal: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     normalized_symbols = [normalize_symbol_token(symbol) for symbol in symbols if normalize_symbol_token(symbol)]
     if not normalized_symbols:
@@ -6816,7 +7003,10 @@ def scan_dip_swing_market_snapshots(
     rows: list[dict[str, Any]] = []
     errors: list[str] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(len(targets), 8))) as executor:
-        future_map = {executor.submit(fetch_dip_swing_target_snapshot, client, target): target for target in targets}
+        future_map = {
+            executor.submit(fetch_dip_swing_target_snapshot, client, target, execution_journal): target
+            for target in targets
+        }
         for future in concurrent.futures.as_completed(future_map):
             target = future_map[future]
             try:
@@ -7314,10 +7504,14 @@ def build_dip_swing_analysis(
 ) -> dict[str, Any]:
     watchlist_symbols = normalize_watchlist_symbols(automation.get("watchlistSymbols"), automation)
     watchlist_targets = [build_dip_swing_scan_target(automation, symbol) for symbol in watchlist_symbols]
+    execution_journal = get_execution_journal_snapshot(limit=160)
     target_snapshots: list[dict[str, Any]] = []
     errors: list[str] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(len(watchlist_targets), 8))) as executor:
-        future_map = {executor.submit(fetch_dip_swing_target_snapshot, client, target): target for target in watchlist_targets}
+        future_map = {
+            executor.submit(fetch_dip_swing_target_snapshot, client, target, execution_journal): target
+            for target in watchlist_targets
+        }
         for future in concurrent.futures.as_completed(future_map):
             target = future_map[future]
             try:
@@ -7331,7 +7525,12 @@ def build_dip_swing_analysis(
     holding_snapshots = [row for row in target_snapshots if str(row.get("positionSide") or "") in {"long", "short"}]
     market_scan_symbols = list_dip_swing_market_symbols(client, automation)
     extra_scan_symbols = [symbol for symbol in market_scan_symbols if symbol not in set(watchlist_symbols)]
-    extra_market_snapshots, market_scan_errors = scan_dip_swing_market_snapshots(client, automation, extra_scan_symbols)
+    extra_market_snapshots, market_scan_errors = scan_dip_swing_market_snapshots(
+        client,
+        automation,
+        extra_scan_symbols,
+        execution_journal=execution_journal,
+    )
     for row in extra_market_snapshots:
         row["profitLoop"] = build_profit_loop_snapshot_metrics(row)
     market_snapshots = target_snapshots + extra_market_snapshots
@@ -7430,6 +7629,10 @@ def build_dip_swing_analysis(
     avg_quote_volume_usd = safe_decimal(selected_snapshot.get("avgQuoteVolumeUsd"), "0")
     open_interest_usd = safe_decimal(selected_snapshot.get("openInterestUsd"), "0")
     execution_quality_score = safe_decimal(selected_snapshot.get("executionQualityScore"), "0")
+    recent_avg_abs_slip_mark_pct = safe_decimal(selected_snapshot.get("recentAvgAbsSlipMarkPct"), "0")
+    recent_avg_abs_slip_index_pct = safe_decimal(selected_snapshot.get("recentAvgAbsSlipIndexPct"), "0")
+    recent_taker_fill_pct = safe_decimal(selected_snapshot.get("recentTakerFillPct"), "0")
+    execution_cost_floor_pct = safe_decimal(selected_snapshot.get("executionCostFloorPct"), "0")
     edge_cost_ready = bool(selected_snapshot.get("edgeCostReady"))
     range_cost_ready = bool(selected_snapshot.get("rangeCostReady"))
     atr_cost_ready = bool(selected_snapshot.get("atrCostReady"))
@@ -7491,6 +7694,10 @@ def build_dip_swing_analysis(
         taker_fee_pct=taker_fee_pct,
     )
     estimated_cost_pct = safe_decimal(live_cost_snapshot.get("estimatedCostPct"), decimal_to_str(estimated_cost_pct))
+    estimated_cost_pct = max(
+        estimated_cost_pct,
+        execution_cost_floor_pct + safe_decimal(live_cost_snapshot.get("fundingDragPct"), "0"),
+    )
     net_edge_pct = setup_edge_pct - estimated_cost_pct
     edge_cost_ratio = (setup_edge_pct / estimated_cost_pct) if estimated_cost_pct > 0 else Decimal("0")
     range_cost_ratio = (volatility_pct / estimated_cost_pct) if estimated_cost_pct > 0 else Decimal("0")
@@ -7549,6 +7756,13 @@ def build_dip_swing_analysis(
     warnings.append(
         f"当前费率采用 OKX 实际/回退费率：maker {compact_metric(maker_fee_pct, '0.001')}% / taker {compact_metric(taker_fee_pct, '0.001')}%"
     )
+    if recent_avg_abs_slip_mark_pct > 0 or recent_taker_fill_pct > 0:
+        warnings.append(
+            f"近期真实执行拖累：加权滑点 {compact_metric(recent_avg_abs_slip_mark_pct, '0.001')}%"
+            f" / index 偏离 {compact_metric(recent_avg_abs_slip_index_pct, '0.001')}%"
+            f" / taker {compact_metric(recent_taker_fill_pct, '0.1')}%"
+            f" / 成本地板 {compact_metric(execution_cost_floor_pct, '0.01')}%"
+        )
     if entry_vetoes:
         warnings.append("结构裁判快照: " + " / ".join(entry_vetoes[:4]))
     warnings.append(
@@ -7679,6 +7893,10 @@ def build_dip_swing_analysis(
         "avgQuoteVolumeUsd": compact_metric(avg_quote_volume_usd, "1"),
         "openInterestUsd": compact_metric(open_interest_usd, "1"),
         "executionQualityScore": compact_metric(execution_quality_score, "0.1"),
+        "recentAvgAbsSlipMarkPct": compact_metric(recent_avg_abs_slip_mark_pct, "0.001"),
+        "recentAvgAbsSlipIndexPct": compact_metric(recent_avg_abs_slip_index_pct, "0.001"),
+        "recentTakerFillPct": compact_metric(recent_taker_fill_pct, "0.1"),
+        "executionCostFloorPct": compact_metric(execution_cost_floor_pct, "0.01"),
         "liquidationPrice": decimal_to_str(liq_price) if liq_price > 0 else "",
         "liquidationBufferPct": compact_metric(liq_buffer, "0.1") if liq_buffer > 0 else "",
         "targetBalanceProgressPct": compact_metric(target_balance.get("progressPct"), "0.1"),
@@ -10667,6 +10885,21 @@ class AutomationEngine:
             if self._order_age_seconds(order) >= DIP_SWING_EXIT_ORDER_MAX_AGE_SECONDS
         ]
         symbol_pressure = build_execution_symbol_pressure_snapshot(inst_id, limit=160)
+        recent_avg_abs_slip_mark_pct = safe_decimal(symbol_pressure.get("avgAbsSlipMarkPct"), "0")
+        recent_avg_abs_slip_index_pct = safe_decimal(symbol_pressure.get("avgAbsSlipIndexPct"), "0")
+        recent_taker_fill_pct = safe_decimal(symbol_pressure.get("takerFillPct"), "0")
+        execution_cost_floor_pct = safe_decimal(symbol_pressure.get("executionCostFloorPct"), "0")
+        estimated_cost_pct = max(
+            estimated_cost_pct,
+            execution_cost_floor_pct + safe_decimal(cost_snapshot.get("fundingDragPct"), "0"),
+        )
+        net_edge_pct = setup_edge_pct - estimated_cost_pct
+        edge_cost_ratio = (setup_edge_pct / estimated_cost_pct) if estimated_cost_pct > 0 else Decimal("0")
+        range_cost_ratio = (volatility_pct / estimated_cost_pct) if estimated_cost_pct > 0 else Decimal("0")
+        atr_cost_ratio = (atr_pct / estimated_cost_pct) if estimated_cost_pct > 0 else Decimal("0")
+        edge_cost_ready = edge_cost_ratio >= DIP_SWING_MIN_EDGE_COST_RATIO
+        range_cost_ready = range_cost_ratio >= DIP_SWING_MIN_RANGE_COST_RATIO
+        atr_cost_ready = atr_cost_ratio >= DIP_SWING_MIN_ATR_COST_RATIO
         floating_pnl = safe_decimal(open_position.get("upl"), "0")
         floating_pnl_pct = Decimal("0")
         if entry_price > 0 and last_price > 0 and position_side == "long":
@@ -10693,6 +10926,7 @@ class AutomationEngine:
             f"预期净优势 {compact_metric(net_edge_pct, '0.01')}% / "
             f"ATR {compact_metric(atr_pct, '0.01')}% / "
             f"maker {compact_metric(maker_fee_pct, '0.001')}% / taker {compact_metric(taker_fee_pct, '0.001')}% / "
+            f"滑点 {compact_metric(recent_avg_abs_slip_mark_pct, '0.001')}% / taker占比 {compact_metric(recent_taker_fill_pct, '0.1')}% / "
             f"成交额 {format_decimal(avg_quote_volume_usd, 0)}U / "
             f"开平差 {symbol_pressure['openCloseGap']} / 连开 {symbol_pressure['consecutiveOpenStreak']}"
         )
@@ -10800,7 +11034,19 @@ class AutomationEngine:
         if trade_contracts <= 0:
             self._set_market(market_key, {"lastMessage": "当前保证金预算不足以触发最小下单单位，继续观察"})
             return
-        entry_signal_ready = True
+        entry_signal_ready = (
+            str(signal.get("trend") or "") == "up"
+            and entry_score >= DIP_SWING_MIN_ENTRY_SCORE
+            and (bool(signal.get("pullbackContext")) or bool(signal.get("bullCross")))
+            and (bool(signal.get("reboundReady")) or bool(signal.get("bullCross")))
+            and bool(signal.get("notOverextended"))
+            and edge_cost_ready
+            and range_cost_ready
+            and atr_cost_ready
+            and liquidity_ready
+            and int(symbol_pressure.get("openCloseGap") or 0) <= DIP_SWING_MAX_OPEN_CLOSE_GAP
+            and int(symbol_pressure.get("consecutiveOpenStreak") or 0) <= DIP_SWING_MAX_CONSECUTIVE_OPEN_STREAK
+        )
         if pending_entry_orders:
             stale_entry_orders = [
                 order for order in pending_entry_orders
@@ -10833,6 +11079,34 @@ class AutomationEngine:
                 return
         if not allow_new_entries:
             self._set_market(market_key, {"lastMessage": f"{ONLY_STRATEGY_LABEL}准备开仓，但当前联网决策层为“{analysis_label}”，本轮不新开仓"})
+            return
+        if not entry_signal_ready:
+            reasons: list[str] = []
+            if not edge_cost_ready:
+                reasons.append(f"结构优势/成本比不足 {compact_metric(edge_cost_ratio, '0.01')}x")
+            if not range_cost_ready:
+                reasons.append(f"波动/成本比不足 {compact_metric(range_cost_ratio, '0.01')}x")
+            if not atr_cost_ready:
+                reasons.append(f"ATR/成本比不足 {compact_metric(atr_cost_ratio, '0.01')}x")
+            if not liquidity_ready:
+                reasons.append("流动性不足")
+            if int(symbol_pressure.get("openCloseGap") or 0) > DIP_SWING_MAX_OPEN_CLOSE_GAP:
+                reasons.append(f"开平差过大 {symbol_pressure['openCloseGap']}")
+            if int(symbol_pressure.get("consecutiveOpenStreak") or 0) > DIP_SWING_MAX_CONSECUTIVE_OPEN_STREAK:
+                reasons.append(f"连续开仓过多 {symbol_pressure['consecutiveOpenStreak']}")
+            if recent_avg_abs_slip_mark_pct > 0 or recent_taker_fill_pct > 0:
+                reasons.append(
+                    f"近期滑点 {compact_metric(recent_avg_abs_slip_mark_pct, '0.001')}% / taker {compact_metric(recent_taker_fill_pct, '0.1')}%"
+                )
+            self._set_market(
+                market_key,
+                {
+                    "lastMessage": (
+                        f"{ONLY_STRATEGY_LABEL}准备开仓，但近期真实执行拖累偏高"
+                        + (f" · {' / '.join(reasons[:4])}" if reasons else "")
+                    )
+                },
+            )
             return
         cooldown_ready, reason = self._cooldown_ready(market_key, int(automation["cooldownSeconds"]))
         if not cooldown_ready:
