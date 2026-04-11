@@ -4335,7 +4335,7 @@ function renderOrderGlobalSummary(groups) {
   if (!target) return;
   if (!groups.length) {
     target.className = "order-global-summary empty";
-    target.textContent = "订单终端会在这里显示组合总收益、已实现、持仓浮动和现价估算。";
+    target.textContent = "订单终端会在这里显示净结果、已实现和手续费三组关键数据。";
     return;
   }
 
@@ -4358,8 +4358,12 @@ function renderOrderGlobalSummary(groups) {
   const arbRealizedPnl = Number(journal.arbRealizedPnl ?? groups.reduce((sum, group) => sum + Number(group.arbRealizedPnl || 0), 0));
   const arbTotalFees = Number(journal.arbTotalFees ?? groups.reduce((sum, group) => sum + Number(group.arbTotalFees || 0), 0));
   const arbNetPnl = Number(journal.arbNetPnl ?? (arbRealizedPnl + arbTotalFees));
+  const totalFees = Number(journal.totalFees ?? 0);
+  const netResult = Number(journal.netPnl ?? (realized + totalFees));
   const successRate = totalCount ? (filledCount / totalCount) * 100 : execution.successRate;
-  const totalTone = total > 0 ? "positive" : total < 0 ? "negative" : "muted";
+  const totalTone = netResult > 0 ? "positive" : netResult < 0 ? "negative" : "muted";
+  const realizedTone = realized > 0 ? "positive" : realized < 0 ? "negative" : "muted";
+  const feeTone = totalFees > 0 ? "positive" : totalFees < 0 ? "negative" : "muted";
   const summaryCancelReason = journal.lastCancelReason || execution.latestCancelReason || execution.topCancelReason || "";
   const summaryAlertLabel = isBenignExecutionCancelReason(summaryCancelReason) ? "最近执行提示" : "最近异常";
   const summaryCancelReasonText = summarizeOrderCancelReason(summaryCancelReason) || summaryCancelReason;
@@ -4382,16 +4386,28 @@ function renderOrderGlobalSummary(groups) {
     <div class="order-global-summary-head">
       <div>
         <span class="order-global-summary-eyebrow">组合订单收益总览</span>
-        <strong class="tone-${totalTone}">${formatSignedMoney(total)} USDT</strong>
+        <strong class="tone-${totalTone}">${formatSignedMoney(netResult)} USDT</strong>
         <small>${activeSymbols} 个币种 · ${visibleOrders} 笔当前可见订单 · 账本成交 ${filledCount} / 异常 ${riskCount}${arbOrderCount ? ` · 套利 ${arbOrderCount} 笔` : ""}</small>
       </div>
     </div>
-    <div class="order-global-summary-grid">
-      <div class="order-global-summary-card">
+    <div class="order-global-summary-hero-grid">
+      <div class="order-global-summary-hero-card">
         <span>已实现</span>
-        <strong class="tone-${realized > 0 ? "positive" : realized < 0 ? "negative" : "muted"}">${formatSignedMoney(realized)} USDT</strong>
+        <strong class="tone-${realizedTone}">${formatSignedMoney(realized)} USDT</strong>
         <small>交易所明确回报</small>
       </div>
+      <div class="order-global-summary-hero-card">
+        <span>手续费</span>
+        <strong class="tone-${feeTone}">${formatSignedMoney(totalFees)} USDT</strong>
+        <small>近场累计成交成本</small>
+      </div>
+      <div class="order-global-summary-hero-card">
+        <span>净结果</span>
+        <strong class="tone-${totalTone}">${formatSignedMoney(netResult)} USDT</strong>
+        <small>已实现 + 手续费</small>
+      </div>
+    </div>
+    <div class="order-global-summary-grid">
       <div class="order-global-summary-card">
         <span>持仓浮动</span>
         <strong class="tone-${position > 0 ? "positive" : position < 0 ? "negative" : "muted"}">${formatSignedMoney(position)} USDT</strong>

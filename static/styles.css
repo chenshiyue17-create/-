@@ -1869,6 +1869,42 @@ select:focus {
   line-height: 1.55;
 }
 
+.order-global-summary-hero-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.order-global-summary-hero-card {
+  display: grid;
+  gap: 8px;
+  padding: 18px 20px;
+  border: 1px solid rgba(255,255,255,0.08);
+  background:
+    linear-gradient(180deg, rgba(255,255,255,0.04), rgba(255,255,255,0.02)),
+    rgba(255,255,255,0.03);
+}
+
+.order-global-summary-hero-card span {
+  color: var(--accent-2);
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.order-global-summary-hero-card strong {
+  font-size: clamp(30px, 4vw, 56px);
+  line-height: 0.94;
+  letter-spacing: -0.04em;
+  font-weight: 800;
+}
+
+.order-global-summary-hero-card small {
+  color: var(--muted);
+  line-height: 1.45;
+  font-size: 13px;
+}
+
 .order-global-summary-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -2637,6 +2673,7 @@ body[data-view="focus"] #automation .focus-inline-note {
   .portfolio-watchlist-grid,
   .portfolio-coin-hero,
   .portfolio-coin-grid,
+  .order-global-summary-hero-grid,
   .order-global-summary-head,
   .order-global-summary-grid,
   .order-symbol-overview,

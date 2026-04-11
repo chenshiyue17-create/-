@@ -3380,7 +3380,7 @@ def persist_local_orders(orders: list[dict[str, Any]], *, source: str = "") -> l
                 continue
             seen.add(key)
             deduped.append(copy.deepcopy(item))
-            if len(deduped) >= 80:
+            if len(deduped) >= MAX_RECENT_ORDER_LIMIT:
                 break
         deduped.sort(
             key=lambda row: int(row.get("uTime") or row.get("cTime") or 0),
@@ -3413,26 +3413,41 @@ def get_stored_local_orders(inst_type: str = "", limit: int = 20) -> list[dict[s
     return items[:limit]
 
 
-def get_execution_journal_snapshot(inst_type: str = "", limit: int = 20) -> dict[str, Any]:
+def get_execution_journal_orders(inst_type: str = "", limit: int = DEFAULT_RECENT_ORDER_LIMIT) -> tuple[list[dict[str, Any]], str, str]:
     state = LOCAL_ORDER_STORE.current()
+    stored_orders = get_stored_local_orders(inst_type, limit=MAX_RECENT_ORDER_LIMIT)
+    stream_orders = PRIVATE_ORDER_STREAM.get_recent_orders(inst_type, limit=MAX_RECENT_ORDER_LIMIT)
+    fallback_orders = derive_orders_from_automation_state()
     if inst_type:
-        orders = backfill_paper_execution_metrics(get_stored_local_orders(inst_type, limit=limit))
-        summary = build_execution_journal_summary(orders)
-        return {
-            "orders": orders,
-            "summary": {key: value for key, value in summary.items() if key != "symbols"},
-            "symbols": summary.get("symbols") or [],
-            "lastReconciledAt": str(state.get("lastReconciledAt") or ""),
-            "lastSource": str(state.get("lastSource") or ""),
-        }
-    orders = backfill_paper_execution_metrics(list((state.get("orders") or [])[:limit]))
+        expected = inst_type.upper()
+        fallback_orders = [item for item in fallback_orders if str(item.get("instType") or "").upper() == expected]
+    merged_orders = merge_order_feeds(stream_orders, stored_orders, fallback_orders, limit=MAX_RECENT_ORDER_LIMIT)
+    merged_orders = backfill_paper_execution_metrics(merged_orders)
+    source_parts: list[str] = []
+    if stream_orders:
+        source_parts.append("private_ws")
+    stored_source = str(state.get("lastSource") or "").strip()
+    if stored_source:
+        source_parts.append(stored_source)
+    if fallback_orders and not source_parts:
+        source_parts.append("paper_state_recovered")
+    source_label = "+".join(dict.fromkeys(source_parts)) if source_parts else ""
+    last_reconciled = str(state.get("lastReconciledAt") or "")
+    stream_last_event = str((PRIVATE_ORDER_STREAM.snapshot() or {}).get("lastEventAt") or "")
+    if stream_last_event and stream_last_event > last_reconciled:
+        last_reconciled = stream_last_event
+    return merged_orders[:limit], source_label, last_reconciled
+
+
+def get_execution_journal_snapshot(inst_type: str = "", limit: int = 20) -> dict[str, Any]:
+    orders, source_label, last_reconciled = get_execution_journal_orders(inst_type, limit=limit)
     summary = build_execution_journal_summary(orders)
     return {
         "orders": orders,
         "summary": {key: value for key, value in summary.items() if key != "symbols"},
         "symbols": summary.get("symbols") or [],
-        "lastReconciledAt": str(state.get("lastReconciledAt") or ""),
-        "lastSource": str(state.get("lastSource") or ""),
+        "lastReconciledAt": last_reconciled,
+        "lastSource": source_label,
     }
 
 
@@ -4643,13 +4658,13 @@ class OkxPrivateOrderStream:
                     continue
                 seen.add(key)
                 deduped.append(item)
-                if len(deduped) >= 40:
+                if len(deduped) >= MAX_RECENT_ORDER_LIMIT:
                     break
             self.orders = deduped
             self.last_event_at = now_local_iso()
             self.connected = True
             self.last_error = ""
-        persist_local_orders(deduped[:40], source="private_ws")
+        persist_local_orders(deduped[:MAX_RECENT_ORDER_LIMIT], source="private_ws")
 
 
 def validate_config(config: dict[str, Any]) -> tuple[bool, str]:
@@ -12881,7 +12896,7 @@ class AppHandler(BaseHTTPRequestHandler):
 
         if path == "/api/automation/state":
             state = sanitize_only_dip_swing_runtime_state(AUTOMATION_ENGINE.snapshot(), AUTOMATION_CONFIG.current())
-            state["executionJournal"] = get_execution_journal_snapshot(limit=20)
+            state["executionJournal"] = get_execution_journal_snapshot(limit=DEFAULT_RECENT_ORDER_LIMIT)
             json_response(self, {"ok": True, "state": state})
             return
 
@@ -12892,7 +12907,7 @@ class AppHandler(BaseHTTPRequestHandler):
                     AUTOMATION_ENGINE.snapshot(),
                     AUTOMATION_CONFIG.current(),
                 ),
-                "executionJournal": get_execution_journal_snapshot(limit=20),
+                "executionJournal": get_execution_journal_snapshot(limit=DEFAULT_RECENT_ORDER_LIMIT),
                 "timestamp": int(time.time()),
             }
 
