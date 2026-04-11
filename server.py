@@ -1454,8 +1454,8 @@ def validate_single_automation_target(config: dict[str, Any]) -> str:
     max_orders = int(config.get("maxOrdersPerDay", 0))
     if fast < 2 or slow <= fast:
         return "EMA 参数不合法，必须满足 slow > fast >= 2"
-    if poll < 5 or poll > 300:
-        return "轮询秒数需在 5 到 300 之间"
+    if poll < 1 or poll > 300:
+        return "轮询秒数需在 1 到 300 之间"
     if cooldown < 0 or cooldown > 3600:
         return "冷却秒数需在 0 到 3600 之间"
     if max_orders < 0 or max_orders > 500:
@@ -10130,7 +10130,7 @@ class AutomationEngine:
                     else:
                         self.stop("自动量化已停止：连续错误过多")
                         return
-            wait_seconds = max(5, int(automation.get("pollSeconds", 20)))
+            wait_seconds = max(1, int(automation.get("pollSeconds", 20)))
             if self.stop_event.wait(wait_seconds):
                 return
 
