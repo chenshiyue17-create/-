@@ -104,7 +104,7 @@ BASIS_ARB_SCAN_LOCK = threading.RLock()
 BASIS_ARB_MARKET_UNIVERSE_CACHE: dict[str, Any] = {"ts": 0.0, "symbols": []}
 BASIS_ARB_MARKET_SCAN_CACHE: dict[str, Any] = {"ts": 0.0, "key": "", "rows": []}
 DIP_SWING_SCAN_SYMBOL_LIMIT = 24
-DIP_SWING_EXECUTION_TARGET_LIMIT = 12
+DIP_SWING_EXECUTION_TARGET_LIMIT = 18
 DIP_SWING_SCAN_LOCK = threading.RLock()
 DIP_SWING_MARKET_UNIVERSE_CACHE: dict[str, Any] = {"ts": 0.0, "symbols": []}
 DIP_SWING_MARKET_SCAN_CACHE: dict[str, Any] = {"ts": 0.0, "key": "", "rows": []}
@@ -117,9 +117,9 @@ ONLY_STRATEGY_LABEL = "利润循环"
 ONLY_STRATEGY_FALLBACK_DECISION = "持续开仓"
 DIP_SWING_NET_TARGET_USDT = Decimal("1")
 DIP_SWING_MIN_NET_HOLD_USDT = Decimal("-999999")
-DIP_SWING_ENTRY_ORDER_MAX_AGE_SECONDS = 30
-DIP_SWING_EXIT_ORDER_MAX_AGE_SECONDS = 20
-DIP_SWING_MAX_PENDING_ENTRY_ORDERS_PER_SYMBOL = 3
+DIP_SWING_ENTRY_ORDER_MAX_AGE_SECONDS = 8
+DIP_SWING_EXIT_ORDER_MAX_AGE_SECONDS = 8
+DIP_SWING_MAX_PENDING_ENTRY_ORDERS_PER_SYMBOL = 6
 DIP_SWING_DIRECTION_LOOKBACK_BARS = 6
 DIP_SWING_MIN_PULLBACK_PCT = Decimal("0.45")
 DIP_SWING_MAX_PULLBACK_PCT = Decimal("1.60")
@@ -141,9 +141,9 @@ DIP_SWING_MIN_ATR_COST_RATIO = Decimal("1.4")
 DIP_SWING_MIN_AVG_QUOTE_VOLUME_USD = Decimal("3000000")
 DIP_SWING_MIN_OPEN_INTEREST_USD = Decimal("6000000")
 DIP_SWING_MIN_PROTECTIVE_EXIT_PCT = Decimal("0.28")
-DIP_SWING_ORDER_PRESSURE_WINDOW_MINUTES = 240
-DIP_SWING_MAX_OPEN_CLOSE_GAP = 4
-DIP_SWING_MAX_CONSECUTIVE_OPEN_STREAK = 3
+DIP_SWING_ORDER_PRESSURE_WINDOW_MINUTES = 90
+DIP_SWING_MAX_OPEN_CLOSE_GAP = 18
+DIP_SWING_MAX_CONSECUTIVE_OPEN_STREAK = 10
 DIP_SWING_SYMBOL_PERF_MIN_CLOSE_ORDERS = 2
 DIP_SWING_SYMBOL_NEGATIVE_NET_WARN_USDT = Decimal("5")
 DIP_SWING_SYMBOL_NEGATIVE_NET_BLOCK_USDT = Decimal("15")
@@ -11068,6 +11068,7 @@ class AutomationEngine:
             (position_side == "long" and desired_side == "buy")
             or (position_side == "short" and desired_side == "sell")
         )
+        effective_cooldown_seconds = min(max(0, int(automation.get("cooldownSeconds", 0))), 2)
         pending_entry_orders = self._working_swap_orders(inst_id, side="buy", reduce_only=False)
         pending_entry_orders += self._working_swap_orders(inst_id, side="sell", reduce_only=False)
         pending_entry_capacity = max(1, DIP_SWING_MAX_PENDING_ENTRY_ORDERS_PER_SYMBOL)
@@ -11252,7 +11253,7 @@ class AutomationEngine:
             if pending_exit_orders:
                 self._cancel_swap_orders(client, inst_id, pending_exit_orders, "这单净利目标未到，撤掉旧平仓单继续持有", market_key=market_key)
             if allow_new_entries and holding_same_direction and trade_contracts > 0:
-                cooldown_ready, reason = self._cooldown_ready(market_key, int(automation["cooldownSeconds"]))
+                cooldown_ready, reason = self._cooldown_ready(market_key, effective_cooldown_seconds)
                 if not cooldown_ready:
                     self._set_market(
                         market_key,
@@ -11355,7 +11356,7 @@ class AutomationEngine:
                 },
             )
             return
-        cooldown_ready, reason = self._cooldown_ready(market_key, int(automation["cooldownSeconds"]))
+        cooldown_ready, reason = self._cooldown_ready(market_key, effective_cooldown_seconds)
         if not cooldown_ready:
             self._set_market(market_key, {"lastMessage": f"{ONLY_STRATEGY_LABEL}准备开仓，但{reason}"})
             return
