@@ -1972,6 +1972,11 @@ def sanitize_only_dip_swing_runtime_state(state: dict[str, Any], automation: dic
     effective = enforce_only_dip_swing_strategy(deep_merge(default_automation_config(), automation or {}))
     sanitized = reconcile_runtime_state_with_automation(copy.deepcopy(state or {}), effective)
     sanitized["analysis"] = sanitize_only_dip_swing_analysis(sanitized.get("analysis") or {}, effective)
+    raw_last_error = str(sanitized.get("lastError") or "").strip()
+    if "exit_score" in raw_last_error:
+        sanitized["lastError"] = ""
+        if not sanitized.get("running"):
+            sanitized["statusText"] = "等待重新启动利润循环"
 
     if has_legacy_non_swing_text(sanitized.get("modeText")):
         sanitized["modeText"] = ONLY_STRATEGY_LABEL

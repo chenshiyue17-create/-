@@ -1848,6 +1848,7 @@ function renderAnalysisState(analysis) {
 function extractAutomationStopReason(statusText = "", lastError = "") {
   const rawStatus = String(statusText || "").trim();
   const rawError = String(lastError || "").trim();
+  if (/exit_score/.test(rawError) || /exit_score/.test(rawStatus)) return "";
   const trimmedStatus = rawStatus
     .replace(/^自动量化已停止[:：]?\s*/, "")
     .replace(/^组合策略已停止[:：]?\s*/, "")
