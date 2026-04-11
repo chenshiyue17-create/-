@@ -125,6 +125,7 @@ DIP_SWING_EXIT_ORDER_MAX_AGE_SECONDS = 4
 DIP_SWING_EXIT_RETRY_SECONDS = 2
 DIP_SWING_MAX_PENDING_ENTRY_ORDERS_PER_SYMBOL = 64
 DIP_SWING_NON_BLOCKING_ORDER_TYPES = {"market", "ioc", "fok", "optimal_limit_ioc"}
+OKX_BATCH_ORDER_LIMIT = 20
 DIP_SWING_DIRECTION_LOOKBACK_BARS = 6
 DIP_SWING_MIN_PULLBACK_PCT = Decimal("0.45")
 DIP_SWING_MAX_PULLBACK_PCT = Decimal("1.60")
@@ -4432,6 +4433,23 @@ class OkxClient:
                 return self._paper_place_order(payload)
             raise
 
+    def place_orders(self, payloads: list[dict[str, Any]]) -> dict[str, Any]:
+        cleaned = [payload for payload in (payloads or []) if isinstance(payload, dict) and payload]
+        if not cleaned:
+            return {"code": "0", "data": []}
+        try:
+            result = self._request("POST", "/api/v5/trade/batch-orders", payload=cleaned)
+            self._extract_data_or_raise(result)
+            return result
+        except Exception:
+            if self._paper_enabled():
+                rows: list[dict[str, Any]] = []
+                for payload in cleaned:
+                    result = self._paper_place_order(payload)
+                    rows.extend(result.get("data") or [])
+                return {"code": "0", "data": rows, "_paperSim": True}
+            raise
+
     def get_order(self, inst_id: str, ord_id: str | None = None, cl_ord_id: str | None = None) -> dict[str, Any]:
         params = {"instId": inst_id}
         if ord_id:
@@ -4457,6 +4475,29 @@ class OkxClient:
                     "data": [{"instId": inst_id, "ordId": ord_id or "", "clOrdId": cl_ord_id or "", "sCode": "0"}],
                     "_paperSim": True,
                 }
+            raise
+
+    def cancel_orders(self, payloads: list[dict[str, Any]]) -> dict[str, Any]:
+        cleaned = [payload for payload in (payloads or []) if isinstance(payload, dict) and payload.get("instId")]
+        if not cleaned:
+            return {"code": "0", "data": []}
+        try:
+            result = self._request("POST", "/api/v5/trade/cancel-batch-orders", payload=cleaned)
+            self._extract_data_or_raise(result)
+            return result
+        except Exception:
+            if self._paper_enabled():
+                rows: list[dict[str, Any]] = []
+                for payload in cleaned:
+                    rows.append(
+                        {
+                            "instId": str(payload.get("instId") or ""),
+                            "ordId": str(payload.get("ordId") or ""),
+                            "clOrdId": str(payload.get("clOrdId") or ""),
+                            "sCode": "0",
+                        }
+                    )
+                return {"code": "0", "data": rows, "_paperSim": True}
             raise
 
 
@@ -10024,19 +10065,55 @@ class AutomationEngine:
         market_key: str = "swap",
     ) -> None:
         canceled = 0
+        cancel_payloads: list[dict[str, Any]] = []
+        order_lookup: dict[tuple[str, str], dict[str, Any]] = {}
         for order in orders:
             ord_id = str(order.get("ordId") or "").strip()
             cl_ord_id = str(order.get("clOrdId") or "").strip()
             if not ord_id and not cl_ord_id:
                 continue
+            payload = {"instId": inst_id}
+            if ord_id:
+                payload["ordId"] = ord_id
+            if cl_ord_id:
+                payload["clOrdId"] = cl_ord_id
+            cancel_payloads.append(payload)
+            order_lookup[(ord_id, cl_ord_id)] = order
+
+        for start in range(0, len(cancel_payloads), OKX_BATCH_ORDER_LIMIT):
+            chunk = cancel_payloads[start:start + OKX_BATCH_ORDER_LIMIT]
+            if not chunk:
+                continue
             try:
-                result = client.cancel_order(inst_id, ord_id=ord_id or None, cl_ord_id=cl_ord_id or None)
-                ack = deep_merge(order, (result.get("data") or [{}])[0])
-                ack["state"] = "canceled"
-                PRIVATE_ORDER_STREAM._ingest_orders([ack])
-                canceled += 1
+                result = client.cancel_orders(chunk)
+                rows = result.get("data") or []
+                if not rows:
+                    rows = chunk
+                ack_rows: list[dict[str, Any]] = []
+                for row in rows:
+                    ord_id = str(row.get("ordId") or "").strip()
+                    cl_ord_id = str(row.get("clOrdId") or "").strip()
+                    original = order_lookup.get((ord_id, cl_ord_id), {})
+                    ack = deep_merge(original, row)
+                    ack["state"] = "canceled"
+                    ack_rows.append(ack)
+                if ack_rows:
+                    PRIVATE_ORDER_STREAM._ingest_orders(ack_rows)
+                    canceled += len(ack_rows)
             except Exception as exc:
-                self._log("warn", f"{reason} · 永续 {inst_id} 撤单失败: {exc}")
+                self._log("warn", f"{reason} · 永续 {inst_id} 批量撤单失败，回退逐笔: {exc}")
+                for payload in chunk:
+                    ord_id = str(payload.get("ordId") or "").strip()
+                    cl_ord_id = str(payload.get("clOrdId") or "").strip()
+                    try:
+                        result = client.cancel_order(inst_id, ord_id=ord_id or None, cl_ord_id=cl_ord_id or None)
+                        original = order_lookup.get((ord_id, cl_ord_id), {})
+                        ack = deep_merge(original, (result.get("data") or [{}])[0])
+                        ack["state"] = "canceled"
+                        PRIVATE_ORDER_STREAM._ingest_orders([ack])
+                        canceled += 1
+                    except Exception as single_exc:
+                        self._log("warn", f"{reason} · 永续 {inst_id} 撤单失败: {single_exc}")
         if canceled > 0:
             self._set_market(market_key, {"lastMessage": f"{reason} · 已撤 {canceled} 笔挂单"})
             self._log("info", f"{reason} · 永续 {inst_id} 已撤 {canceled} 笔挂单")
