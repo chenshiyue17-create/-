@@ -2612,6 +2612,33 @@ def order_total_fee(order: dict[str, Any]) -> Decimal:
     return order_decimal_metric(order, "fillFee", "fee")
 
 
+def is_benign_ioc_cancel_reason(reason: Any) -> bool:
+    text = str(reason or "").strip().lower()
+    if not text:
+        return False
+    return (
+        "immediate or cancel" in text
+        and "was canceled" in text
+        and "wasn" in text
+        and "filled completely" in text
+    )
+
+
+def summarize_execution_cancel_reason(reason: Any) -> str:
+    text = str(reason or "").strip()
+    if not text:
+        return ""
+    lower = text.lower()
+    if is_benign_ioc_cancel_reason(text):
+        return "IOC 保护单未完全成交，剩余部分已自动撤销。"
+    if (
+        "estimated fill price exceeded the price limit" in lower
+        or "slipped beyond the best bid or ask price by at least 5%" in lower
+    ):
+        return "滑点 / 价格保护触发，交易所取消了这笔单。"
+    return text
+
+
 def order_execution_type(order: dict[str, Any]) -> str:
     return str(order.get("execType") or "").strip().upper()
 
@@ -3088,11 +3115,15 @@ def build_execution_journal_summary(orders: list[dict[str, Any]]) -> dict[str, A
         elif kind == "canceled":
             canceled_orders += 1
             if not last_cancel_reason:
-                last_cancel_reason = str(order.get("cancelSourceReason") or order.get("outcome") or "").strip()
+                last_cancel_reason = summarize_execution_cancel_reason(
+                    order.get("cancelSourceReason") or order.get("outcome") or ""
+                )
         elif kind == "rejected":
             rejected_orders += 1
             if not last_cancel_reason:
-                last_cancel_reason = str(order.get("cancelSourceReason") or order.get("outcome") or "").strip()
+                last_cancel_reason = summarize_execution_cancel_reason(
+                    order.get("cancelSourceReason") or order.get("outcome") or ""
+                )
 
         realized_pnl += realized_value
         total_fees += fee_value
