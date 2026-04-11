@@ -104,7 +104,7 @@ BASIS_ARB_SCAN_LOCK = threading.RLock()
 BASIS_ARB_MARKET_UNIVERSE_CACHE: dict[str, Any] = {"ts": 0.0, "symbols": []}
 BASIS_ARB_MARKET_SCAN_CACHE: dict[str, Any] = {"ts": 0.0, "key": "", "rows": []}
 DIP_SWING_SCAN_SYMBOL_LIMIT = 24
-DIP_SWING_EXECUTION_TARGET_LIMIT = 3
+DIP_SWING_EXECUTION_TARGET_LIMIT = 12
 DIP_SWING_SCAN_LOCK = threading.RLock()
 DIP_SWING_MARKET_UNIVERSE_CACHE: dict[str, Any] = {"ts": 0.0, "symbols": []}
 DIP_SWING_MARKET_SCAN_CACHE: dict[str, Any] = {"ts": 0.0, "key": "", "rows": []}
@@ -119,6 +119,7 @@ DIP_SWING_NET_TARGET_USDT = Decimal("1")
 DIP_SWING_MIN_NET_HOLD_USDT = Decimal("-999999")
 DIP_SWING_ENTRY_ORDER_MAX_AGE_SECONDS = 30
 DIP_SWING_EXIT_ORDER_MAX_AGE_SECONDS = 20
+DIP_SWING_MAX_PENDING_ENTRY_ORDERS_PER_SYMBOL = 3
 DIP_SWING_DIRECTION_LOOKBACK_BARS = 6
 DIP_SWING_MIN_PULLBACK_PCT = Decimal("0.45")
 DIP_SWING_MAX_PULLBACK_PCT = Decimal("1.60")
@@ -152,8 +153,8 @@ DIP_SWING_HARD_BREAK_LOSS_PCT = Decimal("0.45")
 DIP_SWING_POST_ONLY_BUFFER_PCT = Decimal("0.02")
 DIP_SWING_EXIT_POST_ONLY_BUFFER_PCT = Decimal("0.02")
 DIP_SWING_EXIT_PROTECTION_PCT = Decimal("0.08")
-DIP_SWING_TARGET_MIN_MARGIN_RATIO = Decimal("0.003")
-DIP_SWING_TARGET_MAX_MARGIN_RATIO = Decimal("0.012")
+DIP_SWING_TARGET_MIN_MARGIN_RATIO = Decimal("0.008")
+DIP_SWING_TARGET_MAX_MARGIN_RATIO = Decimal("0.030")
 DIP_SWING_MIN_LIQ_BUFFER_PCT = Decimal("18")
 DIP_SWING_MAX_LEVERAGE = Decimal("10")
 OKX_DEFAULT_SWAP_MAKER_FEE_PCT = Decimal("0.02")
@@ -11069,6 +11070,7 @@ class AutomationEngine:
         )
         pending_entry_orders = self._working_swap_orders(inst_id, side="buy", reduce_only=False)
         pending_entry_orders += self._working_swap_orders(inst_id, side="sell", reduce_only=False)
+        pending_entry_capacity = max(1, DIP_SWING_MAX_PENDING_ENTRY_ORDERS_PER_SYMBOL)
         pending_exit_orders = self._working_swap_orders(inst_id, side="sell", reduce_only=True)
         pending_exit_orders += self._working_swap_orders(inst_id, side="buy", reduce_only=True)
         stale_exit_orders = [
@@ -11189,13 +11191,14 @@ class AutomationEngine:
             elif stale_entry_orders:
                 self._cancel_swap_orders(client, inst_id, stale_entry_orders, "同向挂单超时，准备重挂", market_key=market_key)
                 pending_entry_orders = [order for order in pending_entry_orders if order not in stale_entry_orders]
-            elif pending_entry_orders:
+            elif pending_entry_orders and len(pending_entry_orders) >= pending_entry_capacity:
                 oldest_age = max(self._order_age_seconds(order) for order in pending_entry_orders)
                 self._set_market(
                     market_key,
                     {
                         "lastMessage": (
-                            f"{ONLY_STRATEGY_LABEL}同向持仓继续挂单中 · 已挂 {len(pending_entry_orders)} 笔 / {int(oldest_age)} 秒"
+                            f"{ONLY_STRATEGY_LABEL}同向持仓继续挂单中 · 已挂 {len(pending_entry_orders)} / 上限 {pending_entry_capacity} 笔"
+                            f" / {int(oldest_age)} 秒"
                             f" · {status_text}"
                         )
                     },
@@ -11264,7 +11267,11 @@ class AutomationEngine:
                     desired_side,
                     trade_contracts,
                     automation["swapTdMode"],
-                    f"{ONLY_STRATEGY_LABEL}同向加仓循环 · {desired_side_label} · 动态仓位 {decimal_to_str(trade_contracts)} 张",
+                    (
+                        f"{ONLY_STRATEGY_LABEL}同向加仓循环 · {desired_side_label}"
+                        f" · 动态仓位 {decimal_to_str(trade_contracts)} 张"
+                        f" · 并发挂单 {len(pending_entry_orders) + 1}/{pending_entry_capacity}"
+                    ),
                     passive_entry=True,
                     market_key=market_key,
                 )
@@ -11300,13 +11307,14 @@ class AutomationEngine:
             elif stale_entry_orders:
                 self._cancel_swap_orders(client, inst_id, stale_entry_orders, "被动挂单超时，准备重挂", market_key=market_key)
                 pending_entry_orders = [order for order in pending_entry_orders if order not in stale_entry_orders]
-            else:
+            elif len(pending_entry_orders) >= pending_entry_capacity:
                 oldest_age = max(self._order_age_seconds(order) for order in pending_entry_orders)
                 self._set_market(
                     market_key,
                     {
                         "lastMessage": (
-                            f"maker-first 挂单等待成交 · 已挂 {len(pending_entry_orders)} 笔 / {int(oldest_age)} 秒"
+                            f"maker-first 挂单等待成交 · 已挂 {len(pending_entry_orders)} / 上限 {pending_entry_capacity} 笔"
+                            f" / {int(oldest_age)} 秒"
                             f" · {status_text}"
                         )
                     },
@@ -11357,7 +11365,11 @@ class AutomationEngine:
             desired_side,
             trade_contracts,
             automation["swapTdMode"],
-            f"{ONLY_STRATEGY_LABEL}开仓 · {desired_side_label} · 动态仓位 {decimal_to_str(trade_contracts)} 张",
+            (
+                f"{ONLY_STRATEGY_LABEL}开仓 · {desired_side_label}"
+                f" · 动态仓位 {decimal_to_str(trade_contracts)} 张"
+                f" · 并发挂单 {len(pending_entry_orders) + 1}/{pending_entry_capacity}"
+            ),
             passive_entry=True,
             market_key=market_key,
         )
