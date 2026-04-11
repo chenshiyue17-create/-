@@ -9676,6 +9676,8 @@ class AutomationEngine:
         self.stop_event = threading.Event()
         self.lock = threading.RLock()
         self._prepared_swap_signature: tuple[Any, ...] | None = None
+        self._queued_swap_orders: list[dict[str, Any]] = []
+        self._queued_swap_orders_lock = threading.RLock()
 
     def snapshot(self) -> dict[str, Any]:
         snapshot = self.state_store.current()
@@ -9724,6 +9726,96 @@ class AutomationEngine:
             state["research"] = research
 
         self._update_state(mutate)
+
+    def _queue_swap_order(self, item: dict[str, Any]) -> None:
+        with self._queued_swap_orders_lock:
+            self._queued_swap_orders.append(item)
+
+    def _drain_queued_swap_orders(self) -> list[dict[str, Any]]:
+        with self._queued_swap_orders_lock:
+            queued = list(self._queued_swap_orders)
+            self._queued_swap_orders.clear()
+        return queued
+
+    def _flush_queued_swap_orders(self, client: OkxClient) -> int:
+        queued = self._drain_queued_swap_orders()
+        if not queued:
+            return 0
+        submitted = 0
+        for start in range(0, len(queued), OKX_BATCH_ORDER_LIMIT):
+            chunk = queued[start:start + OKX_BATCH_ORDER_LIMIT]
+            payloads = [dict(item.get("payload") or {}) for item in chunk if item.get("payload")]
+            if not payloads:
+                continue
+            try:
+                result = client.place_orders(payloads)
+                rows = result.get("data") or []
+                row_map = {
+                    (
+                        str((row or {}).get("instId") or ""),
+                        str((row or {}).get("clOrdId") or ""),
+                    ): (row or {})
+                    for row in rows
+                }
+                ack_rows: list[dict[str, Any]] = []
+                for item in chunk:
+                    payload = dict(item.get("payload") or {})
+                    key = (str(payload.get("instId") or ""), str(payload.get("clOrdId") or ""))
+                    row = row_map.get(key, {})
+                    order = deep_merge(payload, row)
+                    strategy_tag = str(item.get("strategyTag") or "")
+                    strategy_action = str(item.get("strategyAction") or "")
+                    strategy_leg = str(item.get("strategyLeg") or "")
+                    if strategy_tag:
+                        order["tag"] = str(order.get("tag") or strategy_tag)
+                        order["strategyTag"] = strategy_tag
+                    if strategy_action:
+                        order["strategyAction"] = strategy_action
+                    if strategy_leg:
+                        order["strategyLeg"] = strategy_leg
+                    order["strategyReason"] = item.get("reason") or ""
+                    ack_rows.append(order)
+                    order_id = order.get("ordId", "")
+                    self._increment_order_count(str(item.get("marketKey") or "swap"), order_id, str(item.get("reason") or ""))
+                    self._log(
+                        "info",
+                        f"{item.get('reason') or '批量下单'} · 永续 {payload.get('instId') or ''} 已发单 · {item.get('executionMode') or '批量'}",
+                    )
+                if ack_rows:
+                    PRIVATE_ORDER_STREAM._ingest_orders(ack_rows)
+                    submitted += len(ack_rows)
+            except Exception as exc:
+                self._log("warn", f"批量永续下单失败，回退逐笔: {exc}")
+                for item in chunk:
+                    payload = dict(item.get("payload") or {})
+                    if not payload:
+                        continue
+                    try:
+                        result = client.place_order(payload)
+                        order = deep_merge(payload, (result.get("data") or [{}])[0])
+                        strategy_tag = str(item.get("strategyTag") or "")
+                        strategy_action = str(item.get("strategyAction") or "")
+                        strategy_leg = str(item.get("strategyLeg") or "")
+                        if strategy_tag:
+                            order["tag"] = str(order.get("tag") or strategy_tag)
+                            order["strategyTag"] = strategy_tag
+                        if strategy_action:
+                            order["strategyAction"] = strategy_action
+                        if strategy_leg:
+                            order["strategyLeg"] = strategy_leg
+                        order["strategyReason"] = item.get("reason") or ""
+                        if order.get("ordId") or order.get("clOrdId"):
+                            PRIVATE_ORDER_STREAM._ingest_orders([order])
+                        order_id = order.get("ordId", "")
+                        self._increment_order_count(str(item.get("marketKey") or "swap"), order_id, str(item.get("reason") or ""))
+                        self._log(
+                            "info",
+                            f"{item.get('reason') or '逐笔回退'} · 永续 {payload.get('instId') or ''} 已发单 · {item.get('executionMode') or '逐笔回退'}",
+                        )
+                        submitted += 1
+                    except Exception as single_exc:
+                        self._log("warn", f"{item.get('reason') or '批量下单'} · 永续 {payload.get('instId') or ''} 发单失败: {single_exc}")
+        return submitted
 
     def _touch_session(self, total_eq: Decimal, automation: dict[str, Any] | None = None) -> dict[str, Any]:
         today = datetime.now().date().isoformat()
@@ -10715,6 +10807,8 @@ class AutomationEngine:
                 future_map = {executor.submit(run_target_cycle, target): target for target in targets}
                 executed_targets = [future.result() for future in concurrent.futures.as_completed(future_map)]
 
+        queued_submitted = self._flush_queued_swap_orders(client)
+
         current_state = self.snapshot()
         for target, spot_key, swap_key in executed_targets:
             spot_market = copy.deepcopy(current_state.get("markets", {}).get(spot_key) or default_market_state())
@@ -10739,6 +10833,7 @@ class AutomationEngine:
                 "enabledSpot": enabled_spot,
                 "enabledSwap": enabled_swap,
                 "activeSymbols": active_symbols,
+                "queuedSubmitted": queued_submitted,
                 "arbRuntime": arb_runtime,
             },
         }
@@ -11699,6 +11794,7 @@ class AutomationEngine:
                     passive_exit=not aggressive_scalp_mode,
                     protected_exit=not aggressive_scalp_mode,
                     prefer_fill=aggressive_scalp_mode,
+                    batchable=aggressive_scalp_mode,
                     market_key=market_key,
                     strategy_action="exit",
                     strategy_leg="swap",
@@ -11749,6 +11845,7 @@ class AutomationEngine:
                     ),
                     passive_entry=not force_market_entry,
                     prefer_fill=aggressive_scalp_mode and not force_market_entry,
+                    batchable=aggressive_scalp_mode,
                     market_key=market_key,
                     strategy_action="entry",
                     strategy_leg="swap",
@@ -11887,6 +11984,7 @@ class AutomationEngine:
             ),
             passive_entry=not force_market_entry,
             prefer_fill=aggressive_scalp_mode and not force_market_entry,
+            batchable=aggressive_scalp_mode,
             market_key=market_key,
             strategy_action="entry",
             strategy_leg="swap",
@@ -12301,6 +12399,7 @@ class AutomationEngine:
         strategy_action: str = "",
         strategy_leg: str = "",
         prefer_fill: bool = False,
+        batchable: bool = False,
     ) -> dict[str, Any]:
         if strategy_action == "entry" and not reduce_only:
             try:
@@ -12429,6 +12528,20 @@ class AutomationEngine:
             payload["reduceOnly"] = True
         if strategy_tag:
             payload["tag"] = strategy_tag
+        if batchable:
+            self._queue_swap_order(
+                {
+                    "payload": deep_merge({}, payload),
+                    "marketKey": market_key,
+                    "reason": reason,
+                    "executionMode": execution_mode,
+                    "strategyTag": strategy_tag,
+                    "strategyAction": strategy_action,
+                    "strategyLeg": strategy_leg,
+                }
+            )
+            self._log("info", f"{reason} · 永续 {inst_id} 已加入批量队列 · {execution_mode}")
+            return {"queued": True, "instId": inst_id, "clOrdId": payload.get("clOrdId", ""), "ordType": payload.get("ordType", "")}
         result = client.place_order(payload)
         order = deep_merge(payload, (result.get("data") or [{}])[0])
         if strategy_tag:
