@@ -8015,7 +8015,7 @@ def build_dip_swing_analysis(
         summary_bits.append("市场轮动目标")
     if len(execution_symbols) > 1:
         summary_bits.append(f"执行 {len(execution_symbols)} 币并行")
-    if position_side in {"long", "short"} and liq_buffer > 0:
+    if position_side in {"long", "short"} and liq_buffer > 0 and not aggressive_scalp_mode:
         summary_bits.append(f"强平缓冲 {compact_metric(liq_buffer, '0.1')}%")
     if blockers:
         summary_bits.append(blockers[0])
@@ -8035,7 +8035,8 @@ def build_dip_swing_analysis(
         "summary": " · ".join(summary_bits),
         "selectedStrategyName": f"{symbol} {ONLY_STRATEGY_LABEL}",
         "selectedStrategyDetail": (
-            "方向驱动 + 超短直开"
+            ("方向驱动 + 无脑直开" if aggressive_scalp_mode else "方向驱动 + 超短直开")
+            + 
             f" · 空仓即开 {planned_side_label}"
             f" · 每单净赚 {format_decimal(DIP_SWING_NET_TARGET_USDT, 0)}U+ 就平"
             f" · 开仓直开 / 平仓 IOC · {selected_config.get('swapTdMode', 'isolated')} {selected_config.get('swapLeverage', '2')}x"
@@ -9584,6 +9585,7 @@ class AutomationEngine:
         leverage: Decimal,
         entry_score: int = 0,
     ) -> dict[str, Any]:
+        aggressive_scalp_mode = DIP_SWING_AGGRESSIVE_SCALP_MODE
         minimum_contracts = round_down(lot_size, lot_size) if lot_size > 0 else Decimal("0")
         if minimum_contracts <= 0:
             return {
@@ -9611,6 +9613,28 @@ class AutomationEngine:
             state=state,
             target_snapshot=target_snapshot,
         )
+        if aggressive_scalp_mode and current_eq > 0 and leverage > 0 and last_price > 0 and contract_value > 0:
+            contract_margin = (last_price * contract_value) / leverage
+            planned_contracts = round_down((current_eq * DIP_SWING_TARGET_MAX_MARGIN_RATIO) / contract_margin, lot_size) if contract_margin > 0 else Decimal("0")
+            if planned_contracts < minimum_contracts:
+                planned_contracts = Decimal("0")
+            margin_budget = contract_margin * planned_contracts if planned_contracts > 0 else Decimal("0")
+            margin_usage_pct = ((margin_budget / current_eq) * Decimal("100")) if current_eq > 0 and margin_budget > 0 else Decimal("0")
+            return {
+                "plannedContracts": planned_contracts,
+                "baseContracts": Decimal("0"),
+                "marginBudget": margin_budget,
+                "marginUsagePct": margin_usage_pct,
+                "phase": "attack",
+                "phaseLabel": "直开",
+                "progressPct": progress_pct,
+                "scoreScale": Decimal("1"),
+                "abilityScore": safe_decimal(ability_snapshot.get("score"), "0"),
+                "abilityNetPnl": safe_decimal(ability_snapshot.get("netPnl"), "0"),
+                "abilityCloseOrders": int(ability_snapshot.get("closeOrders") or 0),
+                "abilityCloseWinRatePct": safe_decimal(ability_snapshot.get("closeWinRatePct"), "0"),
+                "abilityScalingAllowed": True,
+            }
         if (
             target_multiple <= Decimal("1")
             or not bool(self.config_store.current().get("simulated"))
@@ -11285,7 +11309,7 @@ class AutomationEngine:
                         },
                     )
                     return
-            if liq_buffer > 0 and liq_buffer <= DIP_SWING_MIN_LIQ_BUFFER_PCT:
+            if (not aggressive_scalp_mode) and liq_buffer > 0 and liq_buffer <= DIP_SWING_MIN_LIQ_BUFFER_PCT:
                 if pending_exit_orders:
                     self._cancel_swap_orders(client, inst_id, pending_exit_orders, "强平缓冲不足，撤掉旧平仓单后紧急退出", market_key=market_key)
                     pending_exit_orders = []
