@@ -105,6 +105,8 @@ BASIS_ARB_MARKET_UNIVERSE_CACHE: dict[str, Any] = {"ts": 0.0, "symbols": []}
 BASIS_ARB_MARKET_SCAN_CACHE: dict[str, Any] = {"ts": 0.0, "key": "", "rows": []}
 DIP_SWING_SCAN_SYMBOL_LIMIT = 64
 DIP_SWING_EXECUTION_TARGET_LIMIT = 64
+DIP_SWING_WATCHLIST_LIMIT = 64
+DIP_SWING_SCAN_WORKER_LIMIT = 24
 DIP_SWING_SCAN_LOCK = threading.RLock()
 DIP_SWING_MARKET_UNIVERSE_CACHE: dict[str, Any] = {"ts": 0.0, "symbols": []}
 DIP_SWING_MARKET_SCAN_CACHE: dict[str, Any] = {"ts": 0.0, "key": "", "rows": []}
@@ -121,6 +123,7 @@ DIP_SWING_MIN_NET_HOLD_USDT = Decimal("-999999")
 DIP_SWING_ENTRY_ORDER_MAX_AGE_SECONDS = 4
 DIP_SWING_EXIT_ORDER_MAX_AGE_SECONDS = 4
 DIP_SWING_MAX_PENDING_ENTRY_ORDERS_PER_SYMBOL = 64
+DIP_SWING_NON_BLOCKING_ORDER_TYPES = {"market", "ioc", "fok", "optimal_limit_ioc"}
 DIP_SWING_DIRECTION_LOOKBACK_BARS = 6
 DIP_SWING_MIN_PULLBACK_PCT = Decimal("0.45")
 DIP_SWING_MAX_PULLBACK_PCT = Decimal("1.60")
@@ -3057,6 +3060,11 @@ def classify_execution_order_state(order: dict[str, Any]) -> str:
     return "other"
 
 
+def is_non_blocking_execution_order(order: dict[str, Any]) -> bool:
+    ord_type = str(order.get("ordType") or "").strip().lower()
+    return ord_type in DIP_SWING_NON_BLOCKING_ORDER_TYPES
+
+
 def execution_tag_family(order: dict[str, Any]) -> str:
     action = str(order.get("strategyAction") or "").strip().lower()
     if action in {"entry", "hedge", "exit", "cover", "rollback"}:
@@ -4575,8 +4583,8 @@ def validate_automation_config(config: dict[str, Any]) -> tuple[bool, str, dict[
     primary_symbol = watchlist_symbols[0]
     normalized["spotInstId"] = f"{primary_symbol}-USDT"
     normalized["swapInstId"] = f"{primary_symbol}-USDT-SWAP"
-    if len(watchlist_symbols) > 8:
-        return False, "多币 watchlist 最多支持 8 个标的", normalized
+    if len(watchlist_symbols) > DIP_SWING_WATCHLIST_LIMIT:
+        return False, f"多币 watchlist 最多支持 {DIP_SWING_WATCHLIST_LIMIT} 个标的", normalized
     base_error = validate_single_automation_target(normalized)
     if base_error:
         return False, base_error, normalized
@@ -7135,7 +7143,9 @@ def scan_dip_swing_market_snapshots(
     targets = [build_dip_swing_scan_target(config, symbol) for symbol in normalized_symbols]
     rows: list[dict[str, Any]] = []
     errors: list[str] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(len(targets), 8))) as executor:
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=max(1, min(len(targets), DIP_SWING_SCAN_WORKER_LIMIT))
+    ) as executor:
         future_map = {
             executor.submit(fetch_dip_swing_target_snapshot, client, target, execution_journal): target
             for target in targets
@@ -7305,7 +7315,9 @@ def scan_basis_arb_market_snapshots(
     targets = [build_basis_arb_scan_target(config, symbol) for symbol in normalized_symbols]
     rows: list[dict[str, Any]] = []
     errors: list[str] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(len(targets), 8))) as executor:
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=max(1, min(len(targets), DIP_SWING_SCAN_WORKER_LIMIT))
+    ) as executor:
         future_map = {executor.submit(fetch_basis_arb_target_snapshot, client, target): target for target in targets}
         for future in concurrent.futures.as_completed(future_map):
             target = future_map[future]
@@ -7331,7 +7343,9 @@ def build_basis_arb_analysis(
 
     target_snapshots: list[dict[str, Any]] = []
     errors: list[str] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(len(targets), 8))) as executor:
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=max(1, min(len(targets), DIP_SWING_SCAN_WORKER_LIMIT))
+    ) as executor:
         future_map = {executor.submit(fetch_basis_arb_target_snapshot, client, target): target for target in targets}
         for future in concurrent.futures.as_completed(future_map):
             target = future_map[future]
@@ -7642,7 +7656,9 @@ def build_dip_swing_analysis(
     execution_journal = get_execution_journal_snapshot(limit=160)
     target_snapshots: list[dict[str, Any]] = []
     errors: list[str] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(len(watchlist_targets), 8))) as executor:
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=max(1, min(len(watchlist_targets), DIP_SWING_SCAN_WORKER_LIMIT))
+    ) as executor:
         future_map = {
             executor.submit(fetch_dip_swing_target_snapshot, client, target, execution_journal): target
             for target in watchlist_targets
@@ -9835,6 +9851,8 @@ class AutomationEngine:
                 continue
             if classify_execution_order_state(order) != "working":
                 continue
+            if is_non_blocking_execution_order(order):
+                continue
             if side and str(order.get("side") or "").lower() != side.lower():
                 continue
             if reduce_only is not None and flag_true(order.get("reduceOnly")) != reduce_only:
@@ -11324,6 +11342,8 @@ class AutomationEngine:
                     reduce_only=True,
                     protected_exit=True,
                     market_key=market_key,
+                    strategy_action="exit",
+                    strategy_leg="swap",
                 )
                 return
             if profit_target_reached:
@@ -11352,6 +11372,8 @@ class AutomationEngine:
                     reduce_only=True,
                     protected_exit=True,
                     market_key=market_key,
+                    strategy_action="exit",
+                    strategy_leg="swap",
                 )
                 return
             if pending_exit_orders:
@@ -11386,6 +11408,8 @@ class AutomationEngine:
                     ),
                     passive_entry=not force_market_entry,
                     market_key=market_key,
+                    strategy_action="entry",
+                    strategy_leg="swap",
                 )
                 return
             self._set_market(
@@ -11497,6 +11521,8 @@ class AutomationEngine:
             ),
             passive_entry=not force_market_entry,
             market_key=market_key,
+            strategy_action="entry",
+            strategy_leg="swap",
         )
 
     def _run_swap_cycle(
