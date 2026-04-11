@@ -1868,7 +1868,9 @@ function renderAnalysisState(analysis) {
     data.lastAnalyzedAt
       ? [
           data.lastAnalyzedAt,
-          data.executionAbilityPhaseLabel ? `能力 ${data.executionAbilityPhaseLabel}` : "",
+          data.executionAbilityPhaseLabel
+            ? `${data.executionAbilityPhaseLabel === "直开" ? "模式" : "能力"} ${data.executionAbilityPhaseLabel}`
+            : "",
           data.executionAbilityNetPnl ? `近场净收益 ${formatSignedMoney(data.executionAbilityNetPnl)}U` : "",
           data.fundingRatePct ? `资金费 ${data.fundingRatePct}%` : "",
           data.basisPct ? `基差 ${data.basisPct}%` : "",

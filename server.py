@@ -7925,7 +7925,7 @@ def build_dip_swing_analysis(
         warnings.append(f"watchlist 外出现更优循环目标，当前切到 {selected_symbol}")
     if len(execution_symbols) > 1:
         warnings.append(f"执行层当前按 {len(execution_symbols)} 币并行：{', '.join(execution_symbols)}")
-    if target_multiple > Decimal("1"):
+    if target_multiple > Decimal("1") and not aggressive_scalp_mode:
         if int(ability_snapshot.get("closeOrders") or 0) <= 0:
             warnings.append(
                 f"{format_decimal(target_multiple, 0)}x 是项目目标，不会直接把一个数字乘到仓位上；当前还没拿到足够的平仓样本，先按方向循环并累计积分"
@@ -7939,10 +7939,16 @@ def build_dip_swing_analysis(
     ability_score = safe_decimal(ability_snapshot.get("score"), "0")
     ability_wins = int(ability_snapshot.get("winningCloseOrders") or 0)
     ability_losses = int(ability_snapshot.get("losingCloseOrders") or 0)
-    warnings.append(
-        f"当前积分机制：赢 +1 / 亏 -1 · 当前积分 {format_decimal(ability_score, 0)}"
-        f" · 胜 {ability_wins} / 负 {ability_losses}"
-    )
+    if aggressive_scalp_mode:
+        warnings.append(
+            f"当前只记录赢亏积分，不再用能力阶段限制开仓 · 当前积分 {format_decimal(ability_score, 0)}"
+            f" · 胜 {ability_wins} / 负 {ability_losses}"
+        )
+    else:
+        warnings.append(
+            f"当前积分机制：赢 +1 / 亏 -1 · 当前积分 {format_decimal(ability_score, 0)}"
+            f" · 胜 {ability_wins} / 负 {ability_losses}"
+        )
     if aggressive_scalp_mode:
         warnings.append("当前为超短直开模式：分析只负责方向，执行层直接开单，单笔净赚 1U 就平")
     warnings.append(
@@ -8019,7 +8025,7 @@ def build_dip_swing_analysis(
         f"maker {compact_metric(maker_fee_pct, '0.001')}% / taker {compact_metric(taker_fee_pct, '0.001')}%",
         f"每单净利目标 {format_decimal(DIP_SWING_NET_TARGET_USDT, 0)}U",
     ]
-    if target_multiple > Decimal("1"):
+    if target_multiple > Decimal("1") and not aggressive_scalp_mode:
         summary_bits.append(f"目标余额 {format_decimal(target_multiple, 0)}x")
         summary_bits.append(f"积分 {format_decimal(ability_score, 0)}")
         if int(ability_snapshot.get("closeOrders") or 0) > 0:
@@ -8027,6 +8033,8 @@ def build_dip_swing_analysis(
             summary_bits.append(f"胜 {ability_wins} / 负 {ability_losses}")
         else:
             summary_bits.append("先积累赢亏积分，再放大仓位")
+    elif aggressive_scalp_mode:
+        summary_bits.append(f"积分 {format_decimal(ability_score, 0)}")
     if selected_from_market:
         summary_bits.append("市场轮动目标")
     if len(execution_symbols) > 1:
@@ -8126,8 +8134,8 @@ def build_dip_swing_analysis(
         "liquidationBufferPct": compact_metric(liq_buffer, "0.1") if liq_buffer > 0 else "",
         "targetBalanceProgressPct": compact_metric(target_balance.get("progressPct"), "0.1"),
         "targetCurrentMultiple": compact_metric(target_balance.get("currentMultiple"), "0.01"),
-        "executionAbilityPhase": str(ability_snapshot.get("phase") or "protect"),
-        "executionAbilityPhaseLabel": str(ability_snapshot.get("phaseLabel") or "守仓"),
+        "executionAbilityPhase": ("attack" if aggressive_scalp_mode else str(ability_snapshot.get("phase") or "protect")),
+        "executionAbilityPhaseLabel": ("直开" if aggressive_scalp_mode else str(ability_snapshot.get("phaseLabel") or "守仓")),
         "executionAbilityScore": compact_metric(ability_snapshot.get("score"), "0.1"),
         "executionAbilityNetPnl": compact_metric(ability_snapshot.get("netPnl"), "0.01"),
         "executionAbilityCloseOrders": int(ability_snapshot.get("closeOrders") or 0),
@@ -11252,9 +11260,9 @@ class AutomationEngine:
             f"成交额 {format_decimal(avg_quote_volume_usd, 0)}U / "
             f"开平差 {symbol_pressure['openCloseGap']} / 连开 {symbol_pressure['consecutiveOpenStreak']}"
         )
-        if liq_buffer > 0:
+        if liq_buffer > 0 and not aggressive_scalp_mode:
             status_text += f" / 强平缓冲 {compact_metric(liq_buffer, '0.1')}%"
-        if safe_decimal(target_snapshot.get("targetEq"), "0") > 0:
+        if safe_decimal(target_snapshot.get("targetEq"), "0") > 0 and not aggressive_scalp_mode:
             ability_text = (
                 f"近场净收益 {format_decimal(safe_decimal(target_plan.get('abilityNetPnl'), '0'), 2)}U"
                 f" / 平仓胜率 {compact_metric(target_plan.get('abilityCloseWinRatePct'), '0.1')}%"
@@ -11265,6 +11273,11 @@ class AutomationEngine:
                 f" / 目标 {compact_metric(target_snapshot.get('progressPct'), '0.1')}%"
                 f" / 能力 {target_plan.get('phaseLabel', target_execution_phase_label(target_plan.get('phase', 'fixed')))}"
                 f" / {ability_text}"
+                f" / 保证金 {format_decimal(safe_decimal(target_plan.get('marginBudget'), '0'), 2)}U"
+                f" / 动态仓位 {decimal_to_str(planned_trade_contracts)} 张"
+            )
+        elif aggressive_scalp_mode:
+            status_text += (
                 f" / 保证金 {format_decimal(safe_decimal(target_plan.get('marginBudget'), '0'), 2)}U"
                 f" / 动态仓位 {decimal_to_str(planned_trade_contracts)} 张"
             )
