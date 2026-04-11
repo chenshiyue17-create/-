@@ -1747,6 +1747,25 @@ function sanitizeAnalysisForSwingOnly(analysis = {}) {
   const data = { ...(analysis || {}) };
   const config = dashboardState.savedAutomationConfig || normalizeAutomationConfigForCompare(collectAutomationConfig());
   const symbol = getOnlySwingPrimarySymbol();
+  const scalpMode = [
+    data.selectedStrategyName,
+    data.selectedStrategyDetail,
+    data.summary,
+    data.marketRegime,
+    ...(Array.isArray(data.warnings) ? data.warnings : []),
+  ].some((value) => {
+    const text = String(value || "").trim();
+    return [
+      "利润循环",
+      "24h 利润循环",
+      "每单净利目标 1U",
+      "每单净赚 1U",
+      "空仓直开",
+      "无脑直开",
+      "持续开仓",
+      "当前为超短直开模式",
+    ].some((marker) => text.includes(marker));
+  });
   const stale = (
     hasLegacyNonSwingText(data.selectedStrategyName)
     || hasLegacyNonSwingText(data.selectedStrategyDetail)
@@ -1755,14 +1774,19 @@ function sanitizeAnalysisForSwingOnly(analysis = {}) {
     || hasLegacyNonSwingText(data.marketRegime)
   );
   data.selectedStrategyName = `${symbol} 利润循环`;
-  data.selectedStrategyDetail = `方向轮动 + maker-first · 逐仓 ${config.swapLeverage || "10"}x · 净赚 1U+ 平仓`;
-  if (stale) {
+  data.selectedStrategyDetail = `方向驱动 + 无脑直开 · 逐仓 ${config.swapLeverage || "10"}x · 每单净赚 1U+ 就平`;
+  if (stale || scalpMode) {
     const allowNewEntries = Boolean(data.allowNewEntries);
     data.decision = allowNewEntries ? "execute" : "observe";
-    data.decisionLabel = allowNewEntries ? "持续开仓" : "等待本轮方向确认";
-    data.summary = "当前只保留利润循环策略，旧策略分析结果已隐藏。";
+    data.decisionLabel = allowNewEntries ? "直接开单" : "等待本轮方向确认";
+    data.summary = allowNewEntries
+      ? "空仓直开，持仓同向继续循环，单笔净赚 1U+ 就平。"
+      : "等待本轮方向确认。";
     data.marketRegime = "24h 利润循环";
-    data.warnings = [];
+    data.warnings = (data.warnings || []).filter((item) => {
+      const text = String(item || "");
+      return !["安全缓冲", "收缩风险", "跳过新开仓", "阻断:"].some((marker) => text.includes(marker));
+    });
     data.blockers = [];
   }
   return data;
