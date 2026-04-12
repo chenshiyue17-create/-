@@ -4966,6 +4966,9 @@ function renderOrderFeed(data) {
     lastSource: data?.lastSource || fallbackJournal.lastSource || "",
   };
   renderDeskOverview();
+  if (dashboardState.automation?.analysis) {
+    renderAnalysis(dashboardState.automation.analysis);
+  }
   const baseGroups = groupOrdersBySymbol(allOrders, dashboardState.orderFeedMeta);
   const stateFilter = dashboardState.orderStateFilter || "all";
   const marketFilter = dashboardState.orderMarketFilter || "all";
