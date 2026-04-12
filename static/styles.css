@@ -314,12 +314,14 @@ body {
 }
 
 .floating-dock {
-  position: relative;
+  position: sticky;
+  top: 0;
   z-index: 40;
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(360px, 420px);
   gap: 10px;
   padding: 10px 12px;
+  margin-bottom: 6px;
   border: 1px solid rgba(255, 255, 255, 0.08);
   background:
     linear-gradient(180deg, rgba(7, 10, 14, 0.88), rgba(7, 10, 14, 0.78)),
