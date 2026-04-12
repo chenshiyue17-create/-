@@ -3842,7 +3842,10 @@ class OkxClient:
             and paper_state_has_activity(self._paper_state())
         )
 
-    def _paper_fallback_allowed(self) -> bool:
+    def _paper_read_fallback_allowed(self) -> bool:
+        return self._paper_enabled() and not self._has_private_credentials()
+
+    def _paper_trading_fallback_allowed(self) -> bool:
         return self._paper_enabled() and not self._has_private_credentials()
 
     @staticmethod
@@ -4271,7 +4274,7 @@ class OkxClient:
         try:
             return self._request("GET", "/api/v5/account/balance", params=params)
         except Exception:
-            if self._paper_fallback_allowed():
+            if self._paper_read_fallback_allowed():
                 return self._paper_account_balance()
             raise
 
@@ -4282,7 +4285,7 @@ class OkxClient:
         try:
             return self._request("GET", "/api/v5/asset/balances", params=params)
         except Exception:
-            if self._paper_fallback_allowed():
+            if self._paper_read_fallback_allowed():
                 return {"code": "0", "data": [], "_paperSim": True}
             raise
 
@@ -4293,7 +4296,7 @@ class OkxClient:
         try:
             return self._request("GET", "/api/v5/asset/asset-valuation", params=params)
         except Exception:
-            if self._paper_fallback_allowed():
+            if self._paper_read_fallback_allowed():
                 return {"code": "0", "data": [{"ccy": ccy or "USDT", "totalBal": "0", "ts": str(int(time.time() * 1000))}], "_paperSim": True}
             raise
 
@@ -4318,7 +4321,7 @@ class OkxClient:
         try:
             return self._request("GET", "/api/v5/account/positions", params=params)
         except Exception:
-            if self._paper_fallback_allowed():
+            if self._paper_read_fallback_allowed():
                 return self._paper_positions(inst_id)
             raise
 
@@ -4335,7 +4338,7 @@ class OkxClient:
         try:
             return self._request("GET", "/api/v5/trade/orders-history", params=params)
         except Exception:
-            if self._paper_fallback_allowed():
+            if self._paper_read_fallback_allowed():
                 return self._paper_recent_orders()
             raise
 
@@ -4349,7 +4352,7 @@ class OkxClient:
             try:
                 return self._request("GET", "/api/v5/trade/fills", params=params)
             except Exception:
-                if self._paper_fallback_allowed():
+                if self._paper_read_fallback_allowed():
                     return {"code": "0", "data": [], "_paperSim": True}
                 raise
 
@@ -4438,7 +4441,7 @@ class OkxClient:
         try:
             return self._request("GET", "/api/v5/account/config")
         except Exception:
-            if self._paper_enabled():
+            if self._paper_read_fallback_allowed():
                 return {"code": "0", "data": [{"posMode": "net_mode"}]}
             raise
 
@@ -4452,7 +4455,7 @@ class OkxClient:
             self._extract_data_or_raise(result)
             return result
         except Exception:
-            if self._paper_fallback_allowed():
+            if self._paper_trading_fallback_allowed():
                 return {"code": "0", "data": [{"posMode": pos_mode, "sCode": "0"}], "_paperSim": True}
             raise
 
@@ -4470,7 +4473,7 @@ class OkxClient:
             self._extract_data_or_raise(result)
             return result
         except Exception:
-            if self._paper_fallback_allowed():
+            if self._paper_trading_fallback_allowed():
                 return {
                     "code": "0",
                     "data": [{"instId": inst_id, "lever": lever, "mgnMode": mgn_mode, "sCode": "0"}],
@@ -4484,7 +4487,7 @@ class OkxClient:
             self._extract_data_or_raise(result)
             return result
         except Exception:
-            if self._paper_fallback_allowed():
+            if self._paper_trading_fallback_allowed():
                 return self._paper_place_order(payload)
             raise
 
@@ -4497,7 +4500,7 @@ class OkxClient:
             self._extract_data_or_raise(result)
             return result
         except Exception:
-            if self._paper_fallback_allowed():
+            if self._paper_trading_fallback_allowed():
                 rows: list[dict[str, Any]] = []
                 for payload in cleaned:
                     result = self._paper_place_order(payload)
@@ -4524,7 +4527,7 @@ class OkxClient:
             self._extract_data_or_raise(result)
             return result
         except Exception:
-            if self._paper_fallback_allowed():
+            if self._paper_trading_fallback_allowed():
                 return {
                     "code": "0",
                     "data": [{"instId": inst_id, "ordId": ord_id or "", "clOrdId": cl_ord_id or "", "sCode": "0"}],
@@ -4541,7 +4544,7 @@ class OkxClient:
             self._extract_data_or_raise(result)
             return result
         except Exception:
-            if self._paper_fallback_allowed():
+            if self._paper_trading_fallback_allowed():
                 rows: list[dict[str, Any]] = []
                 for payload in cleaned:
                     rows.append(
