@@ -11769,6 +11769,7 @@ class AutomationEngine:
         )
         target_snapshot = self._target_balance_snapshot(automation)
         planned_trade_contracts = safe_decimal(target_plan.get("plannedContracts"), "0")
+        trade_contracts = planned_trade_contracts
         entry_projection = estimate_profit_loop_entry_net_pnl(
             planned_contracts=planned_trade_contracts,
             last_price=last_price,
@@ -12070,7 +12071,6 @@ class AutomationEngine:
             )
             return
 
-        trade_contracts = planned_trade_contracts
         if trade_contracts <= 0:
             self._set_market(market_key, {"lastMessage": "当前保证金预算不足以触发最小下单单位，继续观察"})
             return
