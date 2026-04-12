@@ -6327,20 +6327,6 @@ async function boot() {
     }
   });
 
-  RAIL_AUTOMATION_TOGGLES.forEach(([formId, railId]) => {
-    const form = $(formId);
-    const rail = $(railId);
-    if (!form || !rail) return;
-    form.addEventListener("change", () => {
-      rail.checked = form.checked;
-      renderRailStrategyControls();
-    });
-    rail.addEventListener("change", () => {
-      form.checked = rail.checked;
-      form.dispatchEvent(new Event("change", { bubbles: true }));
-    });
-  });
-
   $("save-config").addEventListener("click", async () => {
     try {
       await saveConfig();
