@@ -9012,15 +9012,23 @@ def diagnose_pool_endpoint(host: str, port: int) -> dict[str, Any]:
     except Exception as exc:
         recv_error = str(exc)
 
-    if system_ips and public_ips and system_ips[0] != public_ips[0] and any(ip_is_bogon(ip) for ip in system_ips):
-        status = "dns_hijack"
-        detail = f"本机 DNS 把 {host} 解析到 {', '.join(system_ips)}，真实公网结果是 {', '.join(public_ips)}。"
-    elif tcp_connected and bytes_received == 0:
-        status = "stratum_silent"
-        detail = f"{connect_host}:{port} 可连通，但订阅后没有收到任何 stratum 返回。"
-    elif not tcp_connected:
+    dns_hijacked = system_ips and public_ips and system_ips[0] != public_ips[0] and any(ip_is_bogon(ip) for ip in system_ips)
+
+    if not tcp_connected:
         status = "connect_failed"
         detail = f"{host}:{port} 连接失败：{recv_error or '未知错误'}"
+    elif tcp_connected and bytes_received == 0:
+        status = "stratum_silent"
+        if dns_hijacked:
+            detail = (
+                f"本机 DNS 把 {host} 解析到 {', '.join(system_ips)}，真实公网结果是 {', '.join(public_ips)}，"
+                f"但直连 {connect_host}:{port} 后 subscribe 仍然没有任何回包。"
+            )
+        else:
+            detail = f"{connect_host}:{port} 可连通，但订阅后没有收到任何 stratum 返回。"
+    elif dns_hijacked:
+        status = "dns_hijack"
+        detail = f"本机 DNS 把 {host} 解析到 {', '.join(system_ips)}，真实公网结果是 {', '.join(public_ips)}。"
     else:
         status = "ok"
         detail = f"{connect_host}:{port} 已返回 {bytes_received} 字节。"
@@ -9215,6 +9223,16 @@ def build_miner_progress(
     elif running and status in {"subscribed", "new-job"}:
         headline = "在线 / 新作业"
         detail = "job 已刷新，继续刷 nonce。"
+    elif status == "guard-blocked":
+        if pool_diag.get("status") == "stratum_silent":
+            headline = "未在挖 / 矿池无回包"
+        elif pool_diag.get("status") == "connect_failed":
+            headline = "未在挖 / 连接失败"
+        elif pool_diag.get("status") == "dns_hijack":
+            headline = "未在挖 / DNS 异常"
+        else:
+            headline = "未在挖 / 启动已拦截"
+        detail = str(pool_diag.get("detail") or mac_lotto.get("guardReason") or "当前矿池条件不满足启动要求。")
     elif running and status == "waiting-for-job":
         if pool_diag.get("bypassActive"):
             headline = "在线 / DNS 已绕过"
@@ -9603,7 +9621,10 @@ class MacLottoManager:
             self.processes.pop(worker_id, None)
 
     def _should_autostart(self, config: dict[str, Any]) -> bool:
-        return bool(config.get("autoStartMacLotto", True)) and bool(str(config.get("wallet", "")).strip())
+        if not bool(config.get("autoStartMacLotto", True)) or not bool(str(config.get("wallet", "")).strip()):
+            return False
+        guard = self._guard_mode(config)
+        return not bool(guard.get("active"))
 
     def _worker_limit(self) -> int:
         return max(1, min((os.cpu_count() or 1) * 2, 32))
@@ -9614,6 +9635,7 @@ class MacLottoManager:
         bypass_ready = (
             status == "dns_hijack"
             and bool(connect_host)
+            and int(diagnosis.get("bytesReceived") or 0) > 0
             and connect_host != str(diagnosis.get("host") or "")
             and not ip_is_bogon(connect_host)
         )
@@ -9717,6 +9739,8 @@ class MacLottoManager:
             time.sleep(15)
             config = MINER_CONFIG.current()
             if not self._should_autostart(config):
+                if self.processes:
+                    self.stop(config)
                 self.next_restart_not_before = 0.0
                 continue
             requested, effective, _ = self._worker_specs(config)
@@ -9770,6 +9794,25 @@ class MacLottoManager:
             force_random_nonce = effective > 1 or bool(config.get("cpuRandomNonce"))
             guard = self._guard_mode(config)
             worker_pool_host = str(guard.get("workerPoolHost") or pool_host).strip() or pool_host
+            if guard["active"] and not guard["bypassActive"]:
+                self._kill_stray_workers()
+                self.processes = {}
+                self.last_signature = signature
+                secure_dump_json(
+                    MAC_LOTTO_STATUS_PATH,
+                    {
+                        "running": False,
+                        "status": "guard-blocked",
+                        "last_stop_at": now_local_iso(),
+                        "effectiveWorkerCount": 0,
+                        "pool_host": pool_host,
+                        "pool_port": pool_port,
+                        "guardMode": True,
+                        "guardReason": str(guard.get("reason") or ""),
+                        "guardDiagnosis": guard.get("diagnosis") or {},
+                    },
+                )
+                return self.snapshot(config)
 
             for spec in specs:
                 dump_worker_status(
@@ -9908,6 +9951,7 @@ class MacLottoManager:
                 )
 
             status_priority = [
+                "guard-blocked",
                 "block-found",
                 "mining",
                 "new-job",
@@ -9922,6 +9966,8 @@ class MacLottoManager:
             status = next((item for item in status_priority if item in statuses), "idle")
             if running and status in {"starting", "booting"}:
                 status = "waiting-for-job"
+            elif not running and guard["active"]:
+                status = "guard-blocked"
 
             estimated_hashrate = float(benchmark_cpu_hashrate().get("hashrate") or 0) * effective
             payload = {
