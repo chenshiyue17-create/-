@@ -172,6 +172,8 @@ DIP_SWING_EXIT_PROTECTION_PCT = Decimal("0.08")
 DIP_SWING_TARGET_MIN_MARGIN_RATIO = Decimal("0.012")
 DIP_SWING_TARGET_MAX_MARGIN_RATIO = Decimal("0.050")
 DIP_SWING_AVAILABLE_MARGIN_UTILIZATION = Decimal("0.92")
+DIP_SWING_STALLED_POSITION_MAX_HOLD_MINUTES = 20
+DIP_SWING_STALLED_POSITION_MIN_AVAILABLE_MARGIN_USDT = Decimal("25")
 DIP_SWING_MIN_LIQ_BUFFER_PCT = Decimal("18")
 DIP_SWING_MAX_LEVERAGE = Decimal("10")
 OKX_DEFAULT_SWAP_MAKER_FEE_PCT = Decimal("0.02")
@@ -1672,7 +1674,10 @@ def build_target_execution_ability_snapshot(
     limit: int = 120,
 ) -> dict[str, Any]:
     session_state = state or AUTOMATION_STATE.current()
-    journal_snapshot = journal if journal is not None else get_execution_journal_snapshot(limit=limit)
+    journal_snapshot = journal if journal is not None else get_execution_journal_snapshot(
+        limit=limit,
+        live_only=prefer_live_execution_state(CONFIG.current()),
+    )
     summary = journal_snapshot.get("summary") or {}
     target_balance = target_snapshot or build_target_balance_snapshot(
         safe_decimal(session_state.get("sessionStartEq"), "0"),
@@ -1960,6 +1965,37 @@ def reconcile_runtime_state_with_automation(state: dict[str, Any], automation: d
     return hydrated
 
 
+def strip_paper_runtime_artifacts(state: dict[str, Any], config: dict[str, Any] | None = None) -> dict[str, Any]:
+    if not prefer_live_execution_state(config):
+        return copy.deepcopy(state)
+    sanitized = copy.deepcopy(state)
+    markets = sanitized.get("markets") or {}
+    for key, market in list(markets.items()):
+        if not isinstance(market, dict):
+            continue
+        if not str(market.get("lastOrderId") or "").strip().startswith("paper-"):
+            continue
+        preserved = copy.deepcopy(market)
+        cleared = default_market_state()
+        for keep_key in (
+            "enabled",
+            "instId",
+            "signal",
+            "trend",
+            "lastPrice",
+            "riskBudget",
+            "riskCap",
+            "riskMode",
+            "riskLabel",
+            "contractValue",
+            "prepared",
+        ):
+            cleared[keep_key] = preserved.get(keep_key, cleared.get(keep_key))
+        markets[key] = cleared
+    sanitized["markets"] = markets
+    return sanitized
+
+
 def sanitize_only_dip_swing_analysis(analysis: dict[str, Any], automation: dict[str, Any]) -> dict[str, Any]:
     effective = enforce_only_dip_swing_strategy(deep_merge(default_automation_config(), automation or {}))
     sanitized = copy.deepcopy(analysis or {})
@@ -2039,6 +2075,7 @@ def sanitize_only_dip_swing_analysis(analysis: dict[str, Any], automation: dict[
 def sanitize_only_dip_swing_runtime_state(state: dict[str, Any], automation: dict[str, Any]) -> dict[str, Any]:
     effective = enforce_only_dip_swing_strategy(deep_merge(default_automation_config(), automation or {}))
     sanitized = reconcile_runtime_state_with_automation(copy.deepcopy(state or {}), effective)
+    sanitized = strip_paper_runtime_artifacts(sanitized, CONFIG.current())
     sanitized["analysis"] = sanitize_only_dip_swing_analysis(sanitized.get("analysis") or {}, effective)
     if not sanitized["analysis"].get("lastAnalyzedAt") and sanitized.get("lastCycleAt"):
         sanitized["analysis"]["lastAnalyzedAt"] = sanitized.get("lastCycleAt")
@@ -2402,6 +2439,13 @@ def config_has_any_private_credentials(config: dict[str, Any] | None) -> bool:
         if any(str((profile or {}).get(key) or "").strip() for key in ("apiKey", "secretKey", "passphrase")):
             return True
     return False
+
+
+def is_paper_execution_order(order: dict[str, Any] | None) -> bool:
+    row = order or {}
+    order_id = str(row.get("ordId") or row.get("clOrdId") or "").strip()
+    tag = str(row.get("tag") or "").strip().lower()
+    return order_id.startswith("paper-") or tag == "paper-sim"
 
 
 def config_profile_key(config: dict[str, Any]) -> str:
@@ -3062,7 +3106,10 @@ def build_execution_symbol_pressure_snapshot(
     limit: int = 120,
     window_minutes: int = DIP_SWING_ORDER_PRESSURE_WINDOW_MINUTES,
 ) -> dict[str, Any]:
-    journal_snapshot = journal if journal is not None else get_execution_journal_snapshot(limit=limit)
+    journal_snapshot = journal if journal is not None else get_execution_journal_snapshot(
+        limit=limit,
+        live_only=prefer_live_execution_state(CONFIG.current()),
+    )
     orders = [normalize_execution_order(item) for item in (journal_snapshot.get("orders") or [])]
     if not inst_id:
         return {
@@ -3531,13 +3578,20 @@ def build_execution_journal_summary(orders: list[dict[str, Any]]) -> dict[str, A
     }
 
 
-def persist_local_orders(orders: list[dict[str, Any]], *, source: str = "") -> list[dict[str, Any]]:
+def persist_local_orders(
+    orders: list[dict[str, Any]],
+    *,
+    source: str = "",
+    live_only: bool = False,
+) -> list[dict[str, Any]]:
     if not orders:
         return get_local_recent_orders(limit=80)
 
     def mutate(state: dict[str, Any]) -> None:
         existing = list(state.get("orders") or [])
         merged = [normalize_execution_order(item) for item in list(orders) + existing]
+        if live_only:
+            merged = [item for item in merged if not is_paper_execution_order(item)]
         deduped: list[dict[str, Any]] = []
         seen = set()
         for item in merged:
@@ -3566,9 +3620,11 @@ def persist_local_orders(orders: list[dict[str, Any]], *, source: str = "") -> l
     return list(current.get("orders") or [])
 
 
-def get_stored_local_orders(inst_type: str = "", limit: int = 20) -> list[dict[str, Any]]:
+def get_stored_local_orders(inst_type: str = "", limit: int = 20, *, live_only: bool = False) -> list[dict[str, Any]]:
     state = LOCAL_ORDER_STORE.current()
     items = list(state.get("orders") or [])
+    if live_only:
+        items = [item for item in items if not is_paper_execution_order(item)]
     if inst_type:
         expected = inst_type.upper()
         items = [item for item in items if str(item.get("instType") or "").upper() == expected]
@@ -3579,14 +3635,23 @@ def get_stored_local_orders(inst_type: str = "", limit: int = 20) -> list[dict[s
     return items[:limit]
 
 
-def get_execution_journal_orders(inst_type: str = "", limit: int = 80) -> tuple[list[dict[str, Any]], str, str]:
+def get_execution_journal_orders(
+    inst_type: str = "",
+    limit: int = 80,
+    *,
+    live_only: bool = False,
+) -> tuple[list[dict[str, Any]], str, str]:
     state = LOCAL_ORDER_STORE.current()
-    stored_orders = get_stored_local_orders(inst_type, limit=MAX_RECENT_ORDER_LIMIT)
+    stored_orders = get_stored_local_orders(inst_type, limit=MAX_RECENT_ORDER_LIMIT, live_only=live_only)
     stream_orders = PRIVATE_ORDER_STREAM.get_recent_orders(inst_type, limit=MAX_RECENT_ORDER_LIMIT)
+    if live_only:
+        stream_orders = [item for item in stream_orders if not is_paper_execution_order(item)]
     fallback_orders = derive_orders_from_automation_state()
     if inst_type:
         expected = inst_type.upper()
         fallback_orders = [item for item in fallback_orders if str(item.get("instType") or "").upper() == expected]
+    if live_only:
+        fallback_orders = [item for item in fallback_orders if not is_paper_execution_order(item)]
     merged_orders = merge_order_feeds(stream_orders, stored_orders, fallback_orders, limit=MAX_RECENT_ORDER_LIMIT)
     merged_orders = backfill_paper_execution_metrics(merged_orders)
     source_parts: list[str] = []
@@ -3605,8 +3670,13 @@ def get_execution_journal_orders(inst_type: str = "", limit: int = 80) -> tuple[
     return merged_orders[:limit], source_label, last_reconciled
 
 
-def get_execution_journal_snapshot(inst_type: str = "", limit: int = 20) -> dict[str, Any]:
-    orders, source_label, last_reconciled = get_execution_journal_orders(inst_type, limit=limit)
+def get_execution_journal_snapshot(
+    inst_type: str = "",
+    limit: int = 20,
+    *,
+    live_only: bool = False,
+) -> dict[str, Any]:
+    orders, source_label, last_reconciled = get_execution_journal_orders(inst_type, limit=limit, live_only=live_only)
     summary = build_execution_journal_summary(orders)
     return {
         "orders": orders,
@@ -3615,6 +3685,18 @@ def get_execution_journal_snapshot(inst_type: str = "", limit: int = 20) -> dict
         "lastReconciledAt": last_reconciled,
         "lastSource": source_label,
     }
+
+
+def prefer_live_execution_state(config: dict[str, Any] | None = None) -> bool:
+    current = config or CONFIG.current()
+    if is_remote_execution_enabled(current):
+        return True
+    if config_has_any_private_credentials(current):
+        return True
+    return any(
+        str(current.get(mask_key) or "").strip()
+        for mask_key in ("apiKeyMask", "secretKeyMask", "passphraseMask")
+    )
 
 
 def aggregate_recent_fills_by_order(fills: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -8101,7 +8183,10 @@ def build_dip_swing_analysis(
 ) -> dict[str, Any]:
     watchlist_symbols = normalize_watchlist_symbols(automation.get("watchlistSymbols"), automation)
     watchlist_targets = [build_dip_swing_scan_target(automation, symbol) for symbol in watchlist_symbols]
-    execution_journal = get_execution_journal_snapshot(limit=160)
+    execution_journal = get_execution_journal_snapshot(
+        limit=160,
+        live_only=prefer_live_execution_state(CONFIG.current()),
+    )
     target_snapshots: list[dict[str, Any]] = []
     errors: list[str] = []
     with concurrent.futures.ThreadPoolExecutor(
@@ -11930,6 +12015,13 @@ class AutomationEngine:
             position_side = "long"
         elif pos_value < 0:
             position_side = "short"
+        tracked_market = copy.deepcopy((self.snapshot().get("markets") or {}).get(market_key) or {})
+        tracked_trade_at = parse_iso(str(tracked_market.get("lastTradeAt") or tracked_market.get("lastActionAt") or ""))
+        position_hold_minutes = (
+            max(int((datetime.now() - tracked_trade_at).total_seconds() // 60), 0)
+            if tracked_trade_at
+            else 0
+        )
         holding_same_direction = (
             (position_side == "long" and desired_side == "buy")
             or (position_side == "short" and desired_side == "sell")
@@ -12001,6 +12093,17 @@ class AutomationEngine:
         )
         net_close_pnl = safe_decimal(net_close_snapshot.get("netClosePnl"), "0")
         profit_target_reached = net_close_pnl >= DIP_SWING_NET_TARGET_USDT
+        capital_recycle_needed = (
+            aggressive_scalp_mode
+            and position_side in {"long", "short"}
+            and not profit_target_reached
+            and position_hold_minutes >= DIP_SWING_STALLED_POSITION_MAX_HOLD_MINUTES
+            and (
+                available_margin < DIP_SWING_STALLED_POSITION_MIN_AVAILABLE_MARGIN_USDT
+                or trade_contracts <= 0
+                or projected_entry_net_pnl < DIP_SWING_NET_TARGET_USDT
+            )
+        )
 
         status_text = (
             f"方向 {desired_side_label} / "
@@ -12159,6 +12262,53 @@ class AutomationEngine:
                     passive_exit=not aggressive_scalp_mode,
                     protected_exit=not aggressive_scalp_mode,
                     prefer_fill=aggressive_scalp_mode,
+                    batchable=aggressive_scalp_mode,
+                    market_key=market_key,
+                    strategy_action="exit",
+                    strategy_leg="swap",
+                )
+                return
+            if capital_recycle_needed:
+                if pending_exit_orders:
+                    if stale_exit_orders:
+                        self._cancel_swap_orders(client, inst_id, stale_exit_orders, "释放保证金平仓挂单超时，重新发起退出", market_key=market_key)
+                        pending_exit_orders = [order for order in pending_exit_orders if order not in stale_exit_orders]
+                    if pending_exit_orders:
+                        self._set_market(
+                            market_key,
+                            {
+                                "lastMessage": (
+                                    f"{ONLY_STRATEGY_LABEL}仓位占用资金过久，正在释放保证金 · 持仓 {position_hold_minutes} 分钟"
+                                    f" · {status_text}"
+                                )
+                            },
+                        )
+                        return
+                exit_retry_ready, exit_retry_reason = self._cooldown_ready(market_key, DIP_SWING_EXIT_RETRY_SECONDS)
+                if not exit_retry_ready:
+                    self._set_market(
+                        market_key,
+                        {
+                            "lastMessage": (
+                                f"{ONLY_STRATEGY_LABEL}仓位占用资金过久，等待上一笔平仓回报后释放保证金"
+                                f" · {exit_retry_reason} · {status_text}"
+                            )
+                        },
+                    )
+                    return
+                close_side = "sell" if position_side == "long" else "buy"
+                self._place_swap_order(
+                    client,
+                    inst_id,
+                    close_side,
+                    round_down(abs_pos, lot_size),
+                    automation["swapTdMode"],
+                    (
+                        f"{ONLY_STRATEGY_LABEL}仓位占用资金过久，释放保证金重新循环"
+                        f" · 持仓 {position_hold_minutes} 分钟"
+                    ),
+                    reduce_only=True,
+                    prefer_fill=True,
                     batchable=aggressive_scalp_mode,
                     market_key=market_key,
                     strategy_action="exit",
@@ -13078,6 +13228,7 @@ class AppHandler(BaseHTTPRequestHandler):
         if not enforce_gateway_auth(self, path):
             return
         config = CONFIG.current()
+        live_only = prefer_live_execution_state(config)
 
         if path != "/api/automation/config" and should_proxy_to_remote(config, path):
             try:
@@ -13112,7 +13263,7 @@ class AppHandler(BaseHTTPRequestHandler):
                                 remote_automation,
                                 CONFIG.current(),
                             )
-                            local_journal = get_execution_journal_snapshot(limit=80)
+                            local_journal = get_execution_journal_snapshot(limit=80, live_only=live_only)
                             if (local_journal.get("orders") or local_journal.get("summary")):
                                 payload["state"]["executionJournal"] = local_journal
                             payload["state"]["equityDisplay"] = build_equity_display(
@@ -13133,7 +13284,7 @@ class AppHandler(BaseHTTPRequestHandler):
                         payload["remoteStateSource"] = "remote_live"
                         json_response(self, payload, status=response.status_code)
                     except Exception as exc:
-                        local_journal = get_execution_journal_snapshot(limit=80)
+                        local_journal = get_execution_journal_snapshot(limit=80, live_only=live_only)
                         fallback_error = summarize_remote_runtime_error(exc)
                         cached_state, cached_ts = load_cached_remote_automation_state(config)
                         if cached_state:
@@ -13197,12 +13348,20 @@ class AppHandler(BaseHTTPRequestHandler):
                     payload = response.json()
                     orders = payload.get("orders") or []
                     if isinstance(orders, list):
+                        if live_only:
+                            orders = [item for item in orders if not is_paper_execution_order(item)]
                         inst_type = (query.get("instType") or [""])[0]
-                        cached_orders = get_stored_local_orders(inst_type, limit=MAX_RECENT_ORDER_LIMIT)
+                        cached_orders = get_stored_local_orders(
+                            inst_type,
+                            limit=MAX_RECENT_ORDER_LIMIT,
+                            live_only=live_only,
+                        )
                         stream_orders = PRIVATE_ORDER_STREAM.get_recent_orders(inst_type, limit=MAX_RECENT_ORDER_LIMIT)
+                        if live_only:
+                            stream_orders = [item for item in stream_orders if not is_paper_execution_order(item)]
                         merged_orders = merge_order_feeds(orders, stream_orders, cached_orders, limit=MAX_RECENT_ORDER_LIMIT)
-                        persist_local_orders(merged_orders, source="remote_proxy")
-                        journal = get_execution_journal_snapshot(inst_type, limit=limit)
+                        persist_local_orders(merged_orders, source="remote_proxy", live_only=live_only)
+                        journal = get_execution_journal_snapshot(inst_type, limit=limit, live_only=live_only)
                         payload["orders"] = journal.get("orders") or backfill_paper_execution_metrics(merged_orders[:limit])
                         payload["journal"] = journal.get("summary") or {}
                         payload["symbols"] = journal.get("symbols") or payload.get("symbols") or []
@@ -13234,7 +13393,10 @@ class AppHandler(BaseHTTPRequestHandler):
                     payload["equityDisplay"] = build_equity_display(
                         payload.get("summary") or {},
                         remote_runtime_state,
-                        get_execution_journal_snapshot(limit=DEFAULT_RECENT_ORDER_LIMIT),
+                        get_execution_journal_snapshot(
+                            limit=DEFAULT_RECENT_ORDER_LIMIT,
+                            live_only=live_only,
+                        ),
                     )
                     json_response(self, payload, status=response.status_code)
                 else:
@@ -13357,7 +13519,10 @@ class AppHandler(BaseHTTPRequestHandler):
 
         if path == "/api/automation/state":
             state = sanitize_only_dip_swing_runtime_state(AUTOMATION_ENGINE.snapshot(), AUTOMATION_CONFIG.current())
-            state["executionJournal"] = get_execution_journal_snapshot(limit=DEFAULT_RECENT_ORDER_LIMIT)
+            state["executionJournal"] = get_execution_journal_snapshot(
+                limit=DEFAULT_RECENT_ORDER_LIMIT,
+                live_only=live_only,
+            )
             state["equityDisplay"] = build_equity_display(
                 None,
                 state,
@@ -13381,7 +13546,10 @@ class AppHandler(BaseHTTPRequestHandler):
                     AUTOMATION_ENGINE.snapshot(),
                     AUTOMATION_CONFIG.current(),
                 ),
-                "executionJournal": get_execution_journal_snapshot(limit=DEFAULT_RECENT_ORDER_LIMIT),
+                "executionJournal": get_execution_journal_snapshot(
+                    limit=DEFAULT_RECENT_ORDER_LIMIT,
+                    live_only=live_only,
+                ),
                 "timestamp": int(time.time()),
             }
 
@@ -13473,7 +13641,10 @@ class AppHandler(BaseHTTPRequestHandler):
                         "equityDisplay": build_equity_display(
                             snapshot.get("summary") or {},
                             AUTOMATION_STATE.current(),
-                            get_execution_journal_snapshot(limit=DEFAULT_RECENT_ORDER_LIMIT),
+                            get_execution_journal_snapshot(
+                                limit=DEFAULT_RECENT_ORDER_LIMIT,
+                                live_only=live_only,
+                            ),
                         ),
                         "route": route,
                     },
@@ -13490,15 +13661,13 @@ class AppHandler(BaseHTTPRequestHandler):
                 return
             inst_type = (query.get("instType") or [""])[0]
             limit = parse_recent_order_limit(query)
-            cached_journal = get_execution_journal_snapshot(inst_type, limit=limit)
+            cached_journal = get_execution_journal_snapshot(inst_type, limit=limit, live_only=live_only)
             cached_orders = cached_journal.get("orders") or []
             stream_orders = PRIVATE_ORDER_STREAM.get_recent_orders(inst_type, limit=limit)
+            if live_only:
+                stream_orders = [item for item in stream_orders if not is_paper_execution_order(item)]
             merged_live_orders = merge_order_feeds(stream_orders, cached_orders, limit=limit)
-            has_private_credentials = bool(
-                str(config.get("apiKey") or "").strip()
-                and str(config.get("secretKey") or "").strip()
-                and str(config.get("passphrase") or "").strip()
-            )
+            has_private_credentials = live_only
             if merged_live_orders and not has_private_credentials:
                 json_response(
                     self,
@@ -13522,8 +13691,12 @@ class AppHandler(BaseHTTPRequestHandler):
                     fills_result = client.get_recent_fills(inst_type, limit=100)
                     merged_orders = merge_order_feeds(result.get("data", []), stream_orders, cached_orders, limit=limit)
                     merged_orders = enrich_execution_orders_with_fills(merged_orders, fills_result.get("data", []))
-                    persist_local_orders(merged_orders, source="rest_multi" if (stream_orders or cached_orders) else "rest")
-                    journal = get_execution_journal_snapshot(inst_type, limit=limit)
+                    persist_local_orders(
+                        merged_orders,
+                        source="rest_multi" if (stream_orders or cached_orders) else "rest",
+                        live_only=live_only,
+                    )
+                    journal = get_execution_journal_snapshot(inst_type, limit=limit, live_only=live_only)
                     json_response(
                         self,
                         {
@@ -13559,8 +13732,8 @@ class AppHandler(BaseHTTPRequestHandler):
 
                 merged_orders = merge_order_feeds(merged_orders, stream_orders, cached_orders, limit=limit)
                 merged_orders = enrich_execution_orders_with_fills(merged_orders, recent_fills)
-                persist_local_orders(merged_orders, source="rest_multi")
-                journal = get_execution_journal_snapshot(inst_type, limit=limit)
+                persist_local_orders(merged_orders, source="rest_multi", live_only=live_only)
+                journal = get_execution_journal_snapshot(inst_type, limit=limit, live_only=live_only)
                 json_response(
                     self,
                     {
