@@ -4452,7 +4452,7 @@ class OkxClient:
             self._extract_data_or_raise(result)
             return result
         except Exception:
-            if self._paper_enabled():
+            if self._paper_fallback_allowed():
                 return {"code": "0", "data": [{"posMode": pos_mode, "sCode": "0"}], "_paperSim": True}
             raise
 
@@ -4470,7 +4470,7 @@ class OkxClient:
             self._extract_data_or_raise(result)
             return result
         except Exception:
-            if self._paper_enabled():
+            if self._paper_fallback_allowed():
                 return {
                     "code": "0",
                     "data": [{"instId": inst_id, "lever": lever, "mgnMode": mgn_mode, "sCode": "0"}],
@@ -4524,7 +4524,7 @@ class OkxClient:
             self._extract_data_or_raise(result)
             return result
         except Exception:
-            if self._paper_enabled():
+            if self._paper_fallback_allowed():
                 return {
                     "code": "0",
                     "data": [{"instId": inst_id, "ordId": ord_id or "", "clOrdId": cl_ord_id or "", "sCode": "0"}],
@@ -4541,7 +4541,7 @@ class OkxClient:
             self._extract_data_or_raise(result)
             return result
         except Exception:
-            if self._paper_enabled():
+            if self._paper_fallback_allowed():
                 rows: list[dict[str, Any]] = []
                 for payload in cleaned:
                     rows.append(
