@@ -1863,8 +1863,25 @@ function mergeAutomationRuntimeState(previous = {}, incoming = {}) {
   if (!Object.keys(next).length) {
     return { ...prev };
   }
+  const replaceWholeState =
+    Number.isFinite(Number(next.stateRevision || 0))
+    && Number(next.stateRevision || 0) > 0
+    && Number(next.stateRevision || 0) !== Number(prev.stateRevision || 0);
   const nextAnalysis = next.analysis && typeof next.analysis === "object" ? next.analysis : null;
   const nextPipeline = next.lastPipeline && typeof next.lastPipeline === "object" ? next.lastPipeline : null;
+  if (replaceWholeState) {
+    return {
+      ...next,
+      analysis: nextAnalysis ? { ...nextAnalysis } : {},
+      research: next.research && typeof next.research === "object" ? { ...next.research } : {},
+      lastPipeline: nextPipeline ? { ...nextPipeline } : {},
+      executionJournal: next.executionJournal || null,
+      markets: { ...(next.markets || {}) },
+      watchlist: Array.isArray(next.watchlist) ? next.watchlist : [],
+      equityCurve: Array.isArray(next.equityCurve) ? next.equityCurve : [],
+      logs: Array.isArray(next.logs) ? next.logs : [],
+    };
+  }
   return {
     ...prev,
     ...next,

@@ -114,6 +114,8 @@ OKX_FEE_RATE_CACHE_LOCK = threading.RLock()
 OKX_FEE_RATE_CACHE: dict[str, Any] = {}
 REMOTE_AUTOMATION_CONFIG_LOCK = threading.RLock()
 REMOTE_AUTOMATION_CONFIG_CACHE: dict[str, Any] = {"ts": 0.0, "url": "", "config": {}}
+REMOTE_AUTOMATION_STATE_LOCK = threading.RLock()
+REMOTE_AUTOMATION_STATE_CACHE: dict[str, Any] = {"ts": 0.0, "url": "", "state": {}}
 ONLY_STRATEGY_PRESET = "dip_swing"
 ONLY_STRATEGY_LABEL = "利润循环"
 ONLY_STRATEGY_FALLBACK_DECISION = "持续开仓"
@@ -2145,6 +2147,55 @@ def load_remote_automation_config_for_proxy(config: dict[str, Any]) -> dict[str,
         REMOTE_AUTOMATION_CONFIG_CACHE["url"] = cache_key
         REMOTE_AUTOMATION_CONFIG_CACHE["config"] = copy.deepcopy(normalized)
     return normalized
+
+
+def remote_automation_state_cache_key(config: dict[str, Any] | None) -> str:
+    current = config or {}
+    return str(remote_gateway_url(current) or "").rstrip("/")
+
+
+def load_cached_remote_automation_state(config: dict[str, Any]) -> tuple[dict[str, Any], float]:
+    cache_key = remote_automation_state_cache_key(config)
+    if not cache_key:
+        return {}, 0.0
+    with REMOTE_AUTOMATION_STATE_LOCK:
+        cached_key = str(REMOTE_AUTOMATION_STATE_CACHE.get("url") or "")
+        cached_ts = float(REMOTE_AUTOMATION_STATE_CACHE.get("ts") or 0.0)
+        cached_state = REMOTE_AUTOMATION_STATE_CACHE.get("state") or {}
+        if cached_key != cache_key or not isinstance(cached_state, dict) or not cached_state:
+            return {}, 0.0
+        return copy.deepcopy(cached_state), cached_ts
+
+
+def store_cached_remote_automation_state(config: dict[str, Any], state: dict[str, Any]) -> None:
+    cache_key = remote_automation_state_cache_key(config)
+    if not cache_key or not isinstance(state, dict) or not state:
+        return
+    with REMOTE_AUTOMATION_STATE_LOCK:
+        REMOTE_AUTOMATION_STATE_CACHE["ts"] = time.time()
+        REMOTE_AUTOMATION_STATE_CACHE["url"] = cache_key
+        REMOTE_AUTOMATION_STATE_CACHE["state"] = copy.deepcopy(state)
+
+
+def stamp_runtime_state_sync(
+    state: dict[str, Any],
+    *,
+    source: str,
+    loaded: bool,
+    error: str = "",
+    fetched_at: str | None = None,
+    age_seconds: float = 0.0,
+    stale: bool = False,
+) -> dict[str, Any]:
+    payload = copy.deepcopy(state or {})
+    payload["stateRevision"] = int(time.time() * 1000)
+    payload["stateFetchedAt"] = fetched_at or now_local_iso()
+    payload["stateSource"] = source
+    payload["remoteStateLoaded"] = loaded
+    payload["remoteStateError"] = error
+    payload["remoteStateAgeSeconds"] = max(0.0, float(age_seconds or 0.0))
+    payload["remoteStateStale"] = bool(stale)
+    return payload
 
 
 def enrich_remote_dip_swing_runtime_state(
@@ -12887,30 +12938,75 @@ class AppHandler(BaseHTTPRequestHandler):
                                 payload.get("state") or {},
                                 payload["state"].get("executionJournal") or local_journal,
                             )
+                            payload["state"] = stamp_runtime_state_sync(
+                                payload.get("state") or {},
+                                source="remote_live",
+                                loaded=True,
+                                fetched_at=now_local_iso(),
+                                age_seconds=0.0,
+                                stale=False,
+                            )
+                            store_cached_remote_automation_state(config, payload["state"])
+                        payload["remoteStateLoaded"] = True
+                        payload["remoteStateSource"] = "remote_live"
                         json_response(self, payload, status=response.status_code)
                     except Exception as exc:
-                        fallback_state = sanitize_only_dip_swing_runtime_state(
-                            AUTOMATION_ENGINE.snapshot(),
-                            AUTOMATION_CONFIG.current(),
-                        )
                         local_journal = get_execution_journal_snapshot(limit=80)
-                        if (local_journal.get("orders") or local_journal.get("summary")):
-                            fallback_state["executionJournal"] = local_journal
-                        fallback_state["equityDisplay"] = build_equity_display(
-                            None,
-                            fallback_state,
-                            fallback_state.get("executionJournal") or local_journal,
-                        )
-                        warnings = list((fallback_state.get("analysis") or {}).get("warnings") or [])
-                        warnings.append(summarize_remote_runtime_error(exc))
-                        fallback_state.setdefault("analysis", {})["warnings"] = warnings[-6:]
+                        fallback_error = summarize_remote_runtime_error(exc)
+                        cached_state, cached_ts = load_cached_remote_automation_state(config)
+                        if cached_state:
+                            fallback_state = copy.deepcopy(cached_state)
+                            if (local_journal.get("orders") or local_journal.get("summary")):
+                                fallback_state["executionJournal"] = local_journal
+                            fallback_state["equityDisplay"] = build_equity_display(
+                                None,
+                                fallback_state,
+                                fallback_state.get("executionJournal") or local_journal,
+                            )
+                            warnings = list((fallback_state.get("analysis") or {}).get("warnings") or [])
+                            warnings.append(fallback_error)
+                            fallback_state.setdefault("analysis", {})["warnings"] = warnings[-6:]
+                            fallback_state = stamp_runtime_state_sync(
+                                fallback_state,
+                                source="remote_cache",
+                                loaded=False,
+                                error=fallback_error,
+                                fetched_at=fallback_state.get("stateFetchedAt") or now_local_iso(),
+                                age_seconds=time.time() - cached_ts if cached_ts else 0.0,
+                                stale=True,
+                            )
+                        else:
+                            fallback_state = sanitize_only_dip_swing_runtime_state(
+                                AUTOMATION_ENGINE.snapshot(),
+                                AUTOMATION_CONFIG.current(),
+                            )
+                            if (local_journal.get("orders") or local_journal.get("summary")):
+                                fallback_state["executionJournal"] = local_journal
+                            fallback_state["equityDisplay"] = build_equity_display(
+                                None,
+                                fallback_state,
+                                fallback_state.get("executionJournal") or local_journal,
+                            )
+                            warnings = list((fallback_state.get("analysis") or {}).get("warnings") or [])
+                            warnings.append(fallback_error)
+                            fallback_state.setdefault("analysis", {})["warnings"] = warnings[-6:]
+                            fallback_state = stamp_runtime_state_sync(
+                                fallback_state,
+                                source="local_fallback",
+                                loaded=False,
+                                error=fallback_error,
+                                fetched_at=now_local_iso(),
+                                age_seconds=0.0,
+                                stale=True,
+                            )
                         json_response(
                             self,
                             {
                                 "ok": True,
                                 "state": fallback_state,
                                 "remoteStateLoaded": False,
-                                "remoteStateError": summarize_remote_runtime_error(exc),
+                                "remoteStateSource": fallback_state.get("stateSource") or "local_fallback",
+                                "remoteStateError": fallback_error,
                             },
                         )
                 elif path == "/api/orders/recent":
@@ -12951,7 +13047,8 @@ class AppHandler(BaseHTTPRequestHandler):
                                 CONFIG.current(),
                             )
                     except Exception:
-                        remote_runtime_state = {}
+                        cached_runtime_state, _cached_ts = load_cached_remote_automation_state(config)
+                        remote_runtime_state = cached_runtime_state or {}
                     payload["equityDisplay"] = build_equity_display(
                         payload.get("summary") or {},
                         remote_runtime_state,
@@ -13083,6 +13180,14 @@ class AppHandler(BaseHTTPRequestHandler):
                 None,
                 state,
                 state.get("executionJournal") or {},
+            )
+            state = stamp_runtime_state_sync(
+                state,
+                source="local_live",
+                loaded=True,
+                fetched_at=now_local_iso(),
+                age_seconds=0.0,
+                stale=False,
             )
             json_response(self, {"ok": True, "state": state})
             return
