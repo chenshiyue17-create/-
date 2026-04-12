@@ -2393,6 +2393,17 @@ def default_trading_profiles() -> dict[str, dict[str, Any]]:
     }
 
 
+def config_has_any_private_credentials(config: dict[str, Any] | None) -> bool:
+    current = config or {}
+    if any(str(current.get(key) or "").strip() for key in ("apiKey", "secretKey", "passphrase")):
+        return True
+    profiles = current.get("profiles") or {}
+    for profile in profiles.values():
+        if any(str((profile or {}).get(key) or "").strip() for key in ("apiKey", "secretKey", "passphrase")):
+            return True
+    return False
+
+
 def config_profile_key(config: dict[str, Any]) -> str:
     env_preset = str(config.get("envPreset") or "").strip() or "okx_main_demo"
     simulated = bool(config.get("simulated"))
@@ -3993,17 +4004,22 @@ class OkxClient:
     def _paper_state_authoritative(self) -> bool:
         return (
             self._paper_enabled()
-            and not self._has_private_credentials()
+            and not config_has_any_private_credentials(CONFIG.current())
             and paper_state_has_activity(self._paper_state())
         )
 
     def _paper_read_fallback_allowed(self) -> bool:
-        return self._paper_enabled() and not self._has_private_credentials()
+        return self._paper_enabled() and not config_has_any_private_credentials(CONFIG.current())
 
     def _paper_trading_fallback_allowed(self) -> bool:
         if str(CONFIG.current().get("executionMode") or "local").strip() == "remote":
             return False
-        return self._paper_enabled() and not self._has_private_credentials()
+        return self._paper_enabled() and not config_has_any_private_credentials(CONFIG.current())
+
+    def _public_market_fallback_allowed(self) -> bool:
+        if str(CONFIG.current().get("executionMode") or "local").strip() == "remote":
+            return False
+        return self._paper_read_fallback_allowed()
 
     @staticmethod
     def _binance_symbol(inst_id: str) -> str:
@@ -4522,7 +4538,7 @@ class OkxClient:
                 private=False,
             )
         except Exception:
-            if self._paper_enabled():
+            if self._public_market_fallback_allowed():
                 return self._fallback_ticker(inst_id)
             raise
 
@@ -4535,7 +4551,7 @@ class OkxClient:
                 private=False,
             )
         except Exception:
-            if self._paper_enabled():
+            if self._public_market_fallback_allowed():
                 return self._fallback_history_candles(inst_id, bar, limit)
             raise
 
@@ -4551,7 +4567,7 @@ class OkxClient:
                 private=False,
             )
         except Exception:
-            if self._paper_enabled():
+            if self._public_market_fallback_allowed():
                 return self._fallback_public_instruments(inst_type, inst_id)
             raise
 
@@ -4564,7 +4580,7 @@ class OkxClient:
                 private=False,
             )
         except Exception:
-            if self._paper_enabled():
+            if self._public_market_fallback_allowed():
                 return self._fallback_mark_price(inst_id)
             raise
 
@@ -4577,7 +4593,7 @@ class OkxClient:
                 private=False,
             )
         except Exception:
-            if self._paper_enabled():
+            if self._public_market_fallback_allowed():
                 return self._fallback_open_interest(inst_id)
             raise
 
@@ -4590,7 +4606,7 @@ class OkxClient:
                 private=False,
             )
         except Exception:
-            if self._paper_enabled():
+            if self._public_market_fallback_allowed():
                 return self._fallback_funding_rate(inst_id)
             raise
 
