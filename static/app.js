@@ -192,6 +192,7 @@ const liveMarketState = {
 const dashboardState = {
   account: null,
   automation: null,
+  automationStateMeta: null,
   savedAutomationConfig: null,
   strategyApplyState: null,
   miner: null,
@@ -5808,9 +5809,36 @@ async function saveMinerConfig() {
 
 async function refreshAutomationState() {
   return runSingleFlight("automationState", async () => {
-    const data = await request("/api/automation/state");
-    renderAutomationState(data.state || {});
-    if (shouldAutoAnalyze(data.state || {})) {
+    let state = null;
+    let source = "automation_state";
+    try {
+      const data = await request("/api/automation/state", { timeoutMs: 4500 });
+      state = data.state || {};
+    } catch (primaryError) {
+      try {
+        const snapshot = await request("/api/focus-snapshot", { timeoutMs: 6500 });
+        state = snapshot.automationState || {};
+        source = "focus_snapshot";
+      } catch (snapshotError) {
+        if (dashboardState.automation) {
+          const fallbackState = mergeAutomationRuntimeState(dashboardState.automation || {}, {
+            statusText: dashboardState.automation.statusText || "运行中",
+            modeText: dashboardState.automation.modeText || "已切到本地缓存视图",
+            lastError: primaryError?.message || snapshotError?.message || "",
+          });
+          renderAutomationState(fallbackState);
+          dashboardState.automationStateMeta = {
+            source: "local_cache",
+            error: primaryError?.message || snapshotError?.message || "",
+          };
+          return;
+        }
+        throw primaryError;
+      }
+    }
+    renderAutomationState(state || {});
+    dashboardState.automationStateMeta = { source, error: "" };
+    if (shouldAutoAnalyze(state || {})) {
       scheduleAutoAnalysis({ immediate: true });
     }
   });

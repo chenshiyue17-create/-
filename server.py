@@ -465,7 +465,7 @@ REMOTE_CONFIG_KEYS = (
 )
 REMOTE_CONFIG_FETCH_TIMEOUT = 8.0
 REMOTE_NODE_HEALTH_TIMEOUT = 6.0
-REMOTE_AUTOMATION_STATE_TIMEOUT = 4.0
+REMOTE_AUTOMATION_STATE_TIMEOUT = 2.5
 
 
 def build_proxy_runtime_config(current: dict[str, Any], payload: dict[str, Any] | None = None) -> dict[str, Any]:
