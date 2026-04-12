@@ -779,12 +779,6 @@ function setPendingEnvironmentUi() {
   if ($("order-spot-label")) $("order-spot-label").textContent = "等待标的";
   if ($("order-swap-label")) $("order-swap-label").textContent = "等待标的";
   if ($("order-watchlist-label")) $("order-watchlist-label").textContent = "等待 watchlist";
-  if ($("strategy-application-status")) $("strategy-application-status").textContent = "等待应用策略";
-  if ($("strategy-application-detail")) $("strategy-application-detail").textContent = "正在同步当前组合参数和执行状态";
-  if ($("portfolio-context-main")) $("portfolio-context-main").textContent = "等待 watchlist";
-  if ($("portfolio-context-sub")) $("portfolio-context-sub").textContent = "正在同步每个币的独立决策、风控和仓位摘要";
-  if ($("rail-strategy-apply")) $("rail-strategy-apply").textContent = "等待应用";
-  if ($("rail-strategy-pnl")) $("rail-strategy-pnl").textContent = "--";
   if ($("rail-strategy-status-sub")) $("rail-strategy-status-sub").textContent = "正在同步当前环境与策略状态";
   document.querySelectorAll("[data-env-preset]").forEach((button) => {
     button.classList.remove("active");
@@ -797,22 +791,6 @@ function isSimulatedMode() {
 
 function isRemoteExecutionMode() {
   return $("executionMode")?.value === "remote";
-}
-
-const RAIL_AUTOMATION_TOGGLES = [
-  ["autoAutostart", "railAutoAutostart"],
-  ["autoAllowLiveManualOrders", "railAutoAllowLiveManualOrders"],
-  ["autoAllowLiveTrading", "railAutoAllowLiveTrading"],
-  ["autoAllowLiveAutostart", "railAutoAllowLiveAutostart"],
-];
-
-function syncRailAutomationToggles() {
-  RAIL_AUTOMATION_TOGGLES.forEach(([formId, railId]) => {
-    const form = $(formId);
-    const rail = $(railId);
-    if (!form || !rail) return;
-    rail.checked = Boolean(form.checked);
-  });
 }
 
 function isAutomationActuallyRunning(automation = {}) {
@@ -836,27 +814,8 @@ function isAutomationActuallyRunning(automation = {}) {
 function syncRailStrategyButtons() {
   const running = isAutomationActuallyRunning(dashboardState.automation);
   const blocked = isLiveRouteBlocked();
-  const start = $("rail-start-automation");
-  const runOnce = $("rail-run-automation-once");
-  const stop = $("rail-stop-automation");
-  const save = $("rail-save-automation");
   const toggle = $("rail-strategy-toggle");
 
-  if (save) {
-    save.disabled = Boolean(dashboardState.configSaving || dashboardState.configTesting);
-  }
-  if (start) {
-    start.disabled = running || blocked;
-    start.title = blocked ? (dashboardState.routeHealth?.summary || "当前实盘链路不可用") : "";
-  }
-  if (runOnce) {
-    runOnce.disabled = running || blocked;
-    runOnce.title = blocked ? (dashboardState.routeHealth?.summary || "当前实盘链路不可用") : "";
-  }
-  if (stop) {
-    stop.disabled = !running;
-    stop.title = running ? "" : "当前策略未运行";
-  }
   if (toggle) {
     toggle.disabled = !running && blocked;
     toggle.title = !running && blocked ? (dashboardState.routeHealth?.summary || "当前实盘链路不可用") : "";
@@ -873,22 +832,11 @@ function renderRailStrategyControls() {
     $("simulated")?.value === "true"
   );
   const env = ENV_PRESETS[envPreset] || ENV_PRESETS.custom;
-  const watchlist = parseWatchlistSymbols(
-    $("autoWatchlistSymbols")?.value,
-    $("spotInstId")?.value,
-    $("swapInstId")?.value
-  );
   const simulated = isSimulatedMode();
   const running = isAutomationActuallyRunning(automation);
-  const allowLiveTrading = Boolean($("autoAllowLiveTrading")?.checked);
-  const allowLiveManualOrders = Boolean($("autoAllowLiveManualOrders")?.checked);
-  const allowLiveAutostart = Boolean($("autoAllowLiveAutostart")?.checked);
   const state = $("rail-strategy-state");
   const pill = $("rail-strategy-pill");
-  const meta = $("rail-strategy-meta");
   const statusSub = $("rail-strategy-status-sub");
-  const watchlistLabel = $("rail-strategy-watchlist");
-  const guard = $("rail-strategy-guard");
   const summaryText = running
     ? `${env.label} · 自动量化运行中`
     : (automation?.stopReason || automation?.lastError || `${env.label} · 当前待机`);
@@ -899,29 +847,12 @@ function renderRailStrategyControls() {
   if (statusSub) {
     statusSub.textContent = summaryText;
   }
-  if (meta) {
-    meta.textContent = `${$("active-strategy-label")?.textContent || "策略未设置"} · ${env.label}`;
-  }
-  if (watchlistLabel) {
-    watchlistLabel.textContent = watchlist.length > 1
-      ? `${watchlist.join(" / ")} · ${watchlist.length} 币并行`
-      : (watchlist[0] || "BTC");
-  }
-  if (guard) {
-    guard.textContent = simulated
-      ? "模拟盘已锁定真实权限"
-      : [
-          allowLiveManualOrders ? "手动实盘已开" : "手动实盘锁定",
-          allowLiveTrading ? "自动实盘已开" : "自动实盘锁定",
-          allowLiveAutostart ? "实盘自启已开" : "实盘自启锁定",
-        ].join(" · ");
-  }
   if (pill) {
     if (simulated) {
       pill.textContent = running ? "模拟运行" : "模拟待机";
       pill.style.color = "var(--accent-2)";
       pill.style.borderColor = "rgba(69, 214, 196, 0.24)";
-    } else if (allowLiveTrading) {
+    } else if ($("autoAllowLiveTrading")?.checked) {
       pill.textContent = running ? "实盘运行" : "实盘待机";
       pill.style.color = "var(--success)";
       pill.style.borderColor = "rgba(105, 240, 174, 0.22)";
@@ -986,8 +917,6 @@ function applyRouteHealth(route, { preserveMessage = false } = {}) {
     $("start-automation"),
     $("run-automation-once"),
     $("cockpit-run-once"),
-    $("rail-start-automation"),
-    $("rail-run-automation-once"),
     $("spot-order-form")?.querySelector('button[type="submit"]'),
     $("swap-order-form")?.querySelector('button[type="submit"]'),
   ].forEach((node) => {
@@ -3282,7 +3211,6 @@ function fillAutomationForm(config) {
   $("autoAllowLiveAutostart").checked = Boolean(config.allowLiveAutostart);
   $("autoEnforceNetMode").checked = config.enforceNetMode !== false;
   setStrategyPresetUi(ONLY_STRATEGY_PRESET);
-  syncRailAutomationToggles();
   updateQuickState();
   renderDeskGuards();
   renderStrategyPortfolio();
@@ -5508,102 +5436,10 @@ function renderPortfolioWatchlist(entries = []) {
 
 function renderStrategyPortfolio() {
   const automation = dashboardState.automation || {};
-  const analysis = sanitizeAnalysisForSwingOnly(automation.analysis || {});
-  const pipeline = automation.lastPipeline || {};
-  const riskReport = automation.lastRiskReport || {};
-  const executionJournal = automation.executionJournal || dashboardState.orderJournal || {};
-  const saved = dashboardState.savedAutomationConfig;
   const draft = normalizeAutomationConfigForCompare(collectAutomationConfig());
-  const dirty = isAutomationConfigDirty();
-  const applyState = dashboardState.strategyApplyState || {};
   const watchlist = (automation.watchlist && automation.watchlist.length)
     ? automation.watchlist
     : buildDraftPortfolioEntries(draft);
-  const startEq = Number(automation.sessionStartEq || 0);
-  const currentEq = Number(automation.currentEq || 0);
-  const pnlAmount = startEq > 0 ? currentEq - startEq : 0;
-  const pnlPct = startEq > 0 ? (pnlAmount / startEq) * 100 : 0;
-  const running = Boolean(automation.running);
-  const riskChecks = Array.isArray(riskReport.checks) ? riskReport.checks : [];
-  const activeConfig = dirty ? draft : (saved || draft);
-  const activeSummary = buildStrategyFormSummary(activeConfig);
-  let badge = "待同步";
-  let statusTitle = "等待应用策略";
-  let detail = "从研究榜单应用或保存配置后，这里会明确告诉你当前组合是否已经生效。";
-
-  if (running) {
-    badge = "运行中";
-    statusTitle = applyState.title || "组合策略运行中";
-    detail = `${activeSummary} · ${analysis.decisionLabel || automation.modeText || "正在轮询"}。`;
-  } else if (dirty) {
-    badge = "待保存";
-    statusTitle = applyState.title || "参数已改动，待保存";
-    detail = applyState.detail || `${activeSummary} · 当前只是草稿，保存后才会真正生效。`;
-  } else if (saved) {
-    badge = isSimulatedMode() ? "已生效" : "实盘就绪";
-    statusTitle = applyState.title || "当前组合已生效";
-    detail = applyState.detail || `${activeSummary} · ${analysis.selectedStrategyName || "当前执行参数"} 已同步。`;
-  }
-
-  $("strategy-application-status").textContent = statusTitle;
-  $("strategy-application-detail").textContent = detail;
-  $("strategy-application-badge").textContent = badge;
-  $("portfolio-pnl-main").textContent = startEq > 0 ? `${formatPercentValue(pnlPct)}` : "--";
-  $("portfolio-pnl-main").style.color =
-    pnlAmount > 0 ? "var(--success)" : pnlAmount < 0 ? "var(--danger)" : "var(--text)";
-  $("portfolio-pnl-sub").textContent = startEq > 0
-    ? `约 ${formatSignedMoney(pnlAmount)} USDT · 从本次组合会话开始统计`
-    : "收益会按组合会话持续更新，不再只靠订单详情猜测";
-  $("portfolio-context-main").textContent = activeSummary;
-  $("portfolio-context-sub").textContent = running
-    ? `${analysis.selectedStrategyName || "利润循环"} · ${analysis.decisionLabel || "观察中"} · 方向 ${analysis.plannedSideLabel || "--"} · 预期净优势 ${analysis.predictedNetPct || "--"}%${analysis.liquidationBufferPct ? ` · 缓冲 ${analysis.liquidationBufferPct}%` : ""}`
-    : `${watchlist.length} 个币各自独立决策、独立风控、独立仓位摘要`;
-  if ($("portfolio-pipeline-main")) {
-    $("portfolio-pipeline-main").textContent = pipeline.summary || (running ? "本轮执行中" : "等待下一轮编排");
-  }
-  if ($("portfolio-pipeline-sub")) {
-    const pipelineFlags = [
-      `信号 ${pipeline.signal || "idle"}`,
-      `组合 ${pipeline.portfolio || "idle"}`,
-      `风控 ${pipeline.risk || "idle"}`,
-      `执行 ${pipeline.execution || "idle"}`,
-    ];
-    if (pipeline.targetCount) pipelineFlags.push(`${pipeline.targetCount} 币`);
-    if (executionJournal.lastSource) pipelineFlags.push(`账本 ${executionJournal.lastSource}`);
-    $("portfolio-pipeline-sub").textContent = pipelineFlags.join(" · ");
-  }
-  if ($("portfolio-risk-main")) {
-    $("portfolio-risk-main").textContent = riskReport.stopReason || (riskReport.status === "ok" ? "护栏正常" : "等待风控检查");
-  }
-  if ($("portfolio-risk-sub")) {
-    const topChecks = riskChecks.slice(0, 2).map((item) => {
-      const marker = item?.passed ? "通过" : "拦截";
-      return `${marker} · ${item?.detail || item?.name || "未命名检查"}`;
-    });
-    const fallbackRisk = [
-      `活跃 ${riskReport.activeMarkets || 0} 市场`,
-      `观察 ${riskReport.watchedSymbols || watchlist.length || 0} 币`,
-      `方向 ${analysis.plannedSideLabel || "--"}`,
-      `预期净优势 ${analysis.predictedNetPct || "--"}%`,
-    ];
-    if (analysis.liquidationBufferPct) fallbackRisk.push(`强平缓冲 ${analysis.liquidationBufferPct}%`);
-    const journalBits = Number(executionJournal.totalOrders || 0)
-      ? [`账本 ${executionJournal.totalOrders || 0} 单`, `成交 ${executionJournal.filledOrders || 0}`, `异常 ${(Number(executionJournal.canceledOrders || 0) + Number(executionJournal.rejectedOrders || 0))}`]
-      : [];
-    $("portfolio-risk-sub").textContent = [
-      ...(topChecks.length ? topChecks : fallbackRisk),
-      ...journalBits,
-    ].join(" · ");
-  }
-  if ($("rail-strategy-apply")) {
-    $("rail-strategy-apply").textContent = statusTitle;
-  }
-  if ($("rail-strategy-pnl")) {
-    $("rail-strategy-pnl").textContent = startEq > 0
-      ? `${formatPercentValue(pnlPct)} · ${formatSignedMoney(pnlAmount)}U`
-      : "--";
-    $("rail-strategy-pnl").style.color = pnlAmount > 0 ? "var(--success)" : pnlAmount < 0 ? "var(--danger)" : "var(--text)";
-  }
   renderPortfolioWatchlist(watchlist);
 }
 
@@ -5731,7 +5567,6 @@ async function saveConfig() {
       $("autoAllowLiveManualOrders").checked = false;
       $("autoAllowLiveTrading").checked = false;
       $("autoAllowLiveAutostart").checked = false;
-      syncRailAutomationToggles();
       renderRailStrategyControls();
       try {
         await saveAutomationConfig({ silent: true });
@@ -6543,14 +6378,6 @@ async function boot() {
     }
   });
 
-  $("rail-save-automation").addEventListener("click", async () => {
-    try {
-      await saveAutomationConfig();
-    } catch (err) {
-      setAutomationMessage(err.message, "err");
-    }
-  });
-
   $("save-miner-config").addEventListener("click", async () => {
     try {
       await saveMinerConfig();
@@ -6633,25 +6460,7 @@ async function boot() {
     }
   });
 
-  $("rail-run-automation-once").addEventListener("click", async () => {
-    try {
-      await runAutomationOnce();
-    } catch (err) {
-      setAutomationMessage(err.message, "err");
-      await refreshAutomationState().catch(() => {});
-    }
-  });
-
   $("start-automation").addEventListener("click", async () => {
-    try {
-      await startAutomation();
-    } catch (err) {
-      setAutomationMessage(err.message, "err");
-      await refreshAutomationState().catch(() => {});
-    }
-  });
-
-  $("rail-start-automation").addEventListener("click", async () => {
     try {
       await startAutomation();
     } catch (err) {
@@ -6674,14 +6483,6 @@ async function boot() {
   });
 
   $("stop-automation").addEventListener("click", async () => {
-    try {
-      await stopAutomation();
-    } catch (err) {
-      setAutomationMessage(err.message, "err");
-    }
-  });
-
-  $("rail-stop-automation").addEventListener("click", async () => {
     try {
       await stopAutomation();
     } catch (err) {

@@ -45,54 +45,6 @@
           <div class="rail-action-single">
             <button id="rail-strategy-toggle" class="btn btn-primary" type="button">启动</button>
           </div>
-          <div class="rail-strategy-summary rail-strategy-legacy">
-            <div>
-              <span>当前策略</span>
-              <strong id="rail-strategy-meta">等待策略配置</strong>
-            </div>
-            <div>
-              <span>并行标的</span>
-              <strong id="rail-strategy-watchlist">等待 watchlist</strong>
-            </div>
-            <div>
-              <span>执行护栏</span>
-              <strong id="rail-strategy-guard">等待环境检查</strong>
-            </div>
-          </div>
-          <div class="rail-strategy-live rail-strategy-legacy">
-            <div>
-              <span>应用状态</span>
-              <strong id="rail-strategy-apply">等待应用</strong>
-            </div>
-            <div>
-              <span>组合收益</span>
-              <strong id="rail-strategy-pnl">--</strong>
-            </div>
-          </div>
-          <div class="rail-toggle-list rail-strategy-legacy">
-            <label class="rail-toggle-row" for="railAutoAutostart">
-              <span>自动启动</span>
-              <input id="railAutoAutostart" type="checkbox" />
-            </label>
-            <label class="rail-toggle-row" for="railAutoAllowLiveManualOrders">
-              <span>手动实盘</span>
-              <input id="railAutoAllowLiveManualOrders" type="checkbox" />
-            </label>
-            <label class="rail-toggle-row" for="railAutoAllowLiveTrading">
-              <span>自动实盘</span>
-              <input id="railAutoAllowLiveTrading" type="checkbox" />
-            </label>
-            <label class="rail-toggle-row" for="railAutoAllowLiveAutostart">
-              <span>实盘自启</span>
-              <input id="railAutoAllowLiveAutostart" type="checkbox" />
-            </label>
-          </div>
-          <div class="rail-action-grid rail-strategy-legacy">
-            <button id="rail-save-automation" class="btn btn-secondary" type="button">保存</button>
-            <button id="rail-run-automation-once" class="btn btn-ghost" type="button">跑一轮</button>
-            <button id="rail-start-automation" class="btn btn-primary" type="button">启动</button>
-            <button id="rail-stop-automation" class="btn btn-ghost danger" type="button">停止</button>
-          </div>
         </section>
         <div class="rail-highlights">
           <div class="rail-stat">
@@ -586,40 +538,6 @@
           </div>
           </div>
           <div class="portfolio-overview-surface">
-            <div class="portfolio-overview-head">
-              <div>
-                <div class="eyebrow">Portfolio Engine</div>
-                <strong>每个币独立决策、独立风控、独立仓位摘要</strong>
-              </div>
-              <span class="pill" id="strategy-application-badge">等待应用</span>
-            </div>
-            <div class="portfolio-summary-grid">
-              <div class="portfolio-summary-card">
-                <span>应用状态</span>
-                <strong id="strategy-application-status">等待应用策略</strong>
-                <small id="strategy-application-detail">从研究榜单应用或保存配置后，这里会明确告诉你当前组合是否已生效。</small>
-              </div>
-              <div class="portfolio-summary-card">
-                <span>组合收益</span>
-                <strong id="portfolio-pnl-main">--</strong>
-                <small id="portfolio-pnl-sub">等待策略启动后统计会话收益</small>
-              </div>
-              <div class="portfolio-summary-card">
-                <span>当前组合</span>
-                <strong id="portfolio-context-main">等待 watchlist</strong>
-                <small id="portfolio-context-sub">每个币独立执行，统一受组合护栏约束。</small>
-              </div>
-              <div class="portfolio-summary-card">
-                <span>执行流水线</span>
-                <strong id="portfolio-pipeline-main">等待本轮编排</strong>
-                <small id="portfolio-pipeline-sub">信号、组合、风控、执行会在这里告诉你卡在哪一层。</small>
-              </div>
-              <div class="portfolio-summary-card">
-                <span>风控护栏</span>
-                <strong id="portfolio-risk-main">等待风控检查</strong>
-                <small id="portfolio-risk-sub">日内回撤、下单次数、活跃币种等检查结果会显示在这里。</small>
-              </div>
-            </div>
             <div id="portfolio-watchlist" class="portfolio-watchlist-grid empty">等待组合交易状态</div>
           </div>
           <div class="focus-inline-note">
