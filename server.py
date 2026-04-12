@@ -360,6 +360,16 @@ def is_remote_execution_enabled(config: dict[str, Any]) -> bool:
     )
 
 
+def should_run_local_okx_background_tasks(config: dict[str, Any]) -> bool:
+    if is_remote_execution_enabled(config):
+        return False
+    return bool(
+        str(config.get("apiKey") or "").strip()
+        and str(config.get("secretKey") or "").strip()
+        and str(config.get("passphrase") or "").strip()
+    )
+
+
 def remote_gateway_url(config: dict[str, Any]) -> str:
     return str(config.get("remoteGatewayUrl") or "").strip().rstrip("/")
 
@@ -781,7 +791,9 @@ def warm_focus_cache_once() -> None:
     valid, message = validate_config(config)
     if not valid:
         return
-    refresh_route = bool(config.get("apiKey")) and bool(config.get("passphrase"))
+    if not should_run_local_okx_background_tasks(config):
+        return
+    refresh_route = True
 
     def fetch_account() -> dict[str, Any]:
         client = OkxClient(config)
@@ -2205,57 +2217,46 @@ def enrich_remote_dip_swing_runtime_state(
 ) -> dict[str, Any]:
     effective = enforce_only_dip_swing_strategy(deep_merge(default_automation_config(), automation or {}))
     sanitized = sanitize_only_dip_swing_runtime_state(state, effective)
-    try:
-        analysis_bundle = build_execution_analysis(effective, build_public_client(public_config))
-        analysis = {
-            key: value
-            for key, value in analysis_bundle.items()
-            if key not in {"selectedConfig", "research"}
-        }
-        sanitized["analysis"] = analysis
-        sanitized["research"] = analysis_bundle.get("research") or {}
+    analysis = copy.deepcopy(sanitized.get("analysis") or {})
+    candidate_count = int(analysis.get("candidateCount") or 0)
+    market_candidate_count = int(analysis.get("marketCandidateCount") or 0)
+    market_scan_count = int(analysis.get("marketScanCount") or 0)
+    active_symbols = int(
+        ((sanitized.get("lastPipeline") or {}).get("executionSummary") or {}).get("activeSymbols") or 0
+    )
+    selected_from_market = bool(analysis.get("selectedFromMarketScan"))
 
-        candidate_count = int(analysis.get("candidateCount") or 0)
-        market_candidate_count = int(analysis.get("marketCandidateCount") or 0)
-        market_scan_count = int(analysis.get("marketScanCount") or 0)
-        active_symbols = int(
-            ((sanitized.get("lastPipeline") or {}).get("executionSummary") or {}).get("activeSymbols") or 0
-        )
-        selected_from_market = bool(analysis.get("selectedFromMarketScan"))
+    if not analysis.get("warnings"):
+        analysis["warnings"] = []
+    sanitized["analysis"] = analysis
 
-        sanitized["statusText"] = (
-            "运行中" if sanitized.get("running") and bool(analysis.get("allowNewEntries")) else
-            (analysis.get("decisionLabel") or "观察中") if sanitized.get("running") else
-            "自动量化已停止"
-        )
-        sanitized["modeText"] = (
-            f"{analysis.get('selectedStrategyName', f'BTC {ONLY_STRATEGY_LABEL}')}"
-            f" · {analysis.get('decisionLabel', '待分析')}"
-            f" · 市场候选 {market_candidate_count}/{market_scan_count}"
-            + (" · 轮动接管" if selected_from_market else "")
-        )
+    sanitized["statusText"] = (
+        "运行中" if sanitized.get("running") and bool(analysis.get("allowNewEntries")) else
+        (analysis.get("decisionLabel") or "观察中") if sanitized.get("running") else
+        "自动量化已停止"
+    )
+    sanitized["modeText"] = (
+        f"{analysis.get('selectedStrategyName', f'BTC {ONLY_STRATEGY_LABEL}')}"
+        f" · {analysis.get('decisionLabel', '待分析')}"
+        f" · 市场候选 {market_candidate_count}/{market_scan_count}"
+        + (" · 轮动接管" if selected_from_market else "")
+    )
 
-        last_pipeline = copy.deepcopy(sanitized.get("lastPipeline") or {})
-        last_pipeline["summary"] = (
-            f"信号 {analysis.get('decisionLabel', '待分析')} · "
-            f"watchlist 候选 {candidate_count} · "
-            f"市场候选 {market_candidate_count} / 扫描 {market_scan_count} · "
-            f"{active_symbols} 币持仓"
-        )
-        sanitized["lastPipeline"] = last_pipeline
+    last_pipeline = copy.deepcopy(sanitized.get("lastPipeline") or {})
+    last_pipeline["summary"] = (
+        f"信号 {analysis.get('decisionLabel', '待分析')} · "
+        f"watchlist 候选 {candidate_count} · "
+        f"市场候选 {market_candidate_count} / 扫描 {market_scan_count} · "
+        f"{active_symbols} 币持仓"
+    )
+    sanitized["lastPipeline"] = last_pipeline
 
-        last_applied = copy.deepcopy(sanitized.get("lastAppliedStrategy") or {})
-        last_applied["title"] = analysis.get("selectedStrategyName") or f"BTC {ONLY_STRATEGY_LABEL}"
-        last_applied["detail"] = strategy_detail_line(effective)
-        last_applied["stage"] = "running" if bool(analysis.get("allowNewEntries")) else "synced"
-        last_applied["appliedAt"] = sanitized.get("lastCycleAt") or last_applied.get("appliedAt") or now_local_iso()
-        sanitized["lastAppliedStrategy"] = last_applied
-    except Exception as exc:
-        patched_analysis = copy.deepcopy(sanitized.get("analysis") or {})
-        warnings = list(patched_analysis.get("warnings") or [])
-        warnings.append(f"本地重算{ONLY_STRATEGY_LABEL}分析失败，沿用远端状态: {exc}")
-        patched_analysis["warnings"] = warnings[-5:]
-        sanitized["analysis"] = patched_analysis
+    last_applied = copy.deepcopy(sanitized.get("lastAppliedStrategy") or {})
+    last_applied["title"] = analysis.get("selectedStrategyName") or f"BTC {ONLY_STRATEGY_LABEL}"
+    last_applied["detail"] = strategy_detail_line(effective)
+    last_applied["stage"] = "running" if bool(analysis.get("allowNewEntries")) else "synced"
+    last_applied["appliedAt"] = sanitized.get("lastCycleAt") or last_applied.get("appliedAt") or now_local_iso()
+    sanitized["lastAppliedStrategy"] = last_applied
     return sanitized
 
 
@@ -4789,6 +4790,12 @@ class OkxPrivateOrderStream:
         backoff = 1.5
         while True:
             config = CONFIG.current()
+            if not should_run_local_okx_background_tasks(config):
+                with self.state_lock:
+                    self.connected = False
+                    self.last_error = ""
+                await asyncio.sleep(3)
+                continue
             valid, _ = validate_config(config)
             if not valid:
                 await asyncio.sleep(3)
@@ -13852,8 +13859,10 @@ def main() -> None:
     ensure_private_permissions(DATA_DIR, is_dir=True)
     maybe_autostart()
     maybe_autostart_miner()
-    ensure_focus_warmer()
-    PRIVATE_ORDER_STREAM.ensure_running()
+    startup_config = CONFIG.current()
+    if should_run_local_okx_background_tasks(startup_config):
+        ensure_focus_warmer()
+        PRIVATE_ORDER_STREAM.ensure_running()
     try:
         httpd = QuietThreadingHTTPServer((HOST, PORT), AppHandler)
     except OSError as exc:
