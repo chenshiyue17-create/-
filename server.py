@@ -3999,6 +3999,8 @@ class OkxClient:
         return self._paper_enabled() and not self._has_private_credentials()
 
     def _paper_trading_fallback_allowed(self) -> bool:
+        if str(CONFIG.current().get("executionMode") or "local").strip() == "remote":
+            return False
         return self._paper_enabled() and not self._has_private_credentials()
 
     @staticmethod
