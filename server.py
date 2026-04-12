@@ -171,6 +171,7 @@ DIP_SWING_FORCE_MARKET_ENTRY_TARGET_COUNT = 8
 DIP_SWING_EXIT_PROTECTION_PCT = Decimal("0.08")
 DIP_SWING_TARGET_MIN_MARGIN_RATIO = Decimal("0.012")
 DIP_SWING_TARGET_MAX_MARGIN_RATIO = Decimal("0.050")
+DIP_SWING_AVAILABLE_MARGIN_UTILIZATION = Decimal("0.92")
 DIP_SWING_MIN_LIQ_BUFFER_PCT = Decimal("18")
 DIP_SWING_MAX_LEVERAGE = Decimal("10")
 OKX_DEFAULT_SWAP_MAKER_FEE_PCT = Decimal("0.02")
@@ -6645,6 +6646,65 @@ def find_balance_detail(snapshot: dict[str, Any], ccy: str) -> dict[str, Any]:
     return {}
 
 
+def resolve_swap_available_margin(snapshot: dict[str, Any], margin_ccy: str = "USDT") -> Decimal:
+    row = find_balance_detail(snapshot, margin_ccy)
+    if row:
+        for key in ("availEq", "availBal", "cashBal", "eq", "eqUsd"):
+            amount = safe_decimal(row.get(key), "0")
+            if amount > 0:
+                return amount
+    summary = snapshot.get("summary") or {}
+    for key in ("displayTotalEq", "totalEq", "adjEq", "isoEq"):
+        amount = safe_decimal(summary.get(key), "0")
+        if amount > 0:
+            return amount
+    return Decimal("0")
+
+
+def clamp_swap_contracts_to_available_margin(
+    planned_contracts: Decimal,
+    *,
+    available_margin: Decimal,
+    lot_size: Decimal,
+    last_price: Decimal,
+    contract_value: Decimal,
+    leverage: Decimal,
+) -> dict[str, Any]:
+    if planned_contracts <= 0 or lot_size <= 0:
+        return {
+            "contracts": Decimal("0"),
+            "contractMargin": Decimal("0"),
+            "availableBudget": Decimal("0"),
+            "clamped": False,
+        }
+    contract_margin = (last_price * contract_value) / leverage if leverage > 0 and last_price > 0 and contract_value > 0 else Decimal("0")
+    if contract_margin <= 0:
+        return {
+            "contracts": Decimal("0"),
+            "contractMargin": Decimal("0"),
+            "availableBudget": Decimal("0"),
+            "clamped": True,
+        }
+    usable_margin = max(Decimal("0"), available_margin * DIP_SWING_AVAILABLE_MARGIN_UTILIZATION)
+    if usable_margin <= 0:
+        return {
+            "contracts": Decimal("0"),
+            "contractMargin": contract_margin,
+            "availableBudget": Decimal("0"),
+            "clamped": True,
+        }
+    affordable_contracts = round_down(usable_margin / contract_margin, lot_size)
+    if affordable_contracts < lot_size:
+        affordable_contracts = Decimal("0")
+    contracts = min(planned_contracts, affordable_contracts)
+    return {
+        "contracts": contracts,
+        "contractMargin": contract_margin,
+        "availableBudget": usable_margin,
+        "clamped": contracts < planned_contracts,
+    }
+
+
 def latest_public_price(
     client: OkxClient,
     inst_id: str,
@@ -10986,6 +11046,7 @@ class AutomationEngine:
                         self._run_swap_cycle(
                             client,
                             target,
+                            balance_snapshot,
                             allow_new_entries,
                             analysis_label,
                             market_key=swap_key,
@@ -11684,6 +11745,7 @@ class AutomationEngine:
         self,
         client: OkxClient,
         automation: dict[str, Any],
+        balance_snapshot: dict[str, Any],
         allow_new_entries: bool,
         analysis_label: str,
         *,
@@ -11778,9 +11840,24 @@ class AutomationEngine:
         )
         target_snapshot = self._target_balance_snapshot(automation)
         planned_trade_contracts = safe_decimal(target_plan.get("plannedContracts"), "0")
-        trade_contracts = planned_trade_contracts
+        margin_ccy = str(meta.get("settleCcy") or "USDT").strip() or "USDT"
+        available_margin = resolve_swap_available_margin(balance_snapshot, margin_ccy)
+        available_margin_plan = clamp_swap_contracts_to_available_margin(
+            planned_trade_contracts,
+            available_margin=available_margin,
+            lot_size=lot_size,
+            last_price=last_price,
+            contract_value=contract_value,
+            leverage=leverage,
+        )
+        trade_contracts = safe_decimal(available_margin_plan.get("contracts"), "0")
+        effective_margin_budget = (
+            safe_decimal(available_margin_plan.get("contractMargin"), "0") * trade_contracts
+            if trade_contracts > 0
+            else Decimal("0")
+        )
         entry_projection = estimate_profit_loop_entry_net_pnl(
-            planned_contracts=planned_trade_contracts,
+            planned_contracts=trade_contracts,
             last_price=last_price,
             contract_value=contract_value,
             predicted_net_pct=predicted_net_pct,
@@ -11892,12 +11969,17 @@ class AutomationEngine:
                 f" / 能力 {target_plan.get('phaseLabel', target_execution_phase_label(target_plan.get('phase', 'fixed')))}"
                 f" / {ability_text}"
                 f" / 保证金 {format_decimal(safe_decimal(target_plan.get('marginBudget'), '0'), 2)}U"
-                f" / 动态仓位 {decimal_to_str(planned_trade_contracts)} 张"
+                f" / 动态仓位 {decimal_to_str(trade_contracts)} 张"
             )
         elif aggressive_scalp_mode:
             status_text += (
-                f" / 保证金 {format_decimal(safe_decimal(target_plan.get('marginBudget'), '0'), 2)}U"
-                f" / 动态仓位 {decimal_to_str(planned_trade_contracts)} 张"
+                f" / 保证金 {format_decimal(effective_margin_budget, 2)}U"
+                f" / 动态仓位 {decimal_to_str(trade_contracts)} 张"
+            )
+        if bool(available_margin_plan.get("clamped")):
+            status_text += (
+                f" / 可用保证金 {format_decimal(available_margin, 2)} {margin_ccy}"
+                f" / 已按账户余量裁剪到 {decimal_to_str(trade_contracts)} 张"
             )
         self._set_market(
             market_key,
@@ -12081,7 +12163,15 @@ class AutomationEngine:
             return
 
         if trade_contracts <= 0:
-            self._set_market(market_key, {"lastMessage": "当前保证金预算不足以触发最小下单单位，继续观察"})
+            self._set_market(
+                market_key,
+                {
+                    "lastMessage": (
+                        f"当前可用保证金仅 {format_decimal(available_margin, 2)} {margin_ccy}"
+                        "，不足以触发最小下单单位，继续观察"
+                    )
+                },
+            )
             return
         if projected_entry_net_pnl < DIP_SWING_NET_TARGET_USDT:
             self._set_market(
@@ -12214,6 +12304,7 @@ class AutomationEngine:
         self,
         client: OkxClient,
         automation: dict[str, Any],
+        balance_snapshot: dict[str, Any],
         allow_new_entries: bool,
         analysis_label: str,
         *,
@@ -12223,6 +12314,7 @@ class AutomationEngine:
             self._run_dip_swing_swap_cycle(
                 client,
                 automation,
+                balance_snapshot,
                 allow_new_entries,
                 analysis_label,
                 market_key=market_key,
@@ -12353,8 +12445,27 @@ class AutomationEngine:
                 return
 
         trade_contracts = round_down(safe_decimal(automation.get("swapContracts"), "0"), lot_size)
+        margin_ccy = str(meta.get("settleCcy") or "USDT").strip() or "USDT"
+        available_margin = resolve_swap_available_margin(balance_snapshot, margin_ccy)
+        available_margin_plan = clamp_swap_contracts_to_available_margin(
+            trade_contracts,
+            available_margin=available_margin,
+            lot_size=lot_size,
+            last_price=last_price,
+            contract_value=safe_decimal(meta.get("ctVal"), decimal_to_str(default_swap_contract_value(inst_id))),
+            leverage=safe_decimal(automation.get("swapLeverage"), "1"),
+        )
+        trade_contracts = safe_decimal(available_margin_plan.get("contracts"), "0")
         if trade_contracts <= 0:
-            self._set_market(market_key, {"lastMessage": "永续张数为 0，已停止发单"})
+            self._set_market(
+                market_key,
+                {
+                    "lastMessage": (
+                        f"可用保证金仅 {format_decimal(available_margin, 2)} {margin_ccy}"
+                        "，永续张数被裁剪到 0，已停止发单"
+                    )
+                },
+            )
             return
 
         mode = automation["swapStrategyMode"]
