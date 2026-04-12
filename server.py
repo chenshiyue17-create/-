@@ -2712,6 +2712,24 @@ def summarize_execution_cancel_reason(reason: Any) -> str:
     return text
 
 
+def summarize_remote_runtime_error(error: Any) -> str:
+    text = str(error or "").strip()
+    lower = text.lower()
+    if not text:
+        return "远端执行节点暂时未回。"
+    if "timed out" in lower or "timeout" in lower or "read timed out" in lower:
+        return "远端执行节点暂时未回，已切到本地缓存视图。"
+    if "connection refused" in lower or "failed to establish a new connection" in lower:
+        return "远端执行节点未启动或端口未响应，已切到本地缓存视图。"
+    if "max retries exceeded" in lower or "connectionpool" in lower:
+        return "远端执行节点连接失败，已切到本地缓存视图。"
+    if "403" in lower or "鉴权" in lower or "forbidden" in lower:
+        return "远端执行节点鉴权失败，已切到本地缓存视图。"
+    if "404" in lower or "not found" in lower:
+        return "远端执行节点接口暂时不可用，已切到本地缓存视图。"
+    return "远端执行节点暂时未回，已切到本地缓存视图。"
+
+
 def order_execution_type(order: dict[str, Any]) -> str:
     return str(order.get("execType") or "").strip().upper()
 
@@ -12884,7 +12902,7 @@ class AppHandler(BaseHTTPRequestHandler):
                             fallback_state.get("executionJournal") or local_journal,
                         )
                         warnings = list((fallback_state.get("analysis") or {}).get("warnings") or [])
-                        warnings.append(f"远端状态暂时未回，已切到本地缓存视图: {exc}")
+                        warnings.append(summarize_remote_runtime_error(exc))
                         fallback_state.setdefault("analysis", {})["warnings"] = warnings[-6:]
                         json_response(
                             self,
@@ -12892,7 +12910,7 @@ class AppHandler(BaseHTTPRequestHandler):
                                 "ok": True,
                                 "state": fallback_state,
                                 "remoteStateLoaded": False,
-                                "remoteStateError": str(exc),
+                                "remoteStateError": summarize_remote_runtime_error(exc),
                             },
                         )
                 elif path == "/api/orders/recent":
