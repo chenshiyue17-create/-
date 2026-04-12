@@ -1,0 +1,16 @@
+[Unit]
+Description=Auto update OKX Remote Node from GitHub
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/opt/okx-local-app/.git
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/okx-local-app
+EnvironmentFile=-/etc/okx-remote-node.env
+Environment=OKX_REMOTE_APP_DIR=/opt/okx-local-app
+Environment=OKX_REMOTE_BRANCH=main
+Environment=OKX_REMOTE_GIT_REMOTE=origin
+Environment=OKX_REMOTE_SERVICE_NAME=okx-remote-node
+Environment=OKX_REMOTE_ENV_FILE=/etc/okx-remote-node.env
+ExecStart=/opt/okx-local-app/deploy/auto-update-remote-node.sh
