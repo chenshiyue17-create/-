@@ -25,6 +25,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
         let version: String?
     }
 
+    private struct RuntimeAppSource {
+        let sourceURL: URL
+        let runtimeURL: URL
+        let label: String
+        let didSync: Bool
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         if activateExistingInstanceIfNeeded() {
             NSApp.terminate(nil)
@@ -92,13 +99,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
     }
 
     private func ensureServerAndLoad() {
-        if let url = detectExistingServiceURL() {
+        let preparedRuntimeSource: RuntimeAppSource
+        do {
+            guard let resourceURL = Bundle.main.resourceURL else {
+                showPlaceholder(title: "Missing Resources", detail: "Cannot locate the app bundle resources.")
+                return
+            }
+            preparedRuntimeSource = try prepareRuntimeAppSource(
+                bundleAppDir: resourceURL.appendingPathComponent("app", isDirectory: true)
+            )
+        } catch {
+            showPlaceholder(title: "Runtime Sync Failed", detail: error.localizedDescription)
+            return
+        }
+
+        if preparedRuntimeSource.didSync {
+            _ = terminateManagedEmbeddedServices(runtimeSource: preparedRuntimeSource)
+        }
+
+        if let url = detectExistingServiceURL(), !preparedRuntimeSource.didSync {
             attachedToExistingServer = true
             load(url)
             return
         }
 
-        launchEmbeddedServer()
+        launchEmbeddedServer(runtimeSource: preparedRuntimeSource)
 
         DispatchQueue.global(qos: .userInitiated).async {
             for _ in 0..<80 {
@@ -118,13 +143,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
         }
     }
 
-    private func launchEmbeddedServer() {
-        guard let resourceURL = Bundle.main.resourceURL else {
-            showPlaceholder(title: "Missing Resources", detail: "Cannot locate the app bundle resources.")
-            return
-        }
-
-        let appResourceDir = resourceURL.appendingPathComponent("app", isDirectory: true)
+    private func launchEmbeddedServer(runtimeSource: RuntimeAppSource) {
+        let appResourceDir = runtimeSource.runtimeURL
         let serverPath = appResourceDir.appendingPathComponent("server.py").path
         let dataDir = applicationSupportDirectory().appendingPathComponent("data", isDirectory: true)
         let logURL = applicationSupportDirectory().appendingPathComponent("embedded-server.log", isDirectory: false)
@@ -169,7 +189,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
 
         do {
             if let outputHandle = serverOutputHandle,
-               let message = "[runtime] python=\(pythonRuntime.executable) version=\(pythonRuntime.version ?? "system")\n".data(using: .utf8) {
+               let message = "[runtime] python=\(pythonRuntime.executable) version=\(pythonRuntime.version ?? "system") source=\(runtimeSource.label)\n".data(using: .utf8) {
                 outputHandle.write(message)
             }
             try process.run()
@@ -177,6 +197,141 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
         } catch {
             showPlaceholder(title: "Server Launch Error", detail: error.localizedDescription)
         }
+    }
+
+    private func prepareRuntimeAppSource(bundleAppDir: URL) throws -> RuntimeAppSource {
+        let fileManager = FileManager.default
+        let runtimeDir = applicationSupportDirectory().appendingPathComponent("runtime-app", isDirectory: true)
+        let source = preferredWorkspaceAppSource() ?? bundleAppDir
+        let sourceStamp = try runtimeSourceStamp(for: source)
+        let stampURL = applicationSupportDirectory().appendingPathComponent("runtime-source.stamp", isDirectory: false)
+        let previousStamp = try? String(contentsOf: stampURL, encoding: .utf8)
+        let runtimeServerPath = runtimeDir.appendingPathComponent("server.py").path
+        let needsSync = previousStamp != sourceStamp || !fileManager.fileExists(atPath: runtimeServerPath)
+        try fileManager.createDirectory(at: runtimeDir, withIntermediateDirectories: true)
+        if needsSync {
+            try syncRuntimeApp(sourceURL: source, runtimeURL: runtimeDir)
+            try sourceStamp.write(to: stampURL, atomically: true, encoding: .utf8)
+        }
+        let label = source == bundleAppDir ? "bundle" : source.path
+        return RuntimeAppSource(sourceURL: source, runtimeURL: runtimeDir, label: label, didSync: needsSync)
+    }
+
+    private func preferredWorkspaceAppSource() -> URL? {
+        let fileManager = FileManager.default
+        let candidates = [
+            ProcessInfo.processInfo.environment["OKX_LOCAL_APP_SOURCE_DIR"],
+            fileManager.homeDirectoryForCurrentUser
+                .appendingPathComponent("Documents/New project/okx-local-app", isDirectory: true)
+                .path,
+        ].compactMap { $0 }
+
+        for path in candidates {
+            let url = URL(fileURLWithPath: path, isDirectory: true)
+            if isValidAppSource(url) {
+                return url
+            }
+        }
+        return nil
+    }
+
+    private func isValidAppSource(_ url: URL) -> Bool {
+        let fileManager = FileManager.default
+        let server = url.appendingPathComponent("server.py")
+        let staticDir = url.appendingPathComponent("static", isDirectory: true)
+        return fileManager.fileExists(atPath: server.path) && fileManager.fileExists(atPath: staticDir.path)
+    }
+
+    private func syncRuntimeApp(sourceURL: URL, runtimeURL: URL) throws {
+        let fileManager = FileManager.default
+        let serverSource = sourceURL.appendingPathComponent("server.py")
+        let serverRuntime = runtimeURL.appendingPathComponent("server.py")
+        let staticSource = sourceURL.appendingPathComponent("static", isDirectory: true)
+        let staticRuntime = runtimeURL.appendingPathComponent("static", isDirectory: true)
+        let vendorSource = sourceURL.appendingPathComponent("vendor", isDirectory: true)
+        let vendorRuntime = runtimeURL.appendingPathComponent("vendor", isDirectory: true)
+
+        try copyItemReplacing(source: serverSource, destination: serverRuntime)
+        if fileManager.fileExists(atPath: staticSource.path) {
+            try copyItemReplacing(source: staticSource, destination: staticRuntime)
+        }
+        if fileManager.fileExists(atPath: vendorSource.path) {
+            try copyItemReplacing(source: vendorSource, destination: vendorRuntime)
+        }
+    }
+
+    private func runtimeSourceStamp(for sourceURL: URL) throws -> String {
+        let fileManager = FileManager.default
+        let interestingRoots = [
+            sourceURL.appendingPathComponent("server.py"),
+            sourceURL.appendingPathComponent("static", isDirectory: true),
+            sourceURL.appendingPathComponent("vendor", isDirectory: true),
+        ]
+        var totalBytes: UInt64 = 0
+        var latestTimestamp: TimeInterval = 0
+        var fileCount = 0
+
+        for root in interestingRoots {
+            var isDirectory: ObjCBool = false
+            guard fileManager.fileExists(atPath: root.path, isDirectory: &isDirectory) else { continue }
+            if isDirectory.boolValue {
+                guard let enumerator = fileManager.enumerator(
+                    at: root,
+                    includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey, .isDirectoryKey],
+                    options: [.skipsHiddenFiles]
+                ) else { continue }
+                for case let url as URL in enumerator {
+                    let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .contentModificationDateKey, .fileSizeKey])
+                    if values?.isDirectory == true { continue }
+                    fileCount += 1
+                    totalBytes += UInt64(values?.fileSize ?? 0)
+                    latestTimestamp = max(latestTimestamp, values?.contentModificationDate?.timeIntervalSince1970 ?? 0)
+                }
+            } else {
+                let values = try? root.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
+                fileCount += 1
+                totalBytes += UInt64(values?.fileSize ?? 0)
+                latestTimestamp = max(latestTimestamp, values?.contentModificationDate?.timeIntervalSince1970 ?? 0)
+            }
+        }
+
+        return "\(sourceURL.path)|\(fileCount)|\(totalBytes)|\(Int(latestTimestamp))"
+    }
+
+    private func terminateManagedEmbeddedServices(runtimeSource: RuntimeAppSource) -> Bool {
+        let managedPatterns = [
+            Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/app/server.py").path,
+            runtimeSource.runtimeURL.appendingPathComponent("server.py").path,
+        ]
+        var terminatedAny = false
+        for pattern in managedPatterns {
+            guard !pattern.isEmpty else { continue }
+            let task = Process()
+            task.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
+            task.arguments = ["-f", pattern]
+            do {
+                try task.run()
+                task.waitUntilExit()
+                terminatedAny = terminatedAny || task.terminationStatus == 0
+            } catch {
+                continue
+            }
+        }
+        if terminatedAny {
+            Thread.sleep(forTimeInterval: 0.35)
+        }
+        return terminatedAny
+    }
+
+    private func copyItemReplacing(source: URL, destination: URL) throws {
+        let fileManager = FileManager.default
+        if fileManager.fileExists(atPath: destination.path) {
+            try fileManager.removeItem(at: destination)
+        }
+        if !fileManager.fileExists(atPath: source.path) {
+            return
+        }
+        try fileManager.copyItem(at: source, to: destination)
     }
 
     private func preferredPythonRuntime() -> PythonRuntime? {
@@ -341,7 +496,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
 
     private func load(_ url: URL) {
         window.title = "\(appName) - \(url.host ?? "127.0.0.1"):\(url.port ?? 0)"
-        webView.load(URLRequest(url: url))
+        var request = URLRequest(url: url)
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+        webView.load(request)
     }
 
     private func showPlaceholder(title: String, detail: String) {
