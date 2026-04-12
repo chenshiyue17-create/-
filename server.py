@@ -2877,6 +2877,90 @@ def build_execution_journal_insight(orders: list[dict[str, Any]], summary: dict[
     return ""
 
 
+def execution_journal_summary_payload(journal: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(journal, dict):
+        return {}
+    summary = journal.get("summary")
+    if isinstance(summary, dict):
+        return summary
+    return journal
+
+
+def execution_journal_has_paper_orders(journal: dict[str, Any] | None) -> bool:
+    if not isinstance(journal, dict):
+        return False
+    if "paper" in str(journal.get("lastSource") or "").lower():
+        return True
+    for raw in journal.get("orders") or []:
+        order = raw if isinstance(raw, dict) else {}
+        ord_id = str(order.get("ordId") or "")
+        tag = str(order.get("tag") or "")
+        if ord_id.startswith("paper-") or "paper" in tag.lower():
+            return True
+    return False
+
+
+def build_equity_display(
+    account_summary: dict[str, Any] | None = None,
+    automation_state: dict[str, Any] | None = None,
+    execution_journal: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    summary = copy.deepcopy(account_summary or {})
+    session_state = automation_state or {}
+    journal = execution_journal or {}
+    journal_summary = execution_journal_summary_payload(journal)
+
+    account_total_eq = safe_decimal(summary.get("displayTotalEq") or summary.get("totalEq"), "0")
+    current_eq = safe_decimal(session_state.get("currentEq"), "0")
+    session_start_eq = safe_decimal(session_state.get("sessionStartEq"), "0")
+    uses_session_equity = current_eq > 0
+    uses_paper_equity = execution_journal_has_paper_orders(journal)
+
+    display_total_eq = current_eq if uses_session_equity else account_total_eq
+    start_eq = session_start_eq if session_start_eq > 0 else (current_eq if uses_session_equity else Decimal("0"))
+    has_session_pnl = uses_session_equity and start_eq > 0
+    pnl_amount = (display_total_eq - start_eq) if has_session_pnl else Decimal("0")
+    pnl_pct = ((pnl_amount / start_eq) * Decimal("100")) if has_session_pnl and start_eq > 0 else Decimal("0")
+
+    realized_pnl = safe_decimal(journal_summary.get("realizedPnl"), "0")
+    total_fees = safe_decimal(journal_summary.get("totalFees"), "0")
+    net_pnl = safe_decimal(journal_summary.get("netPnl"), decimal_to_str(realized_pnl + total_fees))
+    total_orders = int(journal_summary.get("totalOrders") or 0)
+    net_result_ready = (
+        total_orders > 0
+        or realized_pnl != 0
+        or total_fees != 0
+        or net_pnl != 0
+    )
+
+    if uses_session_equity:
+        source_mode = "paper" if uses_paper_equity else "session"
+        source_label = "纸面权益" if uses_paper_equity else "会话权益"
+        balance_breakdown = f"{source_label} {format_decimal(display_total_eq, 2)} USDT · 余额与订单统一口径"
+    else:
+        source_mode = "account"
+        source_label = str(summary.get("displaySource") or "账户权益")
+        balance_breakdown = str(summary.get("displayBreakdown") or "")
+
+    return {
+        "sourceMode": source_mode,
+        "sourceLabel": source_label,
+        "usesSessionEquity": uses_session_equity,
+        "usesPaperEquity": uses_paper_equity,
+        "displayTotalEq": decimal_to_str(display_total_eq),
+        "sessionStartEq": decimal_to_str(start_eq),
+        "pnlAmount": decimal_to_str(pnl_amount),
+        "pnlPct": decimal_to_str(pnl_pct),
+        "hasSessionPnl": has_session_pnl,
+        "netResult": decimal_to_str(net_pnl),
+        "realizedPnl": decimal_to_str(realized_pnl),
+        "totalFees": decimal_to_str(total_fees),
+        "netResultReady": net_result_ready,
+        "balanceBreakdown": balance_breakdown,
+        "totalOrders": total_orders,
+    }
+
+
 def order_event_timestamp_ms(order: dict[str, Any]) -> int:
     for key in ("uTime", "fillTime", "cTime"):
         raw = order.get(key)
@@ -12780,6 +12864,11 @@ class AppHandler(BaseHTTPRequestHandler):
                             local_journal = get_execution_journal_snapshot(limit=80)
                             if (local_journal.get("orders") or local_journal.get("summary")):
                                 payload["state"]["executionJournal"] = local_journal
+                            payload["state"]["equityDisplay"] = build_equity_display(
+                                None,
+                                payload.get("state") or {},
+                                payload["state"].get("executionJournal") or local_journal,
+                            )
                         json_response(self, payload, status=response.status_code)
                     except Exception as exc:
                         fallback_state = sanitize_only_dip_swing_runtime_state(
@@ -12789,6 +12878,11 @@ class AppHandler(BaseHTTPRequestHandler):
                         local_journal = get_execution_journal_snapshot(limit=80)
                         if (local_journal.get("orders") or local_journal.get("summary")):
                             fallback_state["executionJournal"] = local_journal
+                        fallback_state["equityDisplay"] = build_equity_display(
+                            None,
+                            fallback_state,
+                            fallback_state.get("executionJournal") or local_journal,
+                        )
                         warnings = list((fallback_state.get("analysis") or {}).get("warnings") or [])
                         warnings.append(f"远端状态暂时未回，已切到本地缓存视图: {exc}")
                         fallback_state.setdefault("analysis", {})["warnings"] = warnings[-6:]
@@ -12818,6 +12912,33 @@ class AppHandler(BaseHTTPRequestHandler):
                         payload["symbols"] = journal.get("symbols") or payload.get("symbols") or []
                         payload["lastSource"] = journal.get("lastSource") or payload.get("lastSource") or payload.get("source") or "remote_proxy"
                         payload["lastReconciledAt"] = journal.get("lastReconciledAt") or payload.get("lastReconciledAt") or now_local_iso()
+                    json_response(self, payload, status=response.status_code)
+                elif path == "/api/account/overview":
+                    response = remote_gateway_request(config, "GET", self.path)
+                    payload = response.json() if response.content else {}
+                    remote_runtime_state: dict[str, Any] = {}
+                    try:
+                        runtime_response = remote_gateway_request(
+                            config,
+                            "GET",
+                            "/api/automation/state",
+                            timeout=REMOTE_AUTOMATION_STATE_TIMEOUT,
+                        )
+                        runtime_payload = runtime_response.json() if runtime_response.content else {}
+                        remote_automation = load_remote_automation_config_for_proxy(config)
+                        if isinstance(runtime_payload.get("state"), dict):
+                            remote_runtime_state = enrich_remote_dip_swing_runtime_state(
+                                runtime_payload.get("state") or {},
+                                remote_automation,
+                                CONFIG.current(),
+                            )
+                    except Exception:
+                        remote_runtime_state = {}
+                    payload["equityDisplay"] = build_equity_display(
+                        payload.get("summary") or {},
+                        remote_runtime_state,
+                        get_execution_journal_snapshot(limit=DEFAULT_RECENT_ORDER_LIMIT),
+                    )
                     json_response(self, payload, status=response.status_code)
                 else:
                     response = remote_gateway_request(config, "GET", self.path)
@@ -12940,6 +13061,11 @@ class AppHandler(BaseHTTPRequestHandler):
         if path == "/api/automation/state":
             state = sanitize_only_dip_swing_runtime_state(AUTOMATION_ENGINE.snapshot(), AUTOMATION_CONFIG.current())
             state["executionJournal"] = get_execution_journal_snapshot(limit=DEFAULT_RECENT_ORDER_LIMIT)
+            state["equityDisplay"] = build_equity_display(
+                None,
+                state,
+                state.get("executionJournal") or {},
+            )
             json_response(self, {"ok": True, "state": state})
             return
 
@@ -13039,6 +13165,11 @@ class AppHandler(BaseHTTPRequestHandler):
                         "balanceCount": snapshot.get("balanceCount", 0),
                         "positionCount": snapshot.get("positionCount", 0),
                         "fundingWarning": snapshot.get("fundingWarning", ""),
+                        "equityDisplay": build_equity_display(
+                            snapshot.get("summary") or {},
+                            AUTOMATION_STATE.current(),
+                            get_execution_journal_snapshot(limit=DEFAULT_RECENT_ORDER_LIMIT),
+                        ),
                         "route": route,
                     },
                 )

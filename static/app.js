@@ -2068,6 +2068,19 @@ function renderDeskOverview() {
   const minerNetwork = miner.network || {};
   const minerProgress = miner.progress || {};
   const minerFees = minerNetwork.fees || {};
+  const serverEquityDisplay = automation.equityDisplay || account.equityDisplay || {};
+  const serverDisplayTotalEq = Number(serverEquityDisplay.displayTotalEq || 0);
+  const serverStartEq = Number(serverEquityDisplay.sessionStartEq || 0);
+  const serverPnlAmount = Number(serverEquityDisplay.pnlAmount || 0);
+  const serverPnlPct = Number(serverEquityDisplay.pnlPct || 0);
+  const serverNetResult = Number(serverEquityDisplay.netResult || 0);
+  const serverRealizedNet = Number(serverEquityDisplay.realizedPnl || 0);
+  const serverFeeNet = Number(serverEquityDisplay.totalFees || 0);
+  const serverNetReady = Boolean(serverEquityDisplay.netResultReady);
+  const serverUsesSessionEquity = Boolean(serverEquityDisplay.usesSessionEquity);
+  const serverUsesPaperEquity = Boolean(serverEquityDisplay.usesPaperEquity);
+  const serverBalanceBreakdown = serverEquityDisplay.balanceBreakdown || "";
+  const serverHasEquityDisplay = serverDisplayTotalEq > 0 || serverUsesSessionEquity || serverNetReady;
   // Keep account balance and strategy session equity on separate tracks.
   const totalEq = Number(summary.displayTotalEq || summary.totalEq || 0);
   const currentEq = Number(automation.currentEq || 0);
@@ -2126,19 +2139,27 @@ function renderDeskOverview() {
       Math.abs(analysisNetResult) > 1e-9
       || Number(analysis.executionAbilityCloseOrders || analysis.closeOrders || 0) > 0
     );
-  const effectiveNetResult = netResultReady ? netResult : (analysisNetReady ? analysisNetResult : NaN);
-  const hasSessionPnl = startEq > 0 && Number.isFinite(pnlPct) && Number.isFinite(pnlAmount);
+  const effectiveNetResult = serverNetReady
+    ? serverNetResult
+    : (netResultReady ? netResult : (analysisNetReady ? analysisNetResult : NaN));
+  const hasSessionPnl = serverHasEquityDisplay
+    ? Boolean(serverEquityDisplay.hasSessionPnl)
+    : (startEq > 0 && Number.isFinite(pnlPct) && Number.isFinite(pnlAmount));
   const cache = dashboardState.equityDisplayCache || {};
   const displayPnlPct = hasSessionPnl
-    ? pnlPct
+    ? (serverHasEquityDisplay ? serverPnlPct : pnlPct)
     : (Number.isFinite(cache.pnlPct) ? cache.pnlPct : null);
   const displayPnlAmount = hasSessionPnl
-    ? pnlAmount
+    ? (serverHasEquityDisplay ? serverPnlAmount : pnlAmount)
     : (Number.isFinite(cache.pnlAmount) ? cache.pnlAmount : null);
-  const preferredTotalEq = sessionEquityMode
+  const preferredTotalEq = serverHasEquityDisplay && serverDisplayTotalEq > 0
+    ? serverDisplayTotalEq
+    : sessionEquityMode
     ? currentEq
     : (paperEquityMode && currentEq > 0 ? currentEq : totalEq);
-  const balanceGoalBase = sessionEquityMode
+  const balanceGoalBase = serverHasEquityDisplay && serverStartEq > 0
+    ? serverStartEq
+    : sessionEquityMode
     ? (startEq > 0 ? startEq : currentEq)
     : (startEq > 0 ? startEq : preferredTotalEq);
   const balanceTargetEq = stateTargetEq > 0 ? stateTargetEq : (balanceGoalBase > 0 ? balanceGoalBase * 10 : 0);
@@ -2151,30 +2172,42 @@ function renderDeskOverview() {
   const displayNetResult = Number.isFinite(effectiveNetResult)
     ? effectiveNetResult
     : (Number.isFinite(cache.netResult) ? cache.netResult : null);
-  const displayRealizedNet = netResultReady
+  const displayRealizedNet = serverNetReady
+    ? serverRealizedNet
+    : netResultReady
     ? realizedNet
     : (Number.isFinite(cache.realizedNet) ? cache.realizedNet : 0);
-  const displayFeeNet = netResultReady
+  const displayFeeNet = serverNetReady
+    ? serverFeeNet
+    : netResultReady
     ? feeNet
     : (Number.isFinite(cache.feeNet) ? cache.feeNet : 0);
   if (hasSessionPnl || Number.isFinite(effectiveNetResult) || preferredTotalEq > 0) {
     dashboardState.equityDisplayCache = {
-      pnlPct: hasSessionPnl ? pnlPct : cache.pnlPct,
-      pnlAmount: hasSessionPnl ? pnlAmount : cache.pnlAmount,
+      pnlPct: hasSessionPnl ? (serverHasEquityDisplay ? serverPnlPct : pnlPct) : cache.pnlPct,
+      pnlAmount: hasSessionPnl ? (serverHasEquityDisplay ? serverPnlAmount : pnlAmount) : cache.pnlAmount,
       totalEq: preferredTotalEq > 0 ? preferredTotalEq : cache.totalEq,
       netResult: Number.isFinite(effectiveNetResult) ? effectiveNetResult : cache.netResult,
-      realizedNet: netResultReady ? realizedNet : cache.realizedNet,
-      feeNet: netResultReady ? feeNet : cache.feeNet,
+      realizedNet: serverNetReady ? serverRealizedNet : (netResultReady ? realizedNet : cache.realizedNet),
+      feeNet: serverNetReady ? serverFeeNet : (netResultReady ? feeNet : cache.feeNet),
     };
   }
 
+  const displayUsesSessionEquity = serverHasEquityDisplay ? serverUsesSessionEquity : sessionEquityMode;
+  const displayUsesPaperEquity = serverHasEquityDisplay ? serverUsesPaperEquity : paperEquityMode;
+  const displayBalanceBreakdown = serverHasEquityDisplay && serverBalanceBreakdown
+    ? serverBalanceBreakdown
+    : balanceBreakdown;
+
   $("desk-total-equity").textContent = displayTotalEq > 0 ? `${formatMoney(displayTotalEq)} USDT` : "--";
   $("desk-total-equity-sub").textContent =
-    sessionEquityMode
-      ? `会话权益 ${formatMoney(displayTotalEq || 0)} USDT · 余额与订单统一口径`
-      : paperEquityMode
+    displayUsesSessionEquity
+      ? (displayUsesPaperEquity
+        ? `纸面权益 ${formatMoney(displayTotalEq || 0)} USDT · 余额与订单统一口径`
+        : `会话权益 ${formatMoney(displayTotalEq || 0)} USDT · 余额与订单统一口径`)
+      : displayUsesPaperEquity
       ? `纸面权益 ${formatMoney(displayTotalEq || 0)} USDT · 订单与余额统一口径`
-      : (balanceBreakdown || (summary.adjEq ? `调整后权益 ${formatMoney(summary.adjEq)} USDT` : "等待账户快照"));
+      : (displayBalanceBreakdown || (summary.adjEq ? `调整后权益 ${formatMoney(summary.adjEq)} USDT` : "等待账户快照"));
 
   $("desk-session-pnl").textContent =
     Number.isFinite(displayPnlPct) ? `${formatPercentValue(displayPnlPct)}` : "--";
@@ -2215,7 +2248,7 @@ function renderDeskOverview() {
   if (dockPnlSub) {
     dockPnlSub.textContent = Number.isFinite(displayPnlPct)
       ? `${Number.isFinite(displayNetResult) ? `净结果 ${displayNetResult >= 0 ? "+" : ""}${formatMoney(displayNetResult)} USDT · ` : ""}总权益 ${formatMoney(displayTotalEq)} USDT`
-      : (balanceBreakdown || (displayTotalEq > 0 ? `总权益 ${formatMoney(displayTotalEq)} USDT` : "等待会话收益"));
+      : (displayBalanceBreakdown || (displayTotalEq > 0 ? `总权益 ${formatMoney(displayTotalEq)} USDT` : "等待会话收益"));
     if (!Number.isFinite(displayPnlPct) && analysisNetReady && displayTotalEq > 0) {
       dockPnlSub.textContent = `净结果 ${analysisNetResult >= 0 ? "+" : ""}${formatMoney(analysisNetResult)} USDT · 总权益 ${formatMoney(displayTotalEq)} USDT`;
     }
@@ -2275,11 +2308,11 @@ function renderDeskOverview() {
     railBalanceMain.textContent = formatMoney(displayTotalEq || 0);
   }
   if (railBalanceSub) {
-    railBalanceSub.textContent = sessionEquityMode
-      ? `会话账本 · ${formatMoney(displayTotalEq || 0)} USDT`
-      : paperEquityMode
+    railBalanceSub.textContent = displayUsesSessionEquity
+      ? `${displayUsesPaperEquity ? "纸面账本" : "会话账本"} · ${formatMoney(displayTotalEq || 0)} USDT`
+      : displayUsesPaperEquity
       ? `纸面账本 · ${formatMoney(displayTotalEq || 0)} USDT`
-      : (balanceBreakdown || (displayTotalEq > 0
+      : (displayBalanceBreakdown || (displayTotalEq > 0
         ? `USDT · 调整后 ${formatMoney(Number(summary.adjEq || displayTotalEq))}`
         : "USDT"));
   }
