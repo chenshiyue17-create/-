@@ -3999,6 +3999,46 @@ class OkxClient:
             current_side = str(current.get("positionSide") or "flat")
             current_size = safe_decimal(current.get("positionSize"), "0")
             current_entry = safe_decimal(current.get("entryPrice"), "0")
+            reverse_entry_blocked = (
+                not reduce_only
+                and current_size > 0
+                and (
+                    (current_side == "long" and side == "sell")
+                    or (current_side == "short" and side == "buy")
+                )
+            )
+            if reverse_entry_blocked:
+                blocked_order = {
+                    "ordId": ord_id,
+                    "clOrdId": cl_ord_id,
+                    "instId": inst_id,
+                    "instType": "SWAP",
+                    "tdMode": str(payload.get("tdMode") or "cross"),
+                    "side": side,
+                    "ordType": str(payload.get("ordType") or "market"),
+                    "state": "canceled",
+                    "sz": decimal_to_str(safe_decimal(payload.get("sz"), "0")),
+                    "fillSz": "0",
+                    "accFillSz": "0",
+                    "avgPx": "",
+                    "fillPx": "",
+                    "px": str(payload.get("px") or ""),
+                    "fee": "0",
+                    "fillFee": "0",
+                    "pnl": "0",
+                    "fillPnl": "0",
+                    "realizedPnl": "0",
+                    "reduceOnly": reduce_only,
+                    "posSide": "net",
+                    "tradeSubType": "",
+                    "uTime": now_ms,
+                    "cTime": now_ms,
+                    "tag": "paper-sim",
+                    "cancelSourceReason": "paper-sim reverse entry blocked before prior leg reached net +1U",
+                    "sMsg": "paper-sim reverse entry blocked before prior leg reached net +1U",
+                }
+                PRIVATE_ORDER_STREAM._ingest_orders([blocked_order])
+                return {"code": "0", "data": [blocked_order], "_paperSim": True}
             meta = (self.get_public_instruments("SWAP", inst_id).get("data") or [{}])[0]
             ct_val = safe_decimal(meta.get("ctVal"), decimal_to_str(default_swap_contract_value(inst_id)))
             order_fee = -(filled_size * ct_val * fill_px * PAPER_SWAP_FEE_RATE)
@@ -4444,7 +4484,7 @@ class OkxClient:
             self._extract_data_or_raise(result)
             return result
         except Exception:
-            if self._paper_enabled():
+            if self._paper_fallback_allowed():
                 return self._paper_place_order(payload)
             raise
 
@@ -4457,7 +4497,7 @@ class OkxClient:
             self._extract_data_or_raise(result)
             return result
         except Exception:
-            if self._paper_enabled():
+            if self._paper_fallback_allowed():
                 rows: list[dict[str, Any]] = []
                 for payload in cleaned:
                     result = self._paper_place_order(payload)
