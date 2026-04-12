@@ -1447,12 +1447,14 @@ function computeCurveRenderWidth(sampleCount, shell, baseWidth, stepWidth, paddi
 function applyCurveViewport(svg, renderWidth, renderHeight) {
   if (!svg) return;
   svg.setAttribute("viewBox", `0 0 ${renderWidth} ${renderHeight}`);
-  svg.style.width = `${renderWidth}px`;
+  svg.style.width = "100%";
+  svg.style.maxWidth = "100%";
+  svg.style.height = "100%";
   const shell = svg.parentElement;
   if (!shell) return;
   bindCurveAutoFollow(shell);
   requestAnimationFrame(() => {
-    if (shell.dataset.autoFollow !== "0") {
+    if (shell.scrollWidth > shell.clientWidth && shell.dataset.autoFollow !== "0") {
       shell.scrollLeft = Math.max(shell.scrollWidth - shell.clientWidth, 0);
     }
   });
@@ -1927,6 +1929,19 @@ function renderAnalysisState(analysis, runtimeState = {}) {
     if (data.executionAbilityNetPnl) dockSummaryBits.push(`近场净收益 ${formatSignedMoney(data.executionAbilityNetPnl)}U`);
     if (data.blockers?.length) dockSummaryBits.push(`阻断 ${data.blockers[0]}`);
     else if (data.warnings?.length) dockSummaryBits.push(`提醒 ${data.warnings[0]}`);
+    const journal = dashboardState.orderJournal || {};
+    const recentOrders = dashboardState.recentOrdersAll || [];
+    const filledCount = Number(journal.filledOrders ?? recentOrders.filter((item) => String(item?.state || "") === "filled").length);
+    const latestFilled = recentOrders.find((item) => String(item?.state || "") === "filled");
+    if (filledCount > 0) {
+      const latestLabel = latestFilled?.instId
+        ? `最近成交 ${latestFilled.instId}${latestFilled.uTime || latestFilled.cTime ? ` · ${formatOrderTime(latestFilled.uTime || latestFilled.cTime)}` : ""}`
+        : "最近订单已成交";
+      dockSummaryBits.push(`订单 ${filledCount} 笔`);
+      dockSummaryBits.push(latestLabel);
+    } else {
+      dockSummaryBits.push("最近暂无成交订单");
+    }
     dockSub.textContent = dockSummaryBits.join(" · ") || "顶部固定显示当前策略、联网判断和执行环境。";
   }
 }

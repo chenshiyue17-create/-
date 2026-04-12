@@ -330,6 +330,7 @@ body {
   backdrop-filter: blur(18px);
   box-shadow: 0 18px 44px rgba(0, 0, 0, 0.28);
   min-width: 0;
+  overflow: hidden;
 }
 
 .dock-curve-card,
@@ -342,6 +343,8 @@ body {
   border: 1px solid rgba(255, 255, 255, 0.07);
   background: rgba(255, 255, 255, 0.03);
   min-width: 0;
+  overflow: hidden;
+  isolation: isolate;
 }
 
 .dock-curve-card {
@@ -380,6 +383,8 @@ body {
   height: 150px;
   border: 1px solid rgba(255, 255, 255, 0.05);
   background: linear-gradient(180deg, rgba(255,255,255,0.025), rgba(255,255,255,0.01));
+  overflow: hidden;
+  position: relative;
 }
 
 .dock-equity-hero {
@@ -439,6 +444,7 @@ body {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 8px;
+  min-width: 0;
 }
 
 .dock-market-board .board-card {
@@ -467,6 +473,7 @@ body {
   line-height: 1.05;
   font-variant-numeric: tabular-nums;
   overflow-wrap: anywhere;
+  min-width: 0;
 }
 
 .dock-market-board .board-card small {
@@ -491,8 +498,9 @@ body {
   line-height: 1.45;
   display: -webkit-box;
   overflow: hidden;
-  -webkit-line-clamp: 3;
+  -webkit-line-clamp: 5;
   -webkit-box-orient: vertical;
+  word-break: break-word;
 }
 
 .mode-strip {
