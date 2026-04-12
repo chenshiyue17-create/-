@@ -216,6 +216,7 @@ const dashboardState = {
   accountSummaryLoadedOnce: false,
   ordersLoadedOnce: false,
   equityDisplayCache: null,
+  equityCurveCache: [],
 };
 
 function formatSignedMoney(value) {
@@ -2295,8 +2296,11 @@ function renderDeskOverview() {
     railMinerSub.textContent = "USDT / 天";
   }
 
+  const displayCurve = Array.isArray(automation.equityCurve) && automation.equityCurve.length
+    ? automation.equityCurve
+    : (dashboardState.equityCurveCache || []);
   renderStrategyPortfolio();
-  renderEquityCurve(automation.equityCurve || []);
+  renderEquityCurve(displayCurve);
   renderDeskGuards();
 }
 
@@ -5548,6 +5552,9 @@ function renderAutomationState(state) {
     sanitizedState.statusText = "运行中";
   }
   dashboardState.automation = sanitizedState;
+  if (Array.isArray(sanitizedState.equityCurve) && sanitizedState.equityCurve.length) {
+    dashboardState.equityCurveCache = sanitizedState.equityCurve.slice();
+  }
   if (mergedState?.executionJournal) {
     dashboardState.orderJournal = mergedState.executionJournal;
     dashboardState.orderJournalSymbols = Array.isArray(mergedState.executionJournal.symbols) ? mergedState.executionJournal.symbols : [];

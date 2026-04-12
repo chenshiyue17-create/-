@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>10U战神</title>
-    <link rel="stylesheet" href="/styles.css?v=20260409-portfolio" />
+    <link rel="stylesheet" href="/styles.css?v=20260412-dock-fix" />
   </head>
   <body data-view="focus">
     <canvas id="tunnel-bg" aria-hidden="true"></canvas>
@@ -116,46 +116,48 @@
               </div>
             </div>
           </div>
-          <div class="dock-market-card">
-            <div class="dock-head">
-              <div>
-                <div class="eyebrow">Hot Coins</div>
-                <strong id="dock-market-title">主流币实时价格</strong>
-              </div>
-              <span class="pill" id="dock-market-meta">滚动时保持可见</span>
+          <div class="dock-side-column">
+            <div class="dock-status-card">
+              <div class="eyebrow">Live Decision</div>
+              <strong id="dock-status-main">等待联网预检</strong>
+              <small id="dock-status-sub">顶部固定显示当前策略、联网判断和执行环境。</small>
             </div>
-            <div class="dock-market-board" id="dock-mainstream-board">
-              <div class="board-card">
-                <span>BTC</span>
-                <strong>--</strong>
-                <small>等待价格</small>
+            <div class="dock-market-card">
+              <div class="dock-head">
+                <div>
+                  <div class="eyebrow">Hot Coins</div>
+                  <strong id="dock-market-title">主流币实时价格</strong>
+                </div>
+                <span class="pill" id="dock-market-meta">滚动时保持可见</span>
               </div>
-              <div class="board-card">
-                <span>ETH</span>
-                <strong>--</strong>
-                <small>等待价格</small>
-              </div>
-              <div class="board-card">
-                <span>SOL</span>
-                <strong>--</strong>
-                <small>等待价格</small>
-              </div>
-              <div class="board-card">
-                <span>DOGE</span>
-                <strong>--</strong>
-                <small>等待价格</small>
-              </div>
-              <div class="board-card">
-                <span>XRP</span>
-                <strong>--</strong>
-                <small>等待价格</small>
+              <div class="dock-market-board" id="dock-mainstream-board">
+                <div class="board-card">
+                  <span>BTC</span>
+                  <strong>--</strong>
+                  <small>等待价格</small>
+                </div>
+                <div class="board-card">
+                  <span>ETH</span>
+                  <strong>--</strong>
+                  <small>等待价格</small>
+                </div>
+                <div class="board-card">
+                  <span>SOL</span>
+                  <strong>--</strong>
+                  <small>等待价格</small>
+                </div>
+                <div class="board-card">
+                  <span>DOGE</span>
+                  <strong>--</strong>
+                  <small>等待价格</small>
+                </div>
+                <div class="board-card">
+                  <span>XRP</span>
+                  <strong>--</strong>
+                  <small>等待价格</small>
+                </div>
               </div>
             </div>
-          </div>
-          <div class="dock-status-card">
-            <div class="eyebrow">Live Decision</div>
-            <strong id="dock-status-main">等待联网预检</strong>
-            <small id="dock-status-sub">顶部固定显示当前策略、联网判断和执行环境。</small>
           </div>
         </section>
 
@@ -1107,6 +1109,6 @@
       </main>
     </div>
 
-    <script src="/app.js?v=20260409-portfolio"></script>
+    <script src="/app.js?v=20260412-dock-fix"></script>
   </body>
 </html>

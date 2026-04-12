@@ -317,10 +317,7 @@ body {
   position: relative;
   z-index: 40;
   display: grid;
-  grid-template-columns: minmax(0, 1.75fr) minmax(320px, 0.95fr);
-  grid-template-areas:
-    "curve status"
-    "curve market";
+  grid-template-columns: minmax(0, 1fr) minmax(360px, 420px);
   gap: 10px;
   padding: 10px 12px;
   border: 1px solid rgba(255, 255, 255, 0.08);
@@ -335,28 +332,31 @@ body {
 
 .dock-curve-card,
 .dock-market-card,
-.dock-status-card {
+.dock-status-card,
+.dock-side-column {
   display: grid;
   gap: 6px;
   min-height: 0;
-  padding: 10px 12px;
-  border: 1px solid rgba(255, 255, 255, 0.07);
-  background: rgba(255, 255, 255, 0.03);
   min-width: 0;
   overflow: hidden;
   isolation: isolate;
 }
 
 .dock-curve-card {
-  grid-area: curve;
+  padding: 10px 12px;
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  background: rgba(255, 255, 255, 0.03);
 }
 
-.dock-market-card {
-  grid-area: market;
+.dock-side-column {
+  align-content: start;
 }
 
+.dock-market-card,
 .dock-status-card {
-  grid-area: status;
+  padding: 10px 12px;
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  background: rgba(255, 255, 255, 0.03);
 }
 
 .dock-head {
@@ -385,6 +385,14 @@ body {
   background: linear-gradient(180deg, rgba(255,255,255,0.025), rgba(255,255,255,0.01));
   overflow: hidden;
   position: relative;
+}
+
+.dock-side-column .dock-status-card {
+  min-height: 112px;
+}
+
+.dock-side-column .dock-market-card {
+  min-height: 238px;
 }
 
 .dock-equity-hero {
@@ -2566,10 +2574,6 @@ body[data-view="focus"] #automation .focus-inline-note {
 @media (max-width: 1320px) {
   .floating-dock {
     grid-template-columns: 1fr;
-    grid-template-areas:
-      "curve"
-      "status"
-      "market";
   }
 
   .cockpit-metrics {
