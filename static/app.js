@@ -6169,16 +6169,22 @@ async function boot() {
     $("health-text").textContent = "服务不可用";
   }
 
-  try {
-    await loadSavedConfig();
-    await loadAutomationConfig();
-    await loadMinerConfig();
-    await refreshDeskState();
-  } catch (err) {
-    setMessage(err.message, "err");
-    setAutomationMessage(err.message, "err");
-    setMinerMessage(err.message, "err");
-  }
+  const bootErrors = [];
+  const rememberBootError = (err) => {
+    if (!err?.message) return;
+    if (!bootErrors.includes(err.message)) bootErrors.push(err.message);
+  };
+
+  const configResults = await Promise.allSettled([
+    loadSavedConfig(),
+    loadAutomationConfig(),
+    loadMinerConfig(),
+  ]);
+  configResults.forEach((result) => {
+    if (result.status === "rejected") {
+      rememberBootError(result.reason);
+    }
+  });
 
   $("envPreset").addEventListener("change", () => {
     applyEnvironmentPreset($("envPreset").value);
@@ -6633,10 +6639,24 @@ async function boot() {
   renderRailStrategyControls();
   renderMainstreamBoard();
   renderMarketChart();
-  await Promise.all([
-    refreshDeskState().catch(() => {}),
-    refreshMarket().catch(() => {}),
+  const initialRefreshResults = await Promise.allSettled([
+    refreshDeskState(),
+    refreshAutomationState(),
+    refreshOrders(),
+    refreshMarket(),
+    refreshMinerOverview(),
   ]);
+  initialRefreshResults.forEach((result) => {
+    if (result.status === "rejected") {
+      rememberBootError(result.reason);
+    }
+  });
+  if (bootErrors.length) {
+    const summary = bootErrors[0];
+    setMessage(summary, "err");
+    setAutomationMessage(summary, "err");
+    setMinerMessage(summary, "err");
+  }
   scheduleAutoAnalysis({ immediate: true, force: true });
   await startLiveFeeds().catch((err) => {
     setLiveFeedStatus("err", "实时行情启动失败", err.message);
