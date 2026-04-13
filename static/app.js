@@ -161,6 +161,8 @@ const requestFlightMap = new Map();
 const AUTO_ANALYSIS_INTERVAL_MS = 45000;
 const AUTO_ANALYSIS_DEBOUNCE_MS = 1200;
 const LOCAL_REQUEST_TIMEOUT_MS = 12000;
+const BOOT_CACHE_KEY = "okx-desk-boot-cache-v3";
+const BOOT_CACHE_MAX_AGE_MS = 12 * 60 * 60 * 1000;
 
 const MAINSTREAM_MARKETS = [
   "BTC-USDT",
@@ -212,6 +214,113 @@ const dashboardState = {
   equityDisplayCache: null,
   equityCurveCache: [],
 };
+
+let lastBootCacheSerialized = "";
+
+function buildOrderFeedFromExecutionJournal(executionJournal = {}) {
+  const journal = executionJournal && typeof executionJournal === "object" ? executionJournal : {};
+  return {
+    orders: Array.isArray(journal.orders) ? journal.orders : [],
+    journal: journal.summary || {},
+    symbols: Array.isArray(journal.symbols) ? journal.symbols : [],
+    lastReconciledAt: journal.lastReconciledAt || "",
+    lastSource: journal.lastSource || "",
+    source: "focus_snapshot",
+    stream: dashboardState.orderFeedMeta?.stream || null,
+  };
+}
+
+function buildBootCachePayload() {
+  const automation = dashboardState.automation
+    ? {
+        ...dashboardState.automation,
+        logs: [],
+      }
+    : null;
+  const account = dashboardState.account
+    ? {
+        summary: dashboardState.account.summary || {},
+        fundingSummary: dashboardState.account.fundingSummary || {},
+        balanceCount: dashboardState.account.balanceCount || 0,
+        positionCount: dashboardState.account.positionCount || 0,
+        equityDisplay: dashboardState.account.equityDisplay || null,
+      }
+    : null;
+  const orders = dashboardState.orderJournal
+    ? {
+        orders: Array.isArray(dashboardState.recentOrdersAll) ? dashboardState.recentOrdersAll.slice(0, 80) : [],
+        journal: dashboardState.orderJournal.summary || dashboardState.orderJournal || {},
+        symbols: Array.isArray(dashboardState.orderJournalSymbols) ? dashboardState.orderJournalSymbols : [],
+        lastReconciledAt: dashboardState.orderJournal.lastReconciledAt || "",
+        lastSource: dashboardState.orderJournal.lastSource || "",
+        source: dashboardState.orderFeedMeta?.source || "boot_cache",
+        stream: dashboardState.orderFeedMeta?.stream || null,
+      }
+    : null;
+  if (!automation && !account && !orders) return null;
+  return {
+    cachedAtMs: Date.now(),
+    automation,
+    account,
+    orders,
+  };
+}
+
+function persistDashboardBootCache() {
+  try {
+    const payload = buildBootCachePayload();
+    if (!payload) return;
+    const serialized = JSON.stringify(payload);
+    if (serialized === lastBootCacheSerialized) return;
+    window.localStorage.setItem(BOOT_CACHE_KEY, serialized);
+    lastBootCacheSerialized = serialized;
+  } catch (_) {}
+}
+
+function restoreDashboardBootCache() {
+  try {
+    const raw = window.localStorage.getItem(BOOT_CACHE_KEY);
+    if (!raw) return false;
+    const payload = JSON.parse(raw);
+    const cachedAtMs = Number(payload?.cachedAtMs || 0);
+    if (!cachedAtMs || Date.now() - cachedAtMs > BOOT_CACHE_MAX_AGE_MS) {
+      window.localStorage.removeItem(BOOT_CACHE_KEY);
+      return false;
+    }
+    if (payload.account) {
+      applyAccountSummary(payload.account);
+    }
+    if (payload.automation) {
+      renderAutomationState(payload.automation);
+    }
+    if (payload.orders?.orders?.length) {
+      applyRecentOrders(payload.orders);
+    }
+    lastBootCacheSerialized = raw;
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function restoreServerBootstrap() {
+  try {
+    const payload = window.__OKX_BOOTSTRAP__;
+    if (!payload || typeof payload !== "object") return false;
+    if (payload.account) {
+      applyAccountSummary(payload.account);
+    }
+    if (payload.automationState) {
+      renderAutomationState(payload.automationState);
+    }
+    if (payload.executionJournal?.orders?.length) {
+      applyRecentOrders(buildOrderFeedFromExecutionJournal(payload.executionJournal));
+    }
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
 
 function formatSignedMoney(value) {
   const num = Number(value);
@@ -2270,6 +2379,7 @@ function renderDeskOverview() {
   renderStrategyPortfolio();
   renderEquityCurve(displayCurve);
   renderDeskGuards();
+  persistDashboardBootCache();
 }
 
 function renderMinerSources(sources) {
@@ -5998,6 +6108,9 @@ async function refreshDeskState() {
     const data = await request("/api/focus-snapshot", { timeoutMs: 30000 });
     if (data.account) applyAccountSummary(data.account);
     if (data.automationState) renderAutomationState(data.automationState);
+    if (data.executionJournal?.orders?.length) {
+      applyRecentOrders(buildOrderFeedFromExecutionJournal(data.executionJournal));
+    }
     return data;
   });
 }
@@ -6109,22 +6222,27 @@ async function boot() {
   setWorkspaceView(initialView, { persist: false, scroll: false });
   setupTunnelBackground();
   setPendingEnvironmentUi();
+  restoreServerBootstrap();
+  restoreDashboardBootCache();
 
-  try {
-    const health = await request("/api/health");
-    const route = health?.okxRoute || {};
-    applyRouteHealth(route);
-    if (route?.detail) {
-      const remote = route?.executionMode === "remote" || isRemoteExecutionMode();
-      $("health-text").textContent = route.healthy
-        ? (remote ? `远端执行节点已连接 · ${route.summary || route.detail}` : `本地服务已启动 · ${route.summary || route.detail}`)
-        : (remote ? `远端执行节点 · ${route.summary || route.detail}` : (route.summary || route.detail));
-    } else {
-      $("health-text").textContent = isRemoteExecutionMode() ? "远端执行节点已配置" : "本地服务已启动";
+  const healthPromise = (async () => {
+    try {
+      const health = await request("/api/health");
+      const route = health?.okxRoute || {};
+      applyRouteHealth(route);
+      if (route?.detail) {
+        const remote = route?.executionMode === "remote" || isRemoteExecutionMode();
+        $("health-text").textContent = route.healthy
+          ? (remote ? `远端执行节点已连接 · ${route.summary || route.detail}` : `本地服务已启动 · ${route.summary || route.detail}`)
+          : (remote ? `远端执行节点 · ${route.summary || route.detail}` : (route.summary || route.detail));
+      } else {
+        $("health-text").textContent = isRemoteExecutionMode() ? "远端执行节点已配置" : "本地服务已启动";
+      }
+    } catch (err) {
+      $("health-text").textContent = "服务不可用";
+      throw err;
     }
-  } catch (err) {
-    $("health-text").textContent = "服务不可用";
-  }
+  })();
 
   const bootErrors = [];
   const rememberBootError = (err) => {
@@ -6135,6 +6253,11 @@ async function boot() {
   const configPromises = [
     loadSavedConfig(),
     loadAutomationConfig(),
+  ];
+  const initialDataPromises = [
+    refreshDeskState(),
+    refreshAutomationState(),
+    refreshMarket(),
   ];
 
   $("envPreset").addEventListener("change", () => {
@@ -6518,16 +6641,15 @@ async function boot() {
   renderMarketChart();
   const initialHydrationResults = await Promise.allSettled([
     ...configPromises,
-    refreshDeskState(),
-    refreshAutomationState(),
-    refreshOrders(),
-    refreshMarket(),
+    ...initialDataPromises,
+    healthPromise,
   ]);
   initialHydrationResults.forEach((result) => {
     if (result.status === "rejected") {
       rememberBootError(result.reason);
     }
   });
+  refreshOrders().catch(() => {});
   if (bootErrors.length) {
     const summary = bootErrors[0];
     setMessage(summary, "err");

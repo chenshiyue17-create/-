@@ -13281,6 +13281,89 @@ def relay_requests_response(handler: BaseHTTPRequestHandler, response: requests.
     )
 
 
+def build_index_bootstrap_payload() -> dict[str, Any]:
+    try:
+        config = CONFIG.current()
+        live_only = prefer_live_execution_state(config)
+        execution_journal = get_execution_journal_snapshot(
+            limit=DEFAULT_RECENT_ORDER_LIMIT,
+            live_only=live_only,
+        )
+        automation_state: dict[str, Any] = {}
+        account_payload: dict[str, Any] = {}
+
+        if should_proxy_to_remote(config, "/api/focus-snapshot"):
+            try:
+                response = remote_gateway_request(
+                    config,
+                    "GET",
+                    "/api/focus-snapshot",
+                    timeout=1.5,
+                )
+                remote_payload = response.json() if response.content else {}
+                remote_automation = load_remote_automation_config_for_proxy(config)
+                if isinstance(remote_payload.get("automationState"), dict):
+                    automation_state = enrich_remote_dip_swing_runtime_state(
+                        remote_payload.get("automationState") or {},
+                        remote_automation,
+                        config,
+                    )
+                remote_journal = remote_payload.get("executionJournal") or {}
+                if isinstance(remote_journal, dict) and remote_journal.get("orders"):
+                    execution_journal = remote_journal
+                if isinstance(remote_payload.get("account"), dict):
+                    account_payload = copy.deepcopy(remote_payload.get("account") or {})
+            except Exception:
+                cached_state, _cached_ts = load_cached_remote_automation_state(config)
+                if cached_state:
+                    automation_state = copy.deepcopy(cached_state)
+
+        if not automation_state:
+            automation_state = sanitize_only_dip_swing_runtime_state(
+                AUTOMATION_ENGINE.snapshot(),
+                AUTOMATION_CONFIG.current(),
+            )
+
+        automation_state["executionJournal"] = execution_journal
+        automation_state["equityDisplay"] = build_equity_display(
+            account_payload.get("summary") or None,
+            automation_state,
+            execution_journal,
+        )
+        payload: dict[str, Any] = {
+            "automationState": automation_state,
+            "executionJournal": execution_journal,
+            "timestamp": int(time.time()),
+        }
+        if account_payload:
+            account_payload["equityDisplay"] = build_equity_display(
+                account_payload.get("summary") or {},
+                automation_state,
+                execution_journal,
+            )
+            payload["account"] = account_payload
+        else:
+            current_eq = automation_state.get("currentEq")
+            session_start_eq = automation_state.get("sessionStartEq")
+            if current_eq or session_start_eq:
+                payload["account"] = {
+                    "summary": {
+                        "displayTotalEq": current_eq or 0,
+                        "totalEq": current_eq or 0,
+                    },
+                    "balanceCount": 0,
+                    "positionCount": 0,
+                    "equityDisplay": build_equity_display(
+                        None,
+                        automation_state,
+                        execution_journal,
+                    ),
+                }
+        return payload
+    except Exception:
+        return {}
+
+
 class AppHandler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: Any) -> None:
         return
@@ -14193,6 +14276,19 @@ class AppHandler(BaseHTTPRequestHandler):
             content_type = "application/javascript; charset=utf-8"
 
         raw = candidate.read_bytes()
+        if relative_path == "index.html":
+            try:
+                bootstrap_payload = build_index_bootstrap_payload()
+                bootstrap_json = json.dumps(bootstrap_payload, ensure_ascii=False).replace("</", "<\\/")
+                raw = raw.decode("utf-8").replace(
+                    "<!-- BOOTSTRAP_DATA -->",
+                    f"<script>window.__OKX_BOOTSTRAP__ = {bootstrap_json};</script>",
+                ).encode("utf-8")
+            except Exception:
+                raw = raw.decode("utf-8").replace(
+                    "<!-- BOOTSTRAP_DATA -->",
+                    "<script>window.__OKX_BOOTSTRAP__ = {};</script>",
+                ).encode("utf-8")
         write_http_response(
             self,
             status=200,
