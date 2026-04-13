@@ -7349,6 +7349,12 @@ def evaluate_dip_swing_target_snapshot(
         recent_open_close_gap > DIP_SWING_MAX_OPEN_CLOSE_GAP
         or recent_consecutive_open_streak > DIP_SWING_MAX_CONSECUTIVE_OPEN_STREAK
     )
+    if DIP_SWING_AGGRESSIVE_SCALP_MODE:
+        symbol_cycle_block_reason = ""
+        symbol_cycle_blocked = False
+        symbol_performance_blocked = False
+        symbol_taker_blocked = False
+        symbol_pressure_blocked = False
     funding_drag_pct = max(Decimal("0"), funding_rate_pct) * Decimal("0.35")
     estimated_cost_pct = max(estimated_cost_pct, recent_execution_cost_floor_pct + funding_drag_pct)
     setup_edge_pct = max(ema_spread_pct, Decimal("0")) + max(fast_slope_pct, Decimal("0")) + max(rebound_pct, Decimal("0"))
@@ -8360,6 +8366,8 @@ def build_dip_swing_analysis(
         or (position_side == "short" and planned_side == "sell")
     )
     if aggressive_scalp_mode:
+        symbol_cycle_blocked = False
+        symbol_cycle_block_reason = ""
         symbol_performance_blocked = False
         symbol_taker_blocked = False
         symbol_pressure_blocked = False
@@ -8476,6 +8484,8 @@ def build_dip_swing_analysis(
             f"当前持有 {selected_symbol}{'多单' if position_side == 'long' else '空单'}"
             f" · 当前这单净结果估算 {format_decimal(net_close_pnl, 2)}U / 每单目标 {format_decimal(DIP_SWING_NET_TARGET_USDT, 0)}U"
         )
+        if aggressive_scalp_mode and not holding_same_direction:
+            warnings.append(f"当前方向已切到 {planned_side_label}，会先平掉这笔旧仓再继续直开")
     elif selected_from_market:
         warnings.append(f"watchlist 外出现更优循环目标，当前切到 {selected_symbol}")
     if len(execution_symbols) > 1:
@@ -8571,6 +8581,8 @@ def build_dip_swing_analysis(
         decision = "manage"
         if net_close_pnl >= DIP_SWING_NET_TARGET_USDT:
             decision_label = "这单已达净利，准备平仓"
+        elif aggressive_scalp_mode and not holding_same_direction:
+            decision_label = "方向反转，先平旧仓"
         elif allow_new_entries and holding_same_direction:
             decision_label = "持仓中继续循环"
         else:
@@ -8611,6 +8623,8 @@ def build_dip_swing_analysis(
         summary_bits.append(blockers[0])
     elif position_side in {"long", "short"}:
         summary_bits.append(f"当前这单净结果估算 {format_decimal(net_close_pnl, 2)}U，达到 {format_decimal(DIP_SWING_NET_TARGET_USDT, 0)}U 就平")
+        if aggressive_scalp_mode and not holding_same_direction:
+            summary_bits.append("方向已反转，先平旧仓再恢复直开")
         if allow_new_entries and holding_same_direction:
             summary_bits.append("同方向持仓不中断，继续循环开仓")
     elif allow_new_entries:
@@ -12062,6 +12076,8 @@ class AutomationEngine:
             and recent_taker_fill_pct >= DIP_SWING_SYMBOL_MAX_TAKER_FILL_PCT
         )
         if aggressive_scalp_mode:
+            symbol_cycle_block_reason = ""
+            symbol_cycle_blocked = False
             symbol_performance_blocked = False
             symbol_taker_blocked = False
         estimated_cost_pct = max(
@@ -12219,6 +12235,50 @@ class AutomationEngine:
                     "强平缓冲不足，主动退场",
                     reduce_only=True,
                     protected_exit=True,
+                    market_key=market_key,
+                    strategy_action="exit",
+                    strategy_leg="swap",
+                )
+                return
+            if aggressive_scalp_mode and not holding_same_direction:
+                if pending_exit_orders:
+                    if stale_exit_orders:
+                        self._cancel_swap_orders(client, inst_id, stale_exit_orders, "方向反转，撤掉超时旧平仓单后重新退出", market_key=market_key)
+                        pending_exit_orders = [order for order in pending_exit_orders if order not in stale_exit_orders]
+                    if pending_exit_orders:
+                        self._set_market(
+                            market_key,
+                            {
+                                "lastMessage": (
+                                    f"{ONLY_STRATEGY_LABEL}方向已反转，正在平掉旧仓释放方向"
+                                    f" · {status_text}"
+                                )
+                            },
+                        )
+                        return
+                exit_retry_ready, exit_retry_reason = self._cooldown_ready(market_key, DIP_SWING_EXIT_RETRY_SECONDS)
+                if not exit_retry_ready:
+                    self._set_market(
+                        market_key,
+                        {
+                            "lastMessage": (
+                                f"{ONLY_STRATEGY_LABEL}方向已反转，等待上一笔平仓回报"
+                                f" · {exit_retry_reason} · {status_text}"
+                            )
+                        },
+                    )
+                    return
+                close_side = "sell" if position_side == "long" else "buy"
+                self._place_swap_order(
+                    client,
+                    inst_id,
+                    close_side,
+                    round_down(abs_pos, lot_size),
+                    automation["swapTdMode"],
+                    f"{ONLY_STRATEGY_LABEL}方向反转，先平旧仓再继续循环",
+                    reduce_only=True,
+                    prefer_fill=True,
+                    batchable=True,
                     market_key=market_key,
                     strategy_action="exit",
                     strategy_leg="swap",
