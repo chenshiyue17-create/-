@@ -7,8 +7,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
     private let healthPorts = [8765]
     private let healthPath = "/api/ping"
     private let compatibilityPaths = [
-        "/api/local-config",
-        "/api/miner/config"
+        "/api/local-config"
     ]
     private let bundleId = "com.cc.okxlocalapp"
 
