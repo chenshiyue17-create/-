@@ -49,6 +49,8 @@ MAC_LOTTO_STATUS_PATH = DATA_DIR / "mac-lotto-status.json"
 MAC_LOTTO_LOG_PATH = DATA_DIR / "mac-lotto.log"
 HOST = os.environ.get("OKX_LOCAL_APP_HOST", "127.0.0.1")
 PORT = int(os.environ.get("OKX_LOCAL_APP_PORT", "8765"))
+RUNTIME_SYNC_STAMP = str(os.environ.get("OKX_LOCAL_APP_RUNTIME_SYNC_STAMP") or "").strip()
+RUNTIME_SOURCE_LABEL = str(os.environ.get("OKX_LOCAL_APP_RUNTIME_SOURCE_LABEL") or "").strip()
 MAX_LOG_ENTRIES = 120
 SPOT_SELL_PROTECTION_PCT = Decimal("2.0")
 SECURE_FILE_MAGIC = "okx-local-app-secure-v1"
@@ -119,6 +121,8 @@ REMOTE_AUTOMATION_STATE_CACHE: dict[str, Any] = {"ts": 0.0, "url": "", "state": 
 ONLY_STRATEGY_PRESET = "dip_swing"
 ONLY_STRATEGY_LABEL = "利润循环"
 ONLY_STRATEGY_FALLBACK_DECISION = "持续开仓"
+DEFAULT_SWAP_STRATEGY_MODE = "trend_reverse"
+SUPPORTED_SWAP_STRATEGY_MODES = {"long_only", "short_only", "trend_follow", "trend_reverse"}
 DIP_SWING_AGGRESSIVE_SCALP_MODE = True
 DIP_SWING_NET_TARGET_USDT = Decimal("1")
 DIP_SWING_MIN_NET_HOLD_USDT = Decimal("-999999")
@@ -1148,7 +1152,7 @@ def default_automation_config() -> dict[str, Any]:
         "swapContracts": "0",
         "swapTdMode": "isolated",
         "swapLeverage": "10",
-        "swapStrategyMode": "trend_follow",
+        "swapStrategyMode": DEFAULT_SWAP_STRATEGY_MODE,
         "stopLossPct": "0",
         "takeProfitPct": "0",
         "maxDailyLossPct": "0",
@@ -1174,7 +1178,12 @@ def enforce_only_dip_swing_strategy(config: dict[str, Any]) -> dict[str, Any]:
     enforced["spotMaxExposure"] = "0"
     enforced["swapEnabled"] = True
     enforced["swapTdMode"] = "isolated"
-    enforced["swapStrategyMode"] = "trend_follow"
+    current_mode = str(enforced.get("swapStrategyMode") or "").strip()
+    if current_mode == "trend_follow":
+        current_mode = DEFAULT_SWAP_STRATEGY_MODE
+    enforced["swapStrategyMode"] = (
+        current_mode if current_mode in SUPPORTED_SWAP_STRATEGY_MODES else DEFAULT_SWAP_STRATEGY_MODE
+    )
     enforced["maxOrdersPerDay"] = 0
     enforced["cooldownSeconds"] = 0
     enforced["pollSeconds"] = min(max(int(enforced.get("pollSeconds", 5) or 5), 1), 3)
@@ -1196,7 +1205,12 @@ def sanitize_only_dip_swing_override(override: dict[str, Any]) -> dict[str, Any]
         sanitized.pop(field, None)
     sanitized["swapEnabled"] = True
     sanitized["swapTdMode"] = "isolated"
-    sanitized["swapStrategyMode"] = "long_only"
+    current_mode = str(sanitized.get("swapStrategyMode") or "").strip()
+    if current_mode == "trend_follow":
+        current_mode = DEFAULT_SWAP_STRATEGY_MODE
+    sanitized["swapStrategyMode"] = (
+        current_mode if current_mode in SUPPORTED_SWAP_STRATEGY_MODES else DEFAULT_SWAP_STRATEGY_MODE
+    )
     return sanitized
 
 
@@ -1413,7 +1427,7 @@ WATCHLIST_OVERRIDE_BOOL_FIELDS = {"spotEnabled", "swapEnabled", "arbRequireFundi
 WATCHLIST_OVERRIDE_ENUM_FIELDS = {
     "bar": {"1m", "5m", "15m", "1H"},
     "swapTdMode": {"cross", "isolated"},
-    "swapStrategyMode": {"long_only", "short_only", "trend_follow"},
+    "swapStrategyMode": SUPPORTED_SWAP_STRATEGY_MODES,
 }
 WATCHLIST_OVERRIDE_ALLOWED_FIELDS = (
     WATCHLIST_OVERRIDE_DECIMAL_FIELDS
@@ -1492,7 +1506,7 @@ def validate_single_automation_target(config: dict[str, Any]) -> str:
         return "冷却秒数需在 0 到 3600 之间"
     if max_orders < 0 or max_orders > 500:
         return "每日最大订单数需在 0 到 500 之间；0 代表不限制"
-    if config.get("swapStrategyMode") not in ("long_only", "short_only", "trend_follow"):
+    if str(config.get("swapStrategyMode") or "").strip() not in SUPPORTED_SWAP_STRATEGY_MODES:
         return "永续策略模式不支持"
     if config.get("swapTdMode") not in ("cross", "isolated"):
         return "永续保证金模式仅支持 cross 或 isolated"
@@ -1532,8 +1546,8 @@ def validate_single_automation_target(config: dict[str, Any]) -> str:
     if str(config.get("strategyPreset") or "") == "dip_swing":
         if not config.get("swapEnabled"):
             return f"{ONLY_STRATEGY_LABEL}必须启用永续"
-        if str(config.get("swapStrategyMode") or "") != "trend_follow":
-            return f"{ONLY_STRATEGY_LABEL}只支持 trend_follow"
+        if str(config.get("swapStrategyMode") or "") not in SUPPORTED_SWAP_STRATEGY_MODES:
+            return f"{ONLY_STRATEGY_LABEL}策略模式不支持"
         if str(config.get("swapTdMode") or "") != "isolated":
             return f"{ONLY_STRATEGY_LABEL}必须使用 isolated 逐仓"
         if safe_decimal(config.get("swapLeverage"), "1") > DIP_SWING_MAX_LEVERAGE:
@@ -1753,9 +1767,28 @@ def strategy_mode_text(mode: str) -> str:
     normalized = str(mode or "").strip()
     if normalized == "short_only":
         return "只做空"
+    if normalized == "trend_reverse":
+        return "反向双向"
     if normalized == "trend_follow":
         return "顺势双向"
     return "只做多"
+
+
+def normalize_swap_strategy_mode(mode: Any, *, default: str = DEFAULT_SWAP_STRATEGY_MODE) -> str:
+    normalized = str(mode or "").strip()
+    if normalized == "trend_follow":
+        return DEFAULT_SWAP_STRATEGY_MODE
+    if normalized in SUPPORTED_SWAP_STRATEGY_MODES:
+        return normalized
+    return default
+
+
+def is_reverse_swap_strategy_mode(mode: Any) -> bool:
+    return normalize_swap_strategy_mode(mode) == "trend_reverse"
+
+
+def reverse_trade_side(side: str) -> str:
+    return "sell" if str(side or "").strip().lower() == "buy" else "buy"
 
 
 def build_market_risk_label(target: dict[str, Any], market_kind: str) -> str:
@@ -1901,7 +1934,7 @@ def build_watchlist_entry(
             "swapContracts": "" if str(target.get("strategyPreset") or "") == "dip_swing" else decimal_to_str(safe_decimal(target.get("swapContracts"), "0")),
             "swapLeverage": decimal_to_str(safe_decimal(target.get("swapLeverage"), "0")),
             "swapTdMode": str(target.get("swapTdMode") or "cross"),
-            "swapStrategyMode": str(target.get("swapStrategyMode") or "trend_follow"),
+            "swapStrategyMode": normalize_swap_strategy_mode(target.get("swapStrategyMode")),
             "overrideKeys": override_keys,
         },
         "overrideActive": bool(override_keys),
@@ -1917,7 +1950,7 @@ def build_watchlist_entry(
             "riskLabel": (
                 f"现货 {build_market_risk_label(target, 'spot')} · "
                 f"永续 {build_market_risk_label(target, 'swap')} · "
-                f"{strategy_mode_text(str(target.get('swapStrategyMode') or 'trend_follow'))}"
+                f"{strategy_mode_text(normalize_swap_strategy_mode(target.get('swapStrategyMode')))}"
             ),
         },
     }
@@ -5070,11 +5103,13 @@ def strategy_mode_label(config: dict[str, Any]) -> str:
         return "空仓即开 / 净利 1U 平仓"
     if not config.get("swapEnabled"):
         return "现货执行"
-    mode = str(config.get("swapStrategyMode", "trend_follow"))
-    if mode == "trend_follow":
-        return "顺势双向"
+    mode = normalize_swap_strategy_mode(config.get("swapStrategyMode"))
+    if mode == "trend_reverse":
+        return "反向双向"
     if mode == "short_only":
         return "只做空"
+    if mode == "trend_follow":
+        return "顺势双向"
     return "只做多"
 
 
@@ -5083,11 +5118,13 @@ def strategy_mode_badge(config: dict[str, Any]) -> str:
         return ONLY_STRATEGY_LABEL
     if not config.get("swapEnabled"):
         return "现货"
-    mode = str(config.get("swapStrategyMode", "trend_follow"))
-    if mode == "trend_follow":
-        return "双向"
+    mode = normalize_swap_strategy_mode(config.get("swapStrategyMode"))
+    if mode == "trend_reverse":
+        return "反向"
     if mode == "short_only":
         return "只空"
+    if mode == "trend_follow":
+        return "双向"
     return "只多"
 
 
@@ -5121,10 +5158,11 @@ def strategy_detail_line(config: dict[str, Any], origin_label: str = "") -> str:
         return " · ".join(part for part in parts if part)
     if str(config.get("strategyPreset") or "") == "dip_swing":
         target_multiple = resolve_target_balance_multiple(config)
+        mode_text = strategy_mode_text(config.get("swapStrategyMode"))
         parts = [
             "市场扫描 + 方向轮动 + 因子裁判",
             "空仓即开 · 净赚 1U+ 就平 · 24 小时循环",
-            f"顺势双向 · {config.get('swapTdMode', 'isolated')} {config.get('swapLeverage', '2')}x",
+            f"{mode_text} · {config.get('swapTdMode', 'isolated')} {config.get('swapLeverage', '2')}x",
             "开仓 maker-first / 平仓 IOC",
             f"优势/成本 ≥ {format_decimal(DIP_SWING_MIN_EDGE_COST_RATIO, 1)}x · 波动/成本 ≥ {format_decimal(DIP_SWING_MIN_RANGE_COST_RATIO, 1)}x · ATR/成本 ≥ {format_decimal(DIP_SWING_MIN_ATR_COST_RATIO, 1)}x",
             f"强平缓冲 ≥ {format_decimal(DIP_SWING_MIN_LIQ_BUFFER_PCT, 0)}% · 动态仓位",
@@ -5346,17 +5384,30 @@ def build_pullback_signal(
     }
 
 
-def profit_loop_trade_side(signal: dict[str, Any], candles: list[dict[str, Any]]) -> str:
+def profit_loop_trade_side(
+    signal: dict[str, Any],
+    candles: list[dict[str, Any]],
+    mode: str = DEFAULT_SWAP_STRATEGY_MODE,
+) -> str:
     trend = str(signal.get("trend") or "flat").strip().lower()
     fast_slope_pct = safe_decimal(signal.get("fastSlopePct"), "0")
     slow_slope_pct = safe_decimal(signal.get("slowSlopePct"), "0")
     last_close = safe_decimal(signal.get("lastClose"), "0")
     prev_close = candles[-2]["close"] if len(candles) >= 2 else last_close
     if trend == "up" and fast_slope_pct >= 0 and slow_slope_pct >= 0:
+        side = "buy"
+    elif trend == "down" and fast_slope_pct <= 0 and slow_slope_pct <= 0:
+        side = "sell"
+    else:
+        side = "buy" if last_close >= prev_close else "sell"
+    normalized_mode = normalize_swap_strategy_mode(mode)
+    if normalized_mode == "long_only":
         return "buy"
-    if trend == "down" and fast_slope_pct <= 0 and slow_slope_pct <= 0:
+    if normalized_mode == "short_only":
         return "sell"
-    return "buy" if last_close >= prev_close else "sell"
+    if normalized_mode == "trend_reverse":
+        return reverse_trade_side(side)
+    return side
 
 
 def profit_loop_trade_side_label(side: str) -> str:
@@ -5634,7 +5685,7 @@ def simulate_swap_market(
     cooldown_ms = max(0, int(config.get("cooldownSeconds", 0))) * 1000
     ct_val = safe_decimal(meta.get("ctVal"), "1")
     fee_rate = Decimal("0.0005")
-    mode = str(config.get("swapStrategyMode", "trend_follow"))
+    mode = normalize_swap_strategy_mode(config.get("swapStrategyMode"))
 
     seed_price = candles[0]["close"]
     contract_notional = contracts * ct_val * seed_price
@@ -5715,6 +5766,12 @@ def simulate_swap_market(
                     close_position(price, ts)
                 elif position_side > 0:
                     close_position(price, ts)
+            elif mode == "trend_reverse":
+                if position_side > 0:
+                    close_position(price, ts)
+                    open_position(-1, price, ts)
+                elif position_side == 0:
+                    open_position(-1, price, ts)
             else:
                 if position_side < 0:
                     close_position(price, ts)
@@ -5731,6 +5788,12 @@ def simulate_swap_market(
                     open_position(-1, price, ts)
                 elif position_side == 0:
                     open_position(-1, price, ts)
+            elif mode == "trend_reverse":
+                if position_side < 0:
+                    close_position(price, ts)
+                    open_position(1, price, ts)
+                elif position_side == 0:
+                    open_position(1, price, ts)
             else:
                 if position_side > 0:
                     close_position(price, ts)
@@ -5881,7 +5944,7 @@ def candidate_view_config(config: dict[str, Any]) -> dict[str, Any]:
         "bar": config["bar"],
         "fastEma": int(config["fastEma"]),
         "slowEma": int(config["slowEma"]),
-        "swapStrategyMode": str(config.get("swapStrategyMode", "trend_follow")),
+        "swapStrategyMode": normalize_swap_strategy_mode(config.get("swapStrategyMode")),
         "swapLeverage": str(config.get("swapLeverage", "1")),
         "spotEnabled": bool(config.get("spotEnabled")),
         "swapEnabled": bool(config.get("swapEnabled")),
@@ -6034,8 +6097,8 @@ def mutate_strategy_config(
         1,
         10,
     )
-    mode_cycle = ["trend_follow", "long_only", "short_only"]
-    current_mode = str(config.get("swapStrategyMode", "trend_follow"))
+    mode_cycle = ["trend_reverse", "long_only", "short_only", "trend_follow"]
+    current_mode = normalize_swap_strategy_mode(config.get("swapStrategyMode"))
     try:
         mode_index = mode_cycle.index(current_mode)
     except ValueError:
@@ -6088,9 +6151,9 @@ def hybridize_strategy_config(
         1,
         10,
     )
-    primary_mode = str(primary.get("swapStrategyMode", "trend_follow"))
-    secondary_mode = str(secondary.get("swapStrategyMode", "trend_follow"))
-    mode_options = [primary_mode, secondary_mode, "trend_follow", "short_only", "long_only"]
+    primary_mode = normalize_swap_strategy_mode(primary.get("swapStrategyMode"))
+    secondary_mode = normalize_swap_strategy_mode(secondary.get("swapStrategyMode"))
+    mode_options = [primary_mode, secondary_mode, "trend_reverse", "short_only", "long_only", "trend_follow"]
     chosen_mode = mode_options[seed % len(mode_options)]
     bar_options = [str(primary.get("bar", "5m")), str(secondary.get("bar", "5m"))] + bars
     chosen_bar = bar_options[seed % len(bar_options)]
@@ -6229,8 +6292,8 @@ def optimization_candidates(config: dict[str, Any], depth: str, include_alt_bars
         leverage_values = sorted({max(1, leverage_seed - 2), max(1, leverage_seed - 1), leverage_seed, min(10, leverage_seed + 1), min(10, leverage_seed + 3)})
     else:
         leverage_values = sorted({max(1, leverage_seed - 1), leverage_seed, min(10, leverage_seed + 2)})
-    mode_values = [str(config.get("swapStrategyMode", "trend_follow"))]
-    for candidate_mode in ("trend_follow", "long_only", "short_only"):
+    mode_values = [normalize_swap_strategy_mode(config.get("swapStrategyMode"))]
+    for candidate_mode in ("trend_reverse", "trend_follow", "long_only", "short_only"):
         if candidate_mode not in mode_values:
             mode_values.append(candidate_mode)
 
@@ -6243,7 +6306,7 @@ def optimization_candidates(config: dict[str, Any], depth: str, include_alt_bars
                 for stop_loss in stop_values:
                     for take_profit in take_values:
                         for leverage in leverage_values if config.get("swapEnabled") else [int(safe_decimal(config.get("swapLeverage"), "1"))]:
-                            for mode in mode_values if config.get("swapEnabled") else [str(config.get("swapStrategyMode", "trend_follow"))]:
+                            for mode in mode_values if config.get("swapEnabled") else [normalize_swap_strategy_mode(config.get("swapStrategyMode"))]:
                                 patch = {
                                     "bar": bar,
                                     "fastEma": fast,
@@ -7563,10 +7626,17 @@ def fetch_dip_swing_target_snapshot(
     )
 
 
-def build_profit_loop_snapshot_metrics(snapshot: dict[str, Any]) -> dict[str, Any]:
+def build_profit_loop_snapshot_metrics(snapshot: dict[str, Any], *, mode: str | None = None) -> dict[str, Any]:
     signal = snapshot.get("signal") or {}
     candles = snapshot.get("candles") or []
-    side = profit_loop_trade_side(signal, candles) if candles else "buy"
+    effective_mode = mode
+    if effective_mode is None:
+        effective_mode = (
+            (snapshot.get("target") or {}).get("swapStrategyMode")
+            or snapshot.get("swapStrategyMode")
+            or DEFAULT_SWAP_STRATEGY_MODE
+        )
+    side = profit_loop_trade_side(signal, candles, str(effective_mode)) if candles else "buy"
     ema_spread_pct = abs(safe_decimal(snapshot.get("emaSpreadPct"), "0"))
     fast_slope_pct = abs(safe_decimal(snapshot.get("fastSlopePct"), "0"))
     slow_slope_pct = abs(safe_decimal(snapshot.get("slowSlopePct"), "0"))
@@ -8595,8 +8665,10 @@ def build_dip_swing_analysis(
         decision_label = ONLY_STRATEGY_FALLBACK_DECISION
 
     symbol = selected_symbol
+    selected_mode_text = strategy_mode_text(selected_config.get("swapStrategyMode"))
     summary_bits = [
         f"{symbol} {ONLY_STRATEGY_LABEL}",
+        selected_mode_text,
         f"方向 {planned_side_label}",
         f"预期波动 {compact_metric(predicted_move_pct, '0.01')}%",
         f"预期净优势 {compact_metric(predicted_net_pct, '0.01')}%",
@@ -8639,7 +8711,7 @@ def build_dip_swing_analysis(
         "summary": " · ".join(summary_bits),
         "selectedStrategyName": f"{symbol} {ONLY_STRATEGY_LABEL}",
         "selectedStrategyDetail": (
-            ("方向驱动 + 无脑直开" if aggressive_scalp_mode else "方向驱动 + 超短直开")
+            ((f"{selected_mode_text} + 无脑直开") if aggressive_scalp_mode else f"{selected_mode_text} + 超短直开")
             + 
             f" · 空仓即开 {planned_side_label}"
             f" · 每单净赚 {format_decimal(DIP_SWING_NET_TARGET_USDT, 0)}U+ 就平"
@@ -8854,7 +8926,7 @@ def build_execution_analysis(
     allow_new_entries = not blockers and selected_return > Decimal("0") and selected_score >= Decimal("1.0")
     if volatility_pct <= Decimal("0.35") or (spot_signal["signal"] == "hold" and swap_signal["signal"] == "hold"):
         allow_new_entries = False
-    best_mode = str(best_config.get("swapStrategyMode", "trend_follow"))
+    best_mode = normalize_swap_strategy_mode(best_config.get("swapStrategyMode"))
     if abs(funding_rate_pct) >= Decimal("0.08"):
         if best_mode == "long_only" and funding_rate_pct > 0:
             allow_new_entries = False
@@ -11921,7 +11993,7 @@ class AutomationEngine:
             max(int(automation["slowEma"]) + 30, 80),
         )
         signal = build_pullback_signal(candles, int(automation["fastEma"]), int(automation["slowEma"]))
-        desired_side = profit_loop_trade_side(signal, candles)
+        desired_side = profit_loop_trade_side(signal, candles, str(automation.get("swapStrategyMode") or DEFAULT_SWAP_STRATEGY_MODE))
         desired_side_label = profit_loop_trade_side_label(desired_side)
         loop_snapshot = build_profit_loop_snapshot_metrics(
             {
@@ -11936,7 +12008,8 @@ class AutomationEngine:
                 "executionQualityScore": Decimal("0"),
                 "symbolPerformancePenalty": Decimal("0"),
                 "basisPct": Decimal("0"),
-            }
+            },
+            mode=str(automation.get("swapStrategyMode") or DEFAULT_SWAP_STRATEGY_MODE),
         )
         predicted_net_pct = safe_decimal(loop_snapshot.get("predictedNetPct"), "0")
         aggressive_scalp_mode = DIP_SWING_AGGRESSIVE_SCALP_MODE
@@ -12775,7 +12848,7 @@ class AutomationEngine:
             )
             return
 
-        mode = automation["swapStrategyMode"]
+        mode = normalize_swap_strategy_mode(automation.get("swapStrategyMode"))
         if signal["signal"] == "bull_cross":
             if not cooldown_ready:
                 self._set_market(market_key, {"lastMessage": f"永续金叉出现，但{reason}"})
@@ -12832,6 +12905,43 @@ class AutomationEngine:
                         reduce_only=True,
                         market_key=market_key,
                     )
+            elif mode == "trend_reverse":
+                if position_side == "flat":
+                    if not allow_new_entries:
+                        self._set_market(market_key, {"lastMessage": f"永续金叉出现，但当前联网决策层为“{analysis_label}”，本轮不新开空仓"})
+                        return
+                    self._place_swap_order(
+                        client,
+                        inst_id,
+                        "sell",
+                        trade_contracts,
+                        automation["swapTdMode"],
+                        "永续金叉反向开空",
+                        market_key=market_key,
+                    )
+                elif position_side == "long":
+                    close_size = round_down(abs_pos, lot_size)
+                    if close_size > 0:
+                        self._place_swap_order(
+                            client,
+                            inst_id,
+                            "sell",
+                            close_size,
+                            automation["swapTdMode"],
+                            "永续金叉反向平多",
+                            reduce_only=True,
+                            market_key=market_key,
+                        )
+                    if allow_new_entries:
+                        self._place_swap_order(
+                            client,
+                            inst_id,
+                            "sell",
+                            round_down(trade_contracts, lot_size),
+                            automation["swapTdMode"],
+                            "永续金叉反向翻空",
+                            market_key=market_key,
+                        )
             else:
                 if position_side == "flat":
                     if not allow_new_entries:
@@ -12922,6 +13032,43 @@ class AutomationEngine:
                             round_down(trade_contracts, lot_size),
                             automation["swapTdMode"],
                             "永续死叉翻空",
+                            market_key=market_key,
+                        )
+            elif mode == "trend_reverse":
+                if position_side == "flat":
+                    if not allow_new_entries:
+                        self._set_market(market_key, {"lastMessage": f"永续死叉出现，但当前联网决策层为“{analysis_label}”，本轮不新开多仓"})
+                        return
+                    self._place_swap_order(
+                        client,
+                        inst_id,
+                        "buy",
+                        trade_contracts,
+                        automation["swapTdMode"],
+                        "永续死叉反向开多",
+                        market_key=market_key,
+                    )
+                elif position_side == "short":
+                    close_size = round_down(abs_pos, lot_size)
+                    if close_size > 0:
+                        self._place_swap_order(
+                            client,
+                            inst_id,
+                            "buy",
+                            close_size,
+                            automation["swapTdMode"],
+                            "永续死叉反向平空",
+                            reduce_only=True,
+                            market_key=market_key,
+                        )
+                    if allow_new_entries:
+                        self._place_swap_order(
+                            client,
+                            inst_id,
+                            "buy",
+                            round_down(trade_contracts, lot_size),
+                            automation["swapTdMode"],
+                            "永续死叉反向翻多",
                             market_key=market_key,
                         )
             else:
@@ -13619,7 +13766,15 @@ class AppHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/local-config":
-            json_response(self, {"ok": True, "config": CONFIG.redacted()})
+            json_response(
+                self,
+                {
+                    "ok": True,
+                    "config": CONFIG.redacted(),
+                    "runtimeSyncStamp": RUNTIME_SYNC_STAMP,
+                    "runtimeSource": RUNTIME_SOURCE_LABEL,
+                },
+            )
             return
 
         if path == "/api/config":

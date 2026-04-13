@@ -72,7 +72,7 @@ const ONLY_STRATEGY_PRESET = "dip_swing";
 const STRATEGY_PRESETS = {
   dip_swing: {
     label: "利润循环",
-    description: "市场扫描 + 方向轮动 + 成本过滤。逐仓 10x 顺势双向，空仓即开，净赚 1U+ 就平，24 小时持续循环，目标余额 100x。",
+    description: "市场扫描 + 方向轮动 + 成本过滤。逐仓 10x 反向双向，空仓即开，净赚 1U+ 就平，24 小时持续循环，目标余额 100x。",
     config: {
       strategyPreset: "dip_swing",
       bar: "1m",
@@ -87,7 +87,7 @@ const STRATEGY_PRESETS = {
       swapEnabled: true,
       swapContracts: "0",
       swapTdMode: "isolated",
-      swapStrategyMode: "trend_follow",
+      swapStrategyMode: "trend_reverse",
       swapLeverage: "10",
       stopLossPct: "0",
       takeProfitPct: "0",
@@ -492,9 +492,15 @@ function selectBestExecutionJournal(primaryJournal, fallbackJournal, analysisNet
 }
 
 function formatStrategyMode(mode) {
+  if (mode === "trend_follow") return "反向双向";
   if (mode === "short_only") return "只做空";
-  if (mode === "trend_follow") return "顺势双向";
+  if (mode === "trend_reverse") return "反向双向";
   return "只做多";
+}
+
+function normalizeSwapStrategyMode(mode) {
+  if (mode === "short_only" || mode === "long_only" || mode === "trend_reverse") return mode;
+  return "trend_reverse";
 }
 
 const WATCHLIST_OVERRIDE_EDITOR_FIELDS = [
@@ -807,7 +813,7 @@ function normalizeAutomationConfigForCompare(config = {}) {
     swapEnabled: Boolean(config.swapEnabled),
     swapContracts: "0",
     swapTdMode: String(config.swapTdMode || "cross"),
-    swapStrategyMode: String(config.swapStrategyMode || "trend_follow"),
+    swapStrategyMode: normalizeSwapStrategyMode(String(config.swapStrategyMode || "trend_reverse")),
     swapLeverage: String(config.swapLeverage ?? "5"),
     stopLossPct: String(config.stopLossPct ?? "1.2"),
     takeProfitPct: String(config.takeProfitPct ?? "2.4"),
@@ -839,7 +845,7 @@ function buildStrategyFormSummary(config = {}) {
     ? normalized.watchlistSymbols.split(",").filter(Boolean)
     : ["BTC"];
   const overrideCount = Object.keys(parseWatchlistOverridesValue(normalized.watchlistOverrides, watchlist)).length;
-  const presetDetail = `${normalized.bar} 利润循环 · 逐仓 ${normalized.swapLeverage}x · 净赚 1U+ 平仓`;
+  const presetDetail = `${normalized.bar} 利润循环 · ${formatStrategyMode(normalized.swapStrategyMode)} · 逐仓 ${normalized.swapLeverage}x · 净赚 1U+ 平仓`;
   return `${preset.label} · ${presetDetail} · ${watchlist.join(" / ")} · ${watchlist.length} 币组合${overrideCount ? ` · ${overrideCount} 币独立覆盖` : ""}`;
 }
 
@@ -861,7 +867,7 @@ function buildDraftPortfolioEntries(config = collectAutomationConfig()) {
     const overrideFields = Object.keys(target.watchlistOverride || {});
     const summaryDetail = [
       `${target.bar} · 利润循环`,
-      `逐仓 ${target.swapLeverage}x · 动态仓位 · 空仓即开 / 净赚 1U+ 平仓`,
+      `${formatStrategyMode(target.swapStrategyMode)} · 逐仓 ${target.swapLeverage}x · 动态仓位 · 空仓即开 / 净赚 1U+ 平仓`,
       overrideFields.length ? `独立覆盖 ${overrideFields.length} 项` : "沿用组合参数",
     ].join(" · ");
     return {
@@ -873,7 +879,7 @@ function buildDraftPortfolioEntries(config = collectAutomationConfig()) {
       swapContracts: "",
       swapLeverage: String(target.swapLeverage || "0"),
       swapTdMode: target.swapTdMode || "cross",
-      swapStrategyMode: target.swapStrategyMode || "trend_follow",
+      swapStrategyMode: normalizeSwapStrategyMode(target.swapStrategyMode || "trend_reverse"),
       overrideKeys: overrideFields,
     },
     overrideActive: overrideFields.length > 0,
@@ -3381,7 +3387,7 @@ function fillAutomationForm(config) {
   $("autoSpotMaxExposure").value = "0";
   $("autoSwapEnabled").checked = true;
   $("autoSwapTdMode").value = "isolated";
-  $("autoSwapStrategyMode").value = "long_only";
+  $("autoSwapStrategyMode").value = normalizeSwapStrategyMode(config.swapStrategyMode || "trend_reverse");
   $("autoSwapLeverage").value = config.swapLeverage ?? "10";
   $("autoStopLossPct").value = config.stopLossPct ?? "1.2";
   $("autoTakeProfitPct").value = config.takeProfitPct ?? "8";
@@ -5558,7 +5564,7 @@ function renderResearchState(research) {
             </div>
             <div><b>代次</b><span>G${item.generation || "-"}</span></div>
             <div><b>来源</b><span>${item.originLabel || item.origin || "-"}</span></div>
-            <div><b>方向</b><span>${item.config?.swapStrategyMode === "short_only" ? "只做空" : item.config?.swapStrategyMode === "trend_follow" ? "顺势双向" : "只做多"}</span></div>
+            <div><b>方向</b><span>${formatStrategyMode(item.config?.swapStrategyMode)}</span></div>
             <div><b>杠杆</b><span>${item.config?.swapLeverage ? `${item.config.swapLeverage}x` : "-"}</span></div>
             <div><b>收益</b><span>${formatPercentValue(item.returnPct)}</span></div>
             <div><b>回撤</b><span>${formatPercentValue(item.maxDrawdownPct)}</span></div>

@@ -413,7 +413,7 @@
               <span class="quick-label">策略模式</span>
               <input id="autoStrategyPreset" type="hidden" value="dip_swing" />
               <strong id="active-strategy-label">利润循环</strong>
-              <p id="active-strategy-description">只保留利润循环策略。市场扫描 + 方向轮动 + 成本过滤，逐仓 10x 顺势双向，空仓即开，净赚 1U+ 就平，目标余额 100x。</p>
+              <p id="active-strategy-description">只保留利润循环策略。市场扫描 + 方向轮动 + 成本过滤，逐仓 10x 反向双向，空仓即开，净赚 1U+ 就平，目标余额 100x。</p>
             </div>
             <div class="chip-group" id="strategy-preset-group">
               <button class="chip active" type="button" data-strategy-preset="dip_swing">利润循环</button>
@@ -600,7 +600,7 @@
             <label>
               <span>永续策略方向</span>
               <select id="autoSwapStrategyMode">
-                <option value="trend_follow">顺势双向</option>
+                <option value="trend_reverse">反向双向</option>
                 <option value="long_only">只做多</option>
                 <option value="short_only">只做空</option>
               </select>
