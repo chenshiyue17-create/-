@@ -213,6 +213,8 @@ const dashboardState = {
   ordersLoadedOnce: false,
   equityDisplayCache: null,
   equityCurveCache: [],
+  serverBootstrap: null,
+  bootCachePayload: null,
 };
 
 let lastBootCacheSerialized = "";
@@ -228,6 +230,80 @@ function buildOrderFeedFromExecutionJournal(executionJournal = {}) {
     source: "focus_snapshot",
     stream: dashboardState.orderFeedMeta?.stream || null,
   };
+}
+
+function buildOrderFeedFromJournalSnapshot(journal = {}, source = "journal_cache", stream = null) {
+  const snapshot = journal && typeof journal === "object" ? journal : {};
+  return {
+    orders: Array.isArray(snapshot.orders) ? snapshot.orders : [],
+    journal: snapshot.summary || snapshot,
+    symbols: Array.isArray(snapshot.symbols) ? snapshot.symbols : [],
+    lastReconciledAt: snapshot.lastReconciledAt || "",
+    lastSource: snapshot.lastSource || "",
+    source,
+    stream,
+  };
+}
+
+function getKnownOrderFeedCandidates() {
+  const candidates = [];
+  if (dashboardState.recentOrdersAll?.length) {
+    candidates.push({
+      priority: 90,
+      feed: {
+        orders: dashboardState.recentOrdersAll,
+        journal: dashboardState.orderJournal?.summary || dashboardState.orderJournal || {},
+        symbols: dashboardState.orderJournalSymbols || [],
+        lastReconciledAt: dashboardState.orderJournal?.lastReconciledAt || "",
+        lastSource: dashboardState.orderJournal?.lastSource || "",
+        source: dashboardState.orderFeedMeta?.source || "memory",
+        stream: dashboardState.orderFeedMeta?.stream || null,
+      },
+    });
+  }
+  if (dashboardState.orderJournal?.orders?.length) {
+    candidates.push({
+      priority: 80,
+      feed: buildOrderFeedFromJournalSnapshot(
+        dashboardState.orderJournal,
+        dashboardState.orderFeedMeta?.source || "journal_memory",
+        dashboardState.orderFeedMeta?.stream || null,
+      ),
+    });
+  }
+  if (dashboardState.automation?.executionJournal?.orders?.length) {
+    candidates.push({
+      priority: 70,
+      feed: buildOrderFeedFromExecutionJournal(dashboardState.automation.executionJournal),
+    });
+  }
+  if (dashboardState.serverBootstrap?.executionJournal?.orders?.length) {
+    candidates.push({
+      priority: 60,
+      feed: buildOrderFeedFromExecutionJournal(dashboardState.serverBootstrap.executionJournal),
+    });
+  }
+  if (dashboardState.bootCachePayload?.orders?.orders?.length) {
+    candidates.push({
+      priority: 50,
+      feed: dashboardState.bootCachePayload.orders,
+    });
+  }
+  return candidates
+    .filter((item) => item.feed?.orders?.length)
+    .sort((left, right) => right.priority - left.priority);
+}
+
+function hydrateOrdersFromKnownSources() {
+  for (const candidate of getKnownOrderFeedCandidates()) {
+    try {
+      applyRecentOrders(candidate.feed);
+      return true;
+    } catch (error) {
+      console.error("hydrateOrdersFromKnownSources failed", candidate, error);
+    }
+  }
+  return false;
 }
 
 function buildBootCachePayload() {
@@ -282,6 +358,7 @@ function restoreDashboardBootCache() {
     const raw = window.localStorage.getItem(BOOT_CACHE_KEY);
     if (!raw) return false;
     const payload = JSON.parse(raw);
+    dashboardState.bootCachePayload = payload;
     const cachedAtMs = Number(payload?.cachedAtMs || 0);
     if (!cachedAtMs || Date.now() - cachedAtMs > BOOT_CACHE_MAX_AGE_MS) {
       window.localStorage.removeItem(BOOT_CACHE_KEY);
@@ -298,7 +375,8 @@ function restoreDashboardBootCache() {
     }
     lastBootCacheSerialized = raw;
     return true;
-  } catch (_) {
+  } catch (error) {
+    console.error("restoreDashboardBootCache failed", error);
     return false;
   }
 }
@@ -307,6 +385,7 @@ function restoreServerBootstrap() {
   try {
     const payload = window.__OKX_BOOTSTRAP__;
     if (!payload || typeof payload !== "object") return false;
+    dashboardState.serverBootstrap = payload;
     if (payload.account) {
       applyAccountSummary(payload.account);
     }
@@ -317,7 +396,8 @@ function restoreServerBootstrap() {
       applyRecentOrders(buildOrderFeedFromExecutionJournal(payload.executionJournal));
     }
     return true;
-  } catch (_) {
+  } catch (error) {
+    console.error("restoreServerBootstrap failed", error);
     return false;
   }
 }
@@ -1329,6 +1409,9 @@ function setWorkspaceView(view, { persist = true, scroll = true } = {}) {
   }
   if (key === "orders" && !dashboardState.accountDetailsLoadedOnce) {
     refreshSnapshot().catch(() => {});
+  }
+  if (key === "orders") {
+    hydrateOrdersFromKnownSources();
   }
   if (key === "orders" && !dashboardState.ordersLoadedOnce) {
     refreshOrders().catch(() => {});
@@ -4799,6 +4882,138 @@ function renderOrderTimelineBoard(groups, meta = {}) {
   });
 }
 
+function renderOrderFeedFallback(data, error) {
+  const allOrders = Array.isArray(data?.orders) ? data.orders : [];
+  const source = data?.source || "fallback";
+  const journal = data?.journal || buildDerivedOrderJournal(allOrders, data?.lastSource || source, data?.symbols || []);
+  const totalCount = allOrders.length;
+  const filledCount = allOrders.filter((item) => String(item?.state || "") === "filled").length;
+  const workingCount = allOrders.filter((item) => ["live", "effective", "partially_filled"].includes(String(item?.state || ""))).length;
+  const riskCount = allOrders.filter((item) => isRiskOrder(item)).length;
+  const successRate = totalCount ? (filledCount / totalCount) * 100 : 0;
+  const latest = allOrders
+    .slice()
+    .sort((a, b) => Number(b?.uTime || b?.cTime || 0) - Number(a?.uTime || a?.cTime || 0))[0];
+  const symbolMap = new Map();
+  allOrders.forEach((order) => {
+    const symbol = String(order?.instId || "--").split("-")[0] || "--";
+    const current = symbolMap.get(symbol) || { symbol, count: 0, pnl: 0 };
+    current.count += 1;
+    current.pnl += toOrderNumber(order?.realizedPnl ?? order?.fillPnl ?? order?.pnl ?? 0) + toOrderNumber(order?.fillFee ?? order?.fee ?? 0);
+    symbolMap.set(symbol, current);
+  });
+  const symbols = Array.from(symbolMap.values())
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 8);
+  const realized = Number(journal.realizedPnl ?? 0);
+  const totalFees = Number(journal.totalFees ?? 0);
+  const netResult = Number(journal.netPnl ?? (realized + totalFees));
+
+  dashboardState.recentOrdersAll = allOrders;
+  dashboardState.orderJournal = {
+    ...journal,
+    orders: allOrders,
+    lastSource: data?.lastSource || journal.lastSource || source,
+    lastReconciledAt: data?.lastReconciledAt || journal.lastReconciledAt || "",
+  };
+  dashboardState.orderJournalSymbols = Array.isArray(data?.symbols) ? data.symbols : symbols.map((item) => item.symbol);
+  dashboardState.orderFeedMeta = {
+    source,
+    stream: data?.stream || null,
+    journal: dashboardState.orderJournal,
+    symbols: dashboardState.orderJournalSymbols,
+    lastReconciledAt: dashboardState.orderJournal.lastReconciledAt || "",
+    lastSource: dashboardState.orderJournal.lastSource || "",
+  };
+  dashboardState.ordersLoadedOnce = true;
+  if (!dashboardState.selectedOrderKey && latest) {
+    dashboardState.selectedOrderKey = getOrderKey(latest);
+  }
+  if (!dashboardState.selectedOrderSymbol && symbols[0]?.symbol) {
+    dashboardState.selectedOrderSymbol = symbols[0].symbol;
+  }
+
+  if ($("metric-order-count")) $("metric-order-count").textContent = String(totalCount);
+  if ($("order-summary-count")) $("order-summary-count").textContent = String(totalCount);
+  if ($("order-summary-working")) $("order-summary-working").textContent = String(workingCount);
+  if ($("order-summary-filled")) $("order-summary-filled").textContent = String(filledCount);
+  if ($("order-summary-risk")) $("order-summary-risk").textContent = String(riskCount);
+  if ($("order-summary-rate")) $("order-summary-rate").textContent = totalCount ? formatPercentValue(successRate) : "--";
+  if ($("order-summary-source")) $("order-summary-source").textContent = source;
+  if ($("order-summary-journal-source")) $("order-summary-journal-source").textContent = dashboardState.orderJournal.lastSource || "--";
+  if ($("order-summary-reconciled")) $("order-summary-reconciled").textContent = dashboardState.orderJournal.lastReconciledAt ? formatOrderTime(dashboardState.orderJournal.lastReconciledAt) : "--";
+
+  if ($("orderSummaryInsight")) {
+    $("orderSummaryInsight").innerHTML = `<b>订单页已切到稳态简化视图</b><span>最近 ${totalCount} 笔订单仍已加载，成交 ${filledCount} 笔，工作中 ${workingCount} 笔。${error?.message ? ` 原主渲染异常：${escapeHtml(String(error.message))}。` : ""}</span>`;
+  }
+  if ($("orderGlobalSummary")) {
+    $("orderGlobalSummary").className = "order-global-summary";
+    $("orderGlobalSummary").innerHTML = `
+      <div class="order-global-summary-head">
+        <div>
+          <span class="order-global-summary-eyebrow">组合订单收益总览</span>
+          <strong class="tone-${netResult > 0 ? "positive" : netResult < 0 ? "negative" : "muted"}">${formatSignedMoney(netResult)} USDT</strong>
+          <small>简化稳态视图 · 避免单笔异常把整页拖空</small>
+        </div>
+      </div>
+      <div class="order-global-summary-hero-grid">
+        <div class="order-global-summary-hero-card"><span>已实现</span><strong class="tone-${realized > 0 ? "positive" : realized < 0 ? "negative" : "muted"}">${formatSignedMoney(realized)} USDT</strong><small>成交回报</small></div>
+        <div class="order-global-summary-hero-card"><span>手续费</span><strong class="tone-${totalFees > 0 ? "positive" : totalFees < 0 ? "negative" : "muted"}">${formatSignedMoney(totalFees)} USDT</strong><small>累计成交成本</small></div>
+        <div class="order-global-summary-hero-card"><span>净结果</span><strong class="tone-${netResult > 0 ? "positive" : netResult < 0 ? "negative" : "muted"}">${formatSignedMoney(netResult)} USDT</strong><small>已实现 + 手续费</small></div>
+      </div>
+    `;
+  }
+  if ($("orderSymbolOverview")) {
+    $("orderSymbolOverview").className = "order-symbol-overview";
+    $("orderSymbolOverview").innerHTML = symbols.length
+      ? symbols.map((item) => `
+        <article class="order-symbol-card ${item.symbol === dashboardState.selectedOrderSymbol ? "active" : ""}">
+          <div class="order-symbol-head">
+            <div><strong>${escapeHtml(item.symbol)}</strong><small>${item.count} 笔订单</small></div>
+          </div>
+          <div class="order-symbol-metrics">
+            <div><b>净结果</b><span class="tone-${item.pnl > 0 ? "positive" : item.pnl < 0 ? "negative" : "muted"}">${formatSignedMoney(item.pnl)} USDT</span></div>
+            <div><b>订单数量</b><span>${item.count}</span></div>
+          </div>
+        </article>
+      `).join("")
+      : "暂无可展示的币种摘要";
+  }
+  if ($("orderTerminalFocus")) {
+    $("orderTerminalFocus").className = "order-terminal-focus";
+    $("orderTerminalFocus").innerHTML = latest
+      ? `<div class="order-terminal-focus-head"><div><span class="order-terminal-focus-eyebrow">当前聚焦订单流</span><strong>${escapeHtml(latest.instId || "--")}</strong><small>最近成交/更新 ${escapeHtml(formatOrderTime(latest.uTime || latest.cTime || latest.fillTime))}</small></div></div>`
+      : "暂无聚焦订单";
+  }
+  if ($("orderTimelineBoard")) {
+    $("orderTimelineBoard").className = "order-timeline-board";
+    $("orderTimelineBoard").innerHTML = `<div class="order-timeline-head"><div><span class="order-timeline-eyebrow">组合收益拆分时间线</span><strong>${formatSignedMoney(netResult)} USDT</strong><small>当前已切到稳态简化视图，时间线稍后会自动恢复。</small></div></div>`;
+  }
+  if ($("orderTerminalToolbar")) {
+    $("orderTerminalToolbar").className = "order-terminal-toolbar";
+    $("orderTerminalToolbar").innerHTML = `<div class="order-terminal-toolbar-main"><div class="order-terminal-toolbar-copy"><span class="order-terminal-toolbar-eyebrow">订单流控制台</span><strong>${escapeHtml(dashboardState.selectedOrderSymbol || symbols[0]?.symbol || "--")}</strong><small>简化稳态视图 · ${totalCount} 笔订单</small></div></div>`;
+  }
+  if ($("recentOrders")) {
+    $("recentOrders").className = "orders-feed";
+    $("recentOrders").innerHTML = allOrders.length
+      ? `<div class="orders-group-list"><section class="orders-group-section active"><div class="orders-group-head"><div class="orders-group-head-main"><div class="orders-group-title-line"><strong>最近订单</strong><span class="order-state-pill tone-done">${totalCount} 笔</span></div><span class="orders-group-subline">${escapeHtml(dashboardState.selectedOrderSymbol || symbols[0]?.symbol || "--")}</span></div></div><div class="orders-group-cards">${allOrders.slice(0, 12).map((order) => `
+          <button type="button" class="order-card compact ${String(order?.side || "").toLowerCase() === "sell" ? "down" : "up"}" data-order-key="${escapeHtml(getOrderKey(order))}" data-order-symbol="${escapeHtml(String(order?.instId || "--").split("-")[0] || "--")}">
+            <div class="order-card-head">
+              <div><span class="order-card-inst">${escapeHtml(order?.instId || "--")}</span><span class="order-card-side">${escapeHtml(getOrderSideLabel(order))}</span></div>
+              <span class="order-state-pill ${escapeHtml(getOrderTone(order?.state || ""))}">${escapeHtml(getOrderStateLabel(order?.state || ""))}</span>
+            </div>
+            <div class="order-card-meta">
+              <div><b>委托</b><span>${escapeHtml(order?.ordType === "market" ? "市价" : formatOrderValue(order?.px))}</span></div>
+              <div><b>数量</b><span>${escapeHtml(formatOrderValue(order?.sz))}</span></div>
+              <div><b>时间</b><span>${escapeHtml(formatOrderTime(order?.uTime || order?.cTime || order?.fillTime))}</span></div>
+            </div>
+          </button>
+        `).join("")}</div></section></div>`
+      : '<div class="empty">暂无订单数据</div>';
+  }
+  renderOrderDetail(latest || null, dashboardState.orderFeedMeta);
+}
+
 function rerenderSelectedOrderDetail() {
   if (!dashboardState.ordersLoadedOnce || !dashboardState.recentOrdersAll?.length) return;
   const selectedOrder = dashboardState.recentOrdersAll.find((item) => getOrderKey(item) === dashboardState.selectedOrderKey)
@@ -5637,6 +5852,9 @@ function renderAutomationState(state) {
     dashboardState.orderJournal = mergedState.executionJournal;
     dashboardState.orderJournalSymbols = Array.isArray(mergedState.executionJournal.symbols) ? mergedState.executionJournal.symbols : [];
   }
+  if (!dashboardState.recentOrdersAll?.length) {
+    hydrateOrdersFromKnownSources();
+  }
   renderResearchState(sanitizedState?.research || {});
   renderAnalysisState(sanitizedState?.analysis || {}, sanitizedState);
   const running = isAutomationActuallyRunning(sanitizedState);
@@ -6044,7 +6262,12 @@ function applyAccountSummary(account) {
 }
 
 function applyRecentOrders(data) {
-  renderOrderFeed(data);
+  try {
+    renderOrderFeed(data);
+  } catch (error) {
+    console.error("applyRecentOrders failed, falling back to stable renderer", error, data);
+    renderOrderFeedFallback(data, error);
+  }
 }
 
 function prependRecentOrder(order) {
@@ -6101,8 +6324,22 @@ async function refreshSnapshot() {
 
 async function refreshOrders() {
   return runSingleFlight("orders", async () => {
-    const data = await request("/api/orders/recent?limit=80");
-    applyRecentOrders(data);
+    try {
+      const data = await request("/api/orders/recent?limit=80");
+      if (!data?.orders?.length && getKnownOrderFeedCandidates().length) {
+        console.warn("refreshOrders empty response -> keep known order feed");
+        hydrateOrdersFromKnownSources();
+        return data;
+      }
+      applyRecentOrders(data);
+      return data;
+    } catch (error) {
+      if (hydrateOrdersFromKnownSources()) {
+        console.warn("refreshOrders fallback -> known sources", error);
+        return null;
+      }
+      throw error;
+    }
   });
 }
 
@@ -6227,6 +6464,7 @@ async function boot() {
   setPendingEnvironmentUi();
   restoreServerBootstrap();
   restoreDashboardBootCache();
+  hydrateOrdersFromKnownSources();
 
   const healthPromise = (async () => {
     try {
@@ -6652,6 +6890,7 @@ async function boot() {
       rememberBootError(result.reason);
     }
   });
+  hydrateOrdersFromKnownSources();
   refreshOrders().catch(() => {});
   if (bootErrors.length) {
     const summary = bootErrors[0];
