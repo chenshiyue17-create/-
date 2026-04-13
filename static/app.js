@@ -6175,16 +6175,11 @@ async function boot() {
     if (!bootErrors.includes(err.message)) bootErrors.push(err.message);
   };
 
-  const configResults = await Promise.allSettled([
+  const configPromises = [
     loadSavedConfig(),
     loadAutomationConfig(),
     loadMinerConfig(),
-  ]);
-  configResults.forEach((result) => {
-    if (result.status === "rejected") {
-      rememberBootError(result.reason);
-    }
-  });
+  ];
 
   $("envPreset").addEventListener("change", () => {
     applyEnvironmentPreset($("envPreset").value);
@@ -6639,14 +6634,15 @@ async function boot() {
   renderRailStrategyControls();
   renderMainstreamBoard();
   renderMarketChart();
-  const initialRefreshResults = await Promise.allSettled([
+  const initialHydrationResults = await Promise.allSettled([
+    ...configPromises,
     refreshDeskState(),
     refreshAutomationState(),
     refreshOrders(),
     refreshMarket(),
     refreshMinerOverview(),
   ]);
-  initialRefreshResults.forEach((result) => {
+  initialHydrationResults.forEach((result) => {
     if (result.status === "rejected") {
       rememberBootError(result.reason);
     }
