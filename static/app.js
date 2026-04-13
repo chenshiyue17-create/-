@@ -5940,6 +5940,9 @@ async function refreshAutomationState() {
       }
     }
     renderAutomationState(state || {});
+    if (state?.executionJournal?.orders?.length) {
+      applyRecentOrders(buildOrderFeedFromExecutionJournal(state.executionJournal));
+    }
     dashboardState.automationStateMeta = { source, error: "" };
     if (shouldAutoAnalyze(state || {})) {
       scheduleAutoAnalysis({ immediate: true });
