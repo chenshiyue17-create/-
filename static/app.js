@@ -146,17 +146,11 @@ const WORKSPACE_VIEWS = {
     chip: "Market",
     description: "主流币价格、K 线和行情连通状态。",
   },
-  miner: {
-    label: "矿机看板",
-    chip: "Miner",
-    description: "只看这台 Mac 的本机挖矿控制、进度和收益解释。",
-  },
 };
 
 let automationPollTimer = null;
 let liveFeedRestartTimer = null;
 let snapshotPollTimer = null;
-let minerPollTimer = null;
 let orderPollTimer = null;
 let autoAnalysisDebounceTimer = null;
 let autoAnalysisInFlight = false;
@@ -2026,11 +2020,6 @@ function renderDeskOverview() {
   const account = dashboardState.account || {};
   const summary = account.summary || {};
   const automation = dashboardState.automation || {};
-  const miner = dashboardState.miner || {};
-  const minerConfig = miner.config || {};
-  const minerNetwork = miner.network || {};
-  const minerProgress = miner.progress || {};
-  const minerFees = minerNetwork.fees || {};
   const serverEquityDisplay = automation.equityDisplay || account.equityDisplay || {};
   const serverDisplayTotalEq = Number(serverEquityDisplay.displayTotalEq || 0);
   const serverStartEq = Number(serverEquityDisplay.sessionStartEq || 0);
@@ -2063,13 +2052,10 @@ function renderDeskOverview() {
   const dockPnlCaption = $("dock-pnl-caption");
   const dockNetCaption = $("dock-net-caption");
   const dockPnlSub = $("dock-pnl-sub");
-  const minerDailyUsd = Number(minerProgress.dailyUsd || 0);
   const railBalanceMain = $("rail-balance-main");
   const railBalanceSub = $("rail-balance-sub");
   const railBalanceTarget = $("rail-balance-target");
   const railBalanceProgress = $("rail-balance-progress");
-  const railMinerMain = $("rail-miner-main");
-  const railMinerSub = $("rail-miner-sub");
   const balanceBreakdown = summary.displayBreakdown
     || (fundingTotalEq > 0
       ? `资金账户 ${formatMoney(fundingTotalEq)} USDT · 交易账户 ${formatMoney(tradingTotalEq)} USDT`
@@ -2255,18 +2241,6 @@ function renderDeskOverview() {
     }
   }
 
-  const blockHeight = minerNetwork.tipHeight || "--";
-  const fastFee = minerFees.fastestFee;
-  const minerMode = MINER_MODE_META[minerConfig.mode]?.label || "--";
-  $("desk-block-height").textContent = blockHeight;
-  $("desk-block-height-sub").textContent =
-    Number.isFinite(Number(fastFee)) ? `最快确认 ${fastFee} sat/vB` : "等待 BTC 网络数据";
-  $("desk-miner-route").textContent = minerMode;
-  $("desk-miner-route-sub").textContent =
-    minerMode === "--"
-      ? "等待矿机概览"
-      : `${formatMoney(minerDailyUsd || 0)} USDT/天 · ${minerProgress.hashrateText || "0 H/s"}`;
-
   if (railBalanceMain) {
     railBalanceMain.textContent = formatMoney(displayTotalEq || 0);
   }
@@ -2288,12 +2262,6 @@ function renderDeskOverview() {
     railBalanceProgress.textContent = balanceTargetEq > 0
       ? `进度 ${formatPercentValue(balanceTargetProgressPct)}`
       : "进度 0%";
-  }
-  if (railMinerMain) {
-    railMinerMain.textContent = formatMoney(minerDailyUsd || 0);
-  }
-  if (railMinerSub) {
-    railMinerSub.textContent = "USDT / 天";
   }
 
   const displayCurve = Array.isArray(automation.equityCurve) && automation.equityCurve.length
@@ -6030,7 +5998,6 @@ async function refreshDeskState() {
     const data = await request("/api/focus-snapshot", { timeoutMs: 30000 });
     if (data.account) applyAccountSummary(data.account);
     if (data.automationState) renderAutomationState(data.automationState);
-    if (data.minerOverview) renderMinerOverview(data.minerOverview);
     return data;
   });
 }
@@ -6134,16 +6101,6 @@ function syncOrderPolling() {
   }, 3000);
 }
 
-function startMinerPolling() {
-  if (minerPollTimer) {
-    clearInterval(minerPollTimer);
-  }
-  const seconds = Math.max(1, Number($("minerRefreshSeconds").value || 20));
-  minerPollTimer = setInterval(() => {
-    refreshMinerOverview().catch(() => {});
-  }, seconds * 1000);
-}
-
 async function boot() {
   let initialView = "focus";
   try {
@@ -6178,7 +6135,6 @@ async function boot() {
   const configPromises = [
     loadSavedConfig(),
     loadAutomationConfig(),
-    loadMinerConfig(),
   ];
 
   $("envPreset").addEventListener("change", () => {
@@ -6418,79 +6374,6 @@ async function boot() {
     }
   });
 
-  $("save-miner-config").addEventListener("click", async () => {
-    try {
-      await saveMinerConfig();
-    } catch (err) {
-      setMinerMessage(err.message, "err");
-    }
-  });
-
-  $("refresh-miner").addEventListener("click", async () => {
-    try {
-      await refreshMinerOverview();
-      setMinerMessage("矿机概览已刷新。", "ok");
-    } catch (err) {
-      setMinerMessage(err.message, "err");
-    }
-  });
-
-  $("miner-mac-start").addEventListener("click", async () => {
-    try {
-      await startMacLotto();
-    } catch (err) {
-      setMinerMessage(err.message, "err");
-    }
-  });
-
-  $("miner-mac-stop").addEventListener("click", async () => {
-    try {
-      await stopMacLotto();
-    } catch (err) {
-      setMinerMessage(err.message, "err");
-    }
-  });
-
-  if ($("miner-identify")) {
-    $("miner-identify").addEventListener("click", async () => {
-      try {
-        await runBitaxeAction("identify");
-      } catch (err) {
-        setMinerMessage(err.message, "err");
-      }
-    });
-  }
-
-  if ($("miner-pause")) {
-    $("miner-pause").addEventListener("click", async () => {
-      try {
-        await runBitaxeAction("pause");
-      } catch (err) {
-        setMinerMessage(err.message, "err");
-      }
-    });
-  }
-
-  if ($("miner-resume")) {
-    $("miner-resume").addEventListener("click", async () => {
-      try {
-        await runBitaxeAction("resume");
-      } catch (err) {
-        setMinerMessage(err.message, "err");
-      }
-    });
-  }
-
-  if ($("miner-restart")) {
-    $("miner-restart").addEventListener("click", async () => {
-      try {
-        await runBitaxeAction("restart");
-      } catch (err) {
-        setMinerMessage(err.message, "err");
-      }
-    });
-  }
-
   $("run-automation-once").addEventListener("click", async () => {
     try {
       await runAutomationOnce();
@@ -6627,7 +6510,6 @@ async function boot() {
 
   startAutomationPolling();
   startSnapshotPolling();
-  startMinerPolling();
   syncOrderPolling();
   updateQuickState();
   renderDeskOverview();
@@ -6640,7 +6522,6 @@ async function boot() {
     refreshAutomationState(),
     refreshOrders(),
     refreshMarket(),
-    refreshMinerOverview(),
   ]);
   initialHydrationResults.forEach((result) => {
     if (result.status === "rejected") {
@@ -6651,7 +6532,6 @@ async function boot() {
     const summary = bootErrors[0];
     setMessage(summary, "err");
     setAutomationMessage(summary, "err");
-    setMinerMessage(summary, "err");
   }
   scheduleAutoAnalysis({ immediate: true, force: true });
   await startLiveFeeds().catch((err) => {
@@ -6660,7 +6540,6 @@ async function boot() {
   window.addEventListener("beforeunload", () => {
     if (automationPollTimer) clearInterval(automationPollTimer);
     if (snapshotPollTimer) clearInterval(snapshotPollTimer);
-    if (minerPollTimer) clearInterval(minerPollTimer);
     if (orderPollTimer) clearInterval(orderPollTimer);
     if (autoAnalysisDebounceTimer) clearTimeout(autoAnalysisDebounceTimer);
     clearLiveFeedTimers();

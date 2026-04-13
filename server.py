@@ -13227,6 +13227,9 @@ class AppHandler(BaseHTTPRequestHandler):
         query = urllib.parse.parse_qs(parsed.query)
         if not enforce_gateway_auth(self, path):
             return
+        if path.startswith("/api/miner/"):
+            error_response(self, "矿机功能已移除", status=410)
+            return
         config = CONFIG.current()
         live_only = prefer_live_execution_state(config)
 
@@ -13243,7 +13246,7 @@ class AppHandler(BaseHTTPRequestHandler):
                                 remote_automation,
                                 CONFIG.current(),
                             )
-                        payload["minerOverview"] = miner_focus_overview(MINER_CONFIG.current())
+                        payload.pop("minerOverview", None)
                     payload["executionMode"] = "remote"
                     payload["remoteGatewayUrl"] = remote_gateway_url(config)
                     json_response(self, payload, status=response.status_code)
@@ -13554,8 +13557,6 @@ class AppHandler(BaseHTTPRequestHandler):
             }
 
             valid, message = validate_config(config)
-            miner_config = MINER_CONFIG.current()
-
             def load_account() -> dict[str, Any]:
                 if not valid:
                     raise RuntimeError(message)
@@ -13575,14 +13576,10 @@ class AppHandler(BaseHTTPRequestHandler):
                     payload["accountWarning"] = f"账户快照沿用缓存: {error_text}"
                 return data
 
-            def load_miner() -> dict[str, Any]:
-                return miner_focus_overview(miner_config)
-
             jobs = {
                 "account": load_account,
-                "minerOverview": load_miner,
             }
-            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
                 future_map = {
                     executor.submit(loader): key for key, loader in jobs.items()
                 }
@@ -13594,25 +13591,6 @@ class AppHandler(BaseHTTPRequestHandler):
                         payload[f"{key}Error"] = str(exc)
 
             json_response(self, payload)
-            return
-
-        if path == "/api/miner/config":
-            json_response(self, {"ok": True, "config": MINER_CONFIG.current()})
-            return
-
-        if path == "/api/miner/overview":
-            config = MINER_CONFIG.current()
-            public_client = build_public_client(CONFIG.current())
-            try:
-                overview = miner_overview(config, public_client)
-                update_miner_state(overview)
-                json_response(self, {"ok": True, "overview": overview})
-            except Exception as exc:
-                error_response(self, f"获取矿机概览失败: {exc}", status=502)
-            return
-
-        if path == "/api/miner/mac-lotto/state":
-            json_response(self, {"ok": True, "state": MAC_LOTTO.snapshot(MINER_CONFIG.current())})
             return
 
         if path == "/api/account/overview":
@@ -13806,6 +13784,9 @@ class AppHandler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         if not enforce_gateway_auth(self, path):
+            return
+        if path.startswith("/api/miner/"):
+            error_response(self, "矿机功能已移除", status=410)
             return
         config = CONFIG.current()
         config_state = CONFIG.snapshot()
@@ -14040,47 +14021,6 @@ class AppHandler(BaseHTTPRequestHandler):
                 error_response(self, f"导出策略失败: {exc}", status=502)
             return
 
-        if path == "/api/miner/config":
-            payload = read_json_request(self)
-            normalized = deep_merge(default_miner_config(), payload)
-            MINER_CONFIG.replace(normalized)
-            if MAC_LOTTO._should_autostart(normalized):
-                try:
-                    MAC_LOTTO.start(normalized)
-                except Exception as exc:
-                    append_miner_log("error", f"保存矿机配置后自动启动失败: {exc}")
-            json_response(self, {"ok": True, "config": normalized})
-            return
-
-        if path == "/api/miner/bitaxe-action":
-            payload = read_json_request(self)
-            host = str(payload.get("host", "")).strip()
-            action = str(payload.get("action", "")).strip()
-            if action not in ("identify", "restart", "pause", "resume"):
-                error_response(self, "Bitaxe 动作仅支持 identify / restart / pause / resume", status=400)
-                return
-            try:
-                result = post_bitaxe_action(host, action)
-                json_response(self, {"ok": True, "result": result})
-            except Exception as exc:
-                error_response(self, f"Bitaxe 动作失败: {exc}", status=502)
-            return
-
-        if path == "/api/miner/mac-lotto/start":
-            try:
-                config = MINER_CONFIG.update(lambda current: current.update({"autoStartMacLotto": True}))
-                state = MAC_LOTTO.start(config)
-                json_response(self, {"ok": True, "state": state})
-            except Exception as exc:
-                error_response(self, f"启动 Mac 乐透机失败: {exc}", status=400)
-            return
-
-        if path == "/api/miner/mac-lotto/stop":
-            config = MINER_CONFIG.update(lambda current: current.update({"autoStartMacLotto": False}))
-            state = MAC_LOTTO.stop(config)
-            json_response(self, {"ok": True, "state": state})
-            return
-
         if path == "/api/automation/start":
             try:
                 AUTOMATION_ENGINE.start(autostart=False)
@@ -14188,23 +14128,10 @@ def maybe_autostart() -> None:
         AUTOMATION_ENGINE._log("error", f"自动启动失败: {exc}")
 
 
-def maybe_autostart_miner() -> None:
-    config = MINER_CONFIG.current()
-    MAC_LOTTO.ensure_supervisor()
-    if not MAC_LOTTO._should_autostart(config):
-        return
-    try:
-        MAC_LOTTO.start(config)
-        append_miner_log("info", "Mac 本机乐透机已随桌面服务自动启动。")
-    except Exception as exc:
-        append_miner_log("error", f"Mac 本机乐透机自动启动失败: {exc}")
-
-
 def main() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     ensure_private_permissions(DATA_DIR, is_dir=True)
     maybe_autostart()
-    maybe_autostart_miner()
     startup_config = CONFIG.current()
     if should_run_local_okx_background_tasks(startup_config):
         ensure_focus_warmer()

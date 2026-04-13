@@ -19,7 +19,7 @@
             <div class="brand-kicker">Galaxy Control</div>
             <h1 class="brand-title"><span>10U</span><span>战神</span></h1>
             <div class="brand-subtitle">OKX Quant Desk</div>
-            <p>本地量化驾驶舱，把现货、永续、自动量化、风控与矿机监控压进同一张桌面。</p>
+            <p>本地量化驾驶舱，把现货、永续、自动量化与风控压进同一张桌面。</p>
           </div>
         </div>
         <nav class="nav">
@@ -28,7 +28,6 @@
           <button class="nav-link" type="button" data-view="trade">交易配置</button>
           <button class="nav-link" type="button" data-view="orders">订单终端</button>
           <button class="nav-link" type="button" data-view="market">行情监控</button>
-          <button class="nav-link" type="button" data-view="miner">矿机看板</button>
         </nav>
         <section class="rail-strategy-card">
           <div class="rail-strategy-head">
@@ -55,11 +54,6 @@
               <small id="rail-balance-target">目标 0.00 USDT</small>
               <small id="rail-balance-progress">进度 0%</small>
             </div>
-          </div>
-          <div class="rail-stat">
-            <span>矿机收益</span>
-            <strong id="rail-miner-main">0.00</strong>
-            <small id="rail-miner-sub">USDT / 天</small>
           </div>
         </div>
         <div class="status-strip">
@@ -213,16 +207,6 @@
               </div>
               <strong id="desk-mode">--</strong>
               <small id="desk-mode-sub">模拟 / 实盘 + 策略状态</small>
-            </div>
-            <div class="cockpit-card">
-              <span>BTC 区块高度</span>
-              <strong id="desk-block-height">--</strong>
-              <small id="desk-block-height-sub">等待 BTC 网络数据</small>
-            </div>
-            <div class="cockpit-card">
-              <span>乐透矿机链路</span>
-              <strong id="desk-miner-route">--</strong>
-              <small id="desk-miner-route-sub">等待矿机概览</small>
             </div>
           </div>
 
@@ -796,170 +780,6 @@
             <div class="chart-shell">
               <svg id="market-chart" viewBox="0 0 960 320" preserveAspectRatio="none" aria-label="实时K线图"></svg>
             </div>
-          </div>
-        </section>
-
-        <section class="panel panel-miner" id="miner" data-view-group="miner">
-          <div class="section-title">
-            <div>
-              <div class="eyebrow">Mac BTC Lotto</div>
-              <h2>这里只保留本机 Mac 乐透机</h2>
-            </div>
-            <div class="actions">
-              <button id="save-miner-config" class="btn btn-secondary" type="button">保存矿机配置</button>
-              <button id="refresh-miner" class="btn btn-primary" type="button">刷新矿机概览</button>
-            </div>
-          </div>
-
-          <div class="metrics miner-metrics">
-            <div class="metric">
-              <span>BTC 现价</span>
-              <strong id="miner-btc-price">--</strong>
-            </div>
-            <div class="metric">
-              <span>区块高度</span>
-              <strong id="miner-tip-height">--</strong>
-            </div>
-            <div class="metric">
-              <span>推荐费率</span>
-              <strong id="miner-fast-fee">--</strong>
-            </div>
-            <div class="metric">
-              <span>并发矿工</span>
-              <strong id="miner-worker-count">--</strong>
-            </div>
-            <div class="metric">
-              <span>本机算力</span>
-              <strong id="miner-cpu-hashrate">--</strong>
-            </div>
-            <div class="metric">
-              <span>理论日收益</span>
-              <strong id="miner-theory-yield">--</strong>
-            </div>
-            <div class="metric">
-              <span>单日命中概率</span>
-              <strong id="miner-theory-chance">--</strong>
-            </div>
-            <div class="metric">
-              <span>联网方案</span>
-              <strong id="miner-plan-count">--</strong>
-            </div>
-          </div>
-
-          <div class="miner-progress-surface">
-            <div class="miner-progress-copy">
-              <div class="block-head">
-                <div>
-                  <h3>本机挖矿进度和理论收获</h3>
-                  <p class="subtle">
-                    这不是稳定分润矿机，而是彩票型 solo miner。多数时候不会有稳定 share 收入，所以这里直接展示当前进度、理论日收益和理论中块周期。
-                  </p>
-                </div>
-                <span class="pill" id="miner-progress-badge">等待分析</span>
-              </div>
-              <div class="miner-progress-headline">
-                <strong id="miner-progress-headline">等待矿机概览</strong>
-                <span id="miner-progress-detail">会根据本机算力、全网难度和矿池状态解释现在到底有没有在推进。</span>
-              </div>
-            </div>
-            <div class="miner-progress-grid">
-              <div class="bot-meta">
-                <span>估算算力</span>
-                <strong id="miner-progress-hashrate">--</strong>
-                <small id="miner-progress-hashrate-sub">等待本机基准</small>
-              </div>
-              <div class="bot-meta">
-                <span>理论日收益</span>
-                <strong id="miner-progress-yield">--</strong>
-                <small id="miner-progress-yield-sub">等待网络数据</small>
-              </div>
-              <div class="bot-meta">
-                <span>理论中块时间</span>
-                <strong id="miner-progress-eta">--</strong>
-                <small id="miner-progress-eta-sub">等待全网难度</small>
-              </div>
-              <div class="bot-meta">
-                <span>当前进度</span>
-                <strong id="miner-progress-ratio">--</strong>
-                <small id="miner-progress-ratio-sub">等待最佳难度</small>
-              </div>
-              <div class="bot-meta">
-                <span>运行时长</span>
-                <strong id="miner-progress-uptime">--</strong>
-                <small id="miner-progress-uptime-sub">等待启动时间</small>
-              </div>
-              <div class="bot-meta">
-                <span>矿池反馈</span>
-                <strong id="miner-progress-pool">--</strong>
-                <small id="miner-progress-pool-sub">等待矿池统计</small>
-              </div>
-            </div>
-          </div>
-
-          <input id="minerMode" type="hidden" value="mac_lotto" />
-          <input id="minerPoolApiBase" type="hidden" value="" />
-          <input id="minerBitaxeHosts" type="hidden" value="" />
-          <input id="minerSerialPort" type="hidden" value="" />
-          <input id="minerBoardType" type="hidden" value="Mac 本机 CPU" />
-          <input id="minerBitaxeActionHost" type="hidden" value="" />
-
-          <div class="config-grid miner-config-grid">
-            <label>
-              <span>BTC 地址</span>
-              <input id="minerWallet" type="text" placeholder="bc1..." />
-            </label>
-            <label>
-              <span>Worker 名称</span>
-              <input id="minerWorkerName" type="text" placeholder="desk" />
-            </label>
-            <label>
-              <span>Pool Host</span>
-              <input id="minerPoolHost" type="text" placeholder="solo.ckpool.org" />
-            </label>
-            <label>
-              <span>Pool Port</span>
-              <input id="minerPoolPort" type="number" min="1" step="1" placeholder="3333" />
-            </label>
-            <label>
-              <span>并发矿工</span>
-              <input id="minerCpuWorkers" type="number" min="1" step="1" value="8" />
-            </label>
-            <label>
-              <span>刷新秒数</span>
-              <input id="minerRefreshSeconds" type="number" min="1" step="1" value="20" />
-            </label>
-            <label>
-              <span>Pool Password</span>
-              <input id="minerPoolPassword" type="text" placeholder="x" />
-            </label>
-          </div>
-
-          <div class="bot-status-bar miner-actions-bar">
-            <div class="bot-badge market-badge">
-              <span class="dot" id="miner-dot"></span>
-              <strong id="miner-status">等待刷新</strong>
-              <span id="miner-status-detail">将会展示 BTC 网络、本机 CPU 矿机状态和本轮理论收获解释</span>
-            </div>
-            <button id="miner-mac-start" class="btn btn-primary" type="button">启动 Mac 乐透机</button>
-            <button id="miner-mac-stop" class="btn btn-secondary" type="button">停止本机矿机</button>
-          </div>
-
-          <div class="table-block recent-block">
-            <div class="block-head">
-              <h3>Mac 乐透机日志</h3>
-            </div>
-            <div id="miner-mac-log" class="log-list empty">本机矿机尚未启动</div>
-          </div>
-
-          <div class="table-block recent-block">
-            <div class="block-head">
-              <h3>联网更多矿机方案</h3>
-            </div>
-            <div id="miner-options" class="miner-option-grid"></div>
-          </div>
-
-          <div class="notice" id="miner-message">
-            模式横幅已经移除。现在矿机页只保留本机聚合矿工、理论收益和外部扩展方案。
           </div>
         </section>
 
