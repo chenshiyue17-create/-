@@ -5264,7 +5264,7 @@ function renderOrderFeed(data) {
   };
   renderDeskOverview();
   if (dashboardState.automation?.analysis) {
-    renderAnalysis(dashboardState.automation.analysis);
+    renderAnalysisState(dashboardState.automation.analysis, dashboardState.automation || {});
   }
   const baseGroups = groupOrdersBySymbol(allOrders, dashboardState.orderFeedMeta);
   const stateFilter = dashboardState.orderStateFilter || "all";
