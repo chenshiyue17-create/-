@@ -12017,13 +12017,7 @@ class AutomationEngine:
             if trade_contracts > 0
             else Decimal("0")
         )
-        entry_projection = estimate_profit_loop_entry_net_pnl(
-            planned_contracts=trade_contracts,
-            last_price=last_price,
-            contract_value=contract_value,
-            predicted_net_pct=predicted_net_pct,
-        )
-        projected_entry_net_pnl = safe_decimal(entry_projection.get("projectedNetPnl"), "0")
+        projected_entry_net_pnl = Decimal("0")
         position_side = "flat"
         if pos_value > 0:
             position_side = "long"
@@ -12041,11 +12035,7 @@ class AutomationEngine:
             or (position_side == "short" and desired_side == "sell")
         )
         configured_target_count = max(1, len(build_execution_targets(automation)))
-        force_market_entry_by_mode = (
-            aggressive_scalp_mode
-            or int(automation.get("pollSeconds", 0) or 0) <= DIP_SWING_FORCE_MARKET_ENTRY_POLL_SECONDS
-            or configured_target_count >= DIP_SWING_FORCE_MARKET_ENTRY_TARGET_COUNT
-        )
+        force_market_entry_by_mode = False
         effective_cooldown_seconds = 0 if aggressive_scalp_mode else min(max(0, int(automation.get("cooldownSeconds", 0))), 2)
         pending_entry_orders = self._working_swap_orders(inst_id, side="buy", reduce_only=False)
         pending_entry_orders += self._working_swap_orders(inst_id, side="sell", reduce_only=False)
@@ -12085,6 +12075,24 @@ class AutomationEngine:
             execution_cost_floor_pct + safe_decimal(cost_snapshot.get("fundingDragPct"), "0"),
         )
         net_edge_pct = setup_edge_pct - estimated_cost_pct
+        effective_projected_net_pct = min(
+            max(predicted_net_pct, Decimal("0")),
+            max(net_edge_pct, Decimal("0")),
+        )
+        entry_projection = estimate_profit_loop_entry_net_pnl(
+            planned_contracts=trade_contracts,
+            last_price=last_price,
+            contract_value=contract_value,
+            predicted_net_pct=effective_projected_net_pct,
+        )
+        projected_entry_net_pnl = safe_decimal(entry_projection.get("projectedNetPnl"), "0")
+        force_market_entry_by_mode = (
+            (
+                int(automation.get("pollSeconds", 0) or 0) <= DIP_SWING_FORCE_MARKET_ENTRY_POLL_SECONDS
+                or configured_target_count >= DIP_SWING_FORCE_MARKET_ENTRY_TARGET_COUNT
+            )
+            and projected_entry_net_pnl >= (DIP_SWING_NET_TARGET_USDT * Decimal("2.5"))
+        )
         edge_cost_ratio = (setup_edge_pct / estimated_cost_pct) if estimated_cost_pct > 0 else Decimal("0")
         range_cost_ratio = (volatility_pct / estimated_cost_pct) if estimated_cost_pct > 0 else Decimal("0")
         atr_cost_ratio = (atr_pct / estimated_cost_pct) if estimated_cost_pct > 0 else Decimal("0")
@@ -12378,6 +12386,19 @@ class AutomationEngine:
             if pending_exit_orders:
                 self._cancel_swap_orders(client, inst_id, pending_exit_orders, "这单净利目标未到，撤掉旧平仓单继续持有", market_key=market_key)
             if allow_new_entries and holding_same_direction and trade_contracts > 0:
+                if projected_entry_net_pnl < DIP_SWING_NET_TARGET_USDT:
+                    self._set_market(
+                        market_key,
+                        {
+                            "lastMessage": (
+                                f"{ONLY_STRATEGY_LABEL}同向持仓先不加仓"
+                                f" · 预计这单净赚只有 {format_decimal(projected_entry_net_pnl, 2)}U"
+                                f" · 当前这单 {format_decimal(net_close_pnl, 2)}U"
+                                f" · {status_text}"
+                            ),
+                        },
+                    )
+                    return
                 if symbol_cycle_blocked:
                     self._set_market(
                         market_key,
@@ -12401,10 +12422,17 @@ class AutomationEngine:
                     or int(symbol_pressure.get("openCloseGap") or 0) >= DIP_SWING_MARKET_FALLBACK_OPEN_GAP
                     or int(symbol_pressure.get("consecutiveOpenStreak") or 0) >= DIP_SWING_MARKET_FALLBACK_OPEN_STREAK
                 )
+                prefer_ioc_entry = (
+                    aggressive_scalp_mode
+                    and not force_market_entry
+                    and projected_entry_net_pnl >= (DIP_SWING_NET_TARGET_USDT * Decimal("1.5"))
+                    and net_edge_pct > execution_cost_floor_pct
+                    and recent_taker_fill_pct < Decimal("85")
+                )
                 entry_mode_label = (
                     "市价直开"
                     if force_market_entry
-                    else ("最优限价IOC" if aggressive_scalp_mode else "maker-first")
+                    else ("最优限价IOC" if prefer_ioc_entry else "maker-first")
                 )
                 self._place_swap_order(
                     client,
@@ -12419,7 +12447,7 @@ class AutomationEngine:
                         f" · 并发挂单 {len(pending_entry_orders) + 1}/{pending_entry_capacity}"
                     ),
                     passive_entry=not force_market_entry,
-                    prefer_fill=aggressive_scalp_mode and not force_market_entry,
+                    prefer_fill=prefer_ioc_entry,
                     batchable=aggressive_scalp_mode,
                     market_key=market_key,
                     strategy_action="entry",
@@ -12547,10 +12575,17 @@ class AutomationEngine:
             or int(symbol_pressure.get("openCloseGap") or 0) >= DIP_SWING_MARKET_FALLBACK_OPEN_GAP
             or int(symbol_pressure.get("consecutiveOpenStreak") or 0) >= DIP_SWING_MARKET_FALLBACK_OPEN_STREAK
         )
+        prefer_ioc_entry = (
+            aggressive_scalp_mode
+            and not force_market_entry
+            and projected_entry_net_pnl >= (DIP_SWING_NET_TARGET_USDT * Decimal("1.5"))
+            and net_edge_pct > execution_cost_floor_pct
+            and recent_taker_fill_pct < Decimal("85")
+        )
         entry_mode_label = (
             "市价直开"
             if force_market_entry
-            else ("最优限价IOC" if aggressive_scalp_mode else "maker-first")
+            else ("最优限价IOC" if prefer_ioc_entry else "maker-first")
         )
         self._place_swap_order(
             client,
@@ -12565,7 +12600,7 @@ class AutomationEngine:
                 f" · 并发挂单 {len(pending_entry_orders) + 1}/{pending_entry_capacity}"
             ),
             passive_entry=not force_market_entry,
-            prefer_fill=aggressive_scalp_mode and not force_market_entry,
+            prefer_fill=prefer_ioc_entry,
             batchable=aggressive_scalp_mode,
             market_key=market_key,
             strategy_action="entry",
