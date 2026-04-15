@@ -17,6 +17,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
     private var serverOutputHandle: FileHandle?
     private var serverLogURL: URL?
     private var attachedToExistingServer = false
+    private var currentRuntimeSyncStamp = ""
+    private var currentServiceURL: URL?
 
     private struct PythonRuntime {
         let executable: String
@@ -28,6 +30,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
         let sourceURL: URL
         let runtimeURL: URL
         let label: String
+        let stamp: String
         let didSync: Bool
     }
 
@@ -45,9 +48,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         if !flag {
             window.makeKeyAndOrderFront(nil)
+            if let url = currentServiceURL ?? detectExistingServiceURL(expectedRuntimeSyncStamp: currentRuntimeSyncStamp.isEmpty ? nil : currentRuntimeSyncStamp) {
+                load(url)
+            }
         }
         NSApp.activate(ignoringOtherApps: true)
         return true
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        true
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -88,6 +98,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
 
         let config = WKWebViewConfiguration()
         config.defaultWebpagePreferences.allowsContentJavaScript = true
+        config.websiteDataStore = .nonPersistent()
         webView = WKWebView(frame: frame, configuration: config)
         webView.navigationDelegate = self
         webView.setValue(false, forKey: "drawsBackground")
@@ -107,6 +118,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
             preparedRuntimeSource = try prepareRuntimeAppSource(
                 bundleAppDir: resourceURL.appendingPathComponent("app", isDirectory: true)
             )
+            currentRuntimeSyncStamp = preparedRuntimeSource.stamp
         } catch {
             showPlaceholder(title: "Runtime Sync Failed", detail: error.localizedDescription)
             return
@@ -116,17 +128,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
             _ = terminateManagedEmbeddedServices(runtimeSource: preparedRuntimeSource)
         }
 
-        if let url = detectExistingServiceURL(), !preparedRuntimeSource.didSync {
+        if let url = detectExistingServiceURL(expectedRuntimeSyncStamp: preparedRuntimeSource.stamp), !preparedRuntimeSource.didSync {
             attachedToExistingServer = true
             load(url)
             return
+        }
+
+        if detectExistingServiceURL(expectedRuntimeSyncStamp: nil) != nil {
+            _ = terminateManagedEmbeddedServices(runtimeSource: preparedRuntimeSource)
         }
 
         launchEmbeddedServer(runtimeSource: preparedRuntimeSource)
 
         DispatchQueue.global(qos: .userInitiated).async {
             for _ in 0..<80 {
-                if let url = self.detectExistingServiceURL() {
+                if let url = self.detectExistingServiceURL(expectedRuntimeSyncStamp: preparedRuntimeSource.stamp) {
                     DispatchQueue.main.async {
                         self.load(url)
                     }
@@ -166,6 +182,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
 
         var env = ProcessInfo.processInfo.environment
         env["OKX_LOCAL_APP_DATA_DIR"] = dataDir.path
+        env["OKX_LOCAL_APP_RUNTIME_SYNC_STAMP"] = runtimeSource.stamp
+        env["OKX_LOCAL_APP_RUNTIME_SOURCE_LABEL"] = runtimeSource.label
         env["PYTHONUNBUFFERED"] = "1"
         if let home = pythonRuntime.home {
             env["PYTHONHOME"] = home
@@ -213,7 +231,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
             try sourceStamp.write(to: stampURL, atomically: true, encoding: .utf8)
         }
         let label = source == bundleAppDir ? "bundle" : source.path
-        return RuntimeAppSource(sourceURL: source, runtimeURL: runtimeDir, label: label, didSync: needsSync)
+        return RuntimeAppSource(sourceURL: source, runtimeURL: runtimeDir, label: label, stamp: sourceStamp, didSync: needsSync)
     }
 
     private func preferredWorkspaceAppSource() -> URL? {
@@ -426,12 +444,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
         }
     }
 
-    private func detectExistingServiceURL() -> URL? {
+    private func detectExistingServiceURL(expectedRuntimeSyncStamp: String?) -> URL? {
         for port in healthPorts {
             guard let url = URL(string: "http://127.0.0.1:\(port)\(healthPath)") else {
                 continue
             }
-            if isHealthy(url: url) {
+            if isHealthy(url: url, expectedRuntimeSyncStamp: expectedRuntimeSyncStamp) {
                 return URL(string: "http://127.0.0.1:\(port)/")
             }
         }
@@ -476,7 +494,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
         return looksHealthy
     }
 
-    private func isHealthy(url: URL) -> Bool {
+    private func requestJSON(url: URL, timeout: TimeInterval) -> [String: Any]? {
+        let semaphore = DispatchSemaphore(value: 0)
+        var payload: [String: Any]?
+        var request = URLRequest(url: url)
+        request.timeoutInterval = timeout
+
+        URLSession.shared.dataTask(with: request) { data, response, error in
+            defer { semaphore.signal() }
+            guard
+                error == nil,
+                let http = response as? HTTPURLResponse,
+                http.statusCode == 200,
+                let data,
+                let json = try? JSONSerialization.jsonObject(with: data),
+                let object = json as? [String: Any]
+            else {
+                return
+            }
+            payload = object
+        }.resume()
+
+        _ = semaphore.wait(timeout: .now() + timeout + 0.25)
+        return payload
+    }
+
+    private func isHealthy(url: URL, expectedRuntimeSyncStamp: String?) -> Bool {
         guard requestLooksHealthy(url: url, timeout: 0.8, bodyMustContain: "\"service\": \"okx-local-app\"") else {
             return false
         }
@@ -485,8 +528,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
             guard let compatibilityURL = URL(string: "http://127.0.0.1:\(url.port ?? 0)\(compatibilityPath)") else {
                 return false
             }
-            guard requestLooksHealthy(url: compatibilityURL, timeout: 1.5) else {
+            guard let payload = requestJSON(url: compatibilityURL, timeout: 1.5) else {
                 return false
+            }
+            if compatibilityPath == "/api/local-config",
+               let expectedRuntimeSyncStamp,
+               !expectedRuntimeSyncStamp.isEmpty {
+                let runtimeStamp = String(payload["runtimeSyncStamp"] as? String ?? "")
+                if runtimeStamp != expectedRuntimeSyncStamp {
+                    return false
+                }
             }
         }
 
@@ -494,8 +545,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
     }
 
     private func load(_ url: URL) {
+        currentServiceURL = url
+        var finalURL = url
+        if var components = URLComponents(url: url, resolvingAgainstBaseURL: false) {
+            var queryItems = components.queryItems ?? []
+            queryItems.removeAll { item in
+                item.name == "_runtimeStamp" || item.name == "_launchTs"
+            }
+            if !currentRuntimeSyncStamp.isEmpty {
+                queryItems.append(URLQueryItem(name: "_runtimeStamp", value: currentRuntimeSyncStamp))
+            }
+            queryItems.append(URLQueryItem(name: "_launchTs", value: String(Int(Date().timeIntervalSince1970 * 1000))))
+            components.queryItems = queryItems
+            if let rebuilt = components.url {
+                finalURL = rebuilt
+            }
+        }
         window.title = "\(appName) - \(url.host ?? "127.0.0.1"):\(url.port ?? 0)"
-        var request = URLRequest(url: url)
+        var request = URLRequest(url: finalURL)
         request.cachePolicy = .reloadIgnoringLocalCacheData
         request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
         webView.load(request)
