@@ -7429,8 +7429,6 @@ def evaluate_dip_swing_target_snapshot(
     if DIP_SWING_AGGRESSIVE_SCALP_MODE:
         symbol_cycle_block_reason = ""
         symbol_cycle_blocked = False
-        symbol_performance_blocked = False
-        symbol_taker_blocked = False
         symbol_pressure_blocked = False
     funding_drag_pct = max(Decimal("0"), funding_rate_pct) * Decimal("0.35")
     estimated_cost_pct = max(estimated_cost_pct, recent_execution_cost_floor_pct + funding_drag_pct)
@@ -8452,8 +8450,6 @@ def build_dip_swing_analysis(
     if aggressive_scalp_mode:
         symbol_cycle_blocked = False
         symbol_cycle_block_reason = ""
-        symbol_performance_blocked = False
-        symbol_taker_blocked = False
         symbol_pressure_blocked = False
         entry_vetoes = []
     predicted_move_pct = safe_decimal(loop_metrics.get("predictedMovePct"), "0")
@@ -8615,9 +8611,9 @@ def build_dip_swing_analysis(
         warnings.append(
             f"{selected_symbol} 近场净结果 {format_decimal(recent_symbol_net_pnl, 2)}U / 平仓 {recent_symbol_close_orders} 笔，先降权处理"
         )
-    if symbol_performance_blocked and not aggressive_scalp_mode:
+    if symbol_performance_blocked:
         warnings.append(f"{selected_symbol} 最近净亏偏大，已临时禁开新仓")
-    if symbol_taker_blocked and not aggressive_scalp_mode:
+    if symbol_taker_blocked:
         warnings.append(f"{selected_symbol} 近期 taker 占比偏高，已临时禁开新仓")
     if symbol_pressure_blocked and not aggressive_scalp_mode:
         warnings.append(f"{selected_symbol} 开平结构失衡，先等平仓闭环")
@@ -8663,10 +8659,23 @@ def build_dip_swing_analysis(
         blockers.append(
             f"预期净优势只有 {compact_metric(predicted_net_pct, '0.01')}%，低于开仓门槛 {compact_metric(required_predicted_net_pct, '0.01')}%"
         )
+    if position_side == "flat" and symbol_performance_blocked:
+        blockers.append(
+            f"{selected_symbol} 近场净亏 {format_decimal(recent_symbol_net_pnl, 2)}U，先暂停这只币"
+        )
+    if position_side == "flat" and symbol_taker_blocked:
+        blockers.append(
+            f"{selected_symbol} 近期 taker 占比 {compact_metric(recent_taker_fill_pct, '0.1')}%，先暂停这只币"
+        )
 
     allow_new_entries = True if aggressive_scalp_mode else (not blockers)
     if aggressive_scalp_mode and position_side == "flat":
-        allow_new_entries = projected_entry_net_pnl >= DIP_SWING_NET_TARGET_USDT
+        allow_new_entries = (
+            projected_entry_net_pnl >= DIP_SWING_NET_TARGET_USDT
+            and predicted_net_pct >= required_predicted_net_pct
+            and not symbol_performance_blocked
+            and not symbol_taker_blocked
+        )
     if blockers:
         decision = "skip"
         decision_label = "这单预计净利不够"
@@ -12165,8 +12174,6 @@ class AutomationEngine:
         if aggressive_scalp_mode:
             symbol_cycle_block_reason = ""
             symbol_cycle_blocked = False
-            symbol_performance_blocked = False
-            symbol_taker_blocked = False
         estimated_cost_pct = max(
             estimated_cost_pct,
             execution_cost_floor_pct + safe_decimal(cost_snapshot.get("fundingDragPct"), "0"),
@@ -12506,6 +12513,30 @@ class AutomationEngine:
                         },
                     )
                     return
+                if symbol_performance_blocked:
+                    self._set_market(
+                        market_key,
+                        {
+                            "lastMessage": (
+                                f"{ONLY_STRATEGY_LABEL}同向持仓先不加仓"
+                                f" · {inst_id} 近场净亏 {format_decimal(recent_net_pnl, 2)}U"
+                                f" · {status_text}"
+                            ),
+                        },
+                    )
+                    return
+                if symbol_taker_blocked:
+                    self._set_market(
+                        market_key,
+                        {
+                            "lastMessage": (
+                                f"{ONLY_STRATEGY_LABEL}同向持仓先不加仓"
+                                f" · {inst_id} taker 占比 {compact_metric(recent_taker_fill_pct, '0.1')}%"
+                                f" 偏高 · {status_text}"
+                            ),
+                        },
+                    )
+                    return
                 if symbol_cycle_blocked:
                     self._set_market(
                         market_key,
@@ -12591,6 +12622,28 @@ class AutomationEngine:
                     "lastMessage": (
                         f"{ONLY_STRATEGY_LABEL}预期净优势 {compact_metric(effective_projected_net_pct, '0.01')}%"
                         f" 低于开仓门槛 {compact_metric(required_predicted_net_pct, '0.01')}%，不开仓"
+                    )
+                },
+            )
+            return
+        if symbol_performance_blocked:
+            self._set_market(
+                market_key,
+                {
+                    "lastMessage": (
+                        f"{ONLY_STRATEGY_LABEL}{inst_id} 近场净亏 {format_decimal(recent_net_pnl, 2)}U"
+                        "，暂停这只币开仓"
+                    )
+                },
+            )
+            return
+        if symbol_taker_blocked:
+            self._set_market(
+                market_key,
+                {
+                    "lastMessage": (
+                        f"{ONLY_STRATEGY_LABEL}{inst_id} taker 占比 {compact_metric(recent_taker_fill_pct, '0.1')}%"
+                        " 偏高，暂停这只币开仓"
                     )
                 },
             )
