@@ -302,9 +302,37 @@ function normalizeOrderFeedPayload(payload = {}) {
 
 function getKnownOrderFeedCandidates() {
   const candidates = [];
-  if (dashboardState.recentOrdersAll?.length) {
+  if (dashboardState.runtimeSnapshot?.executionJournal?.orders?.length) {
     candidates.push({
       priority: 90,
+      feed: buildOrderFeedFromExecutionJournal(dashboardState.runtimeSnapshot.executionJournal),
+    });
+  }
+  if (dashboardState.serverBootstrap?.executionJournal?.orders?.length) {
+    candidates.push({
+      priority: 80,
+      feed: buildOrderFeedFromExecutionJournal(dashboardState.serverBootstrap.executionJournal),
+    });
+  }
+  if (dashboardState.bootCachePayload?.runtimeSnapshot?.executionJournal?.orders?.length) {
+    candidates.push({
+      priority: 70,
+      feed: buildOrderFeedFromExecutionJournal(dashboardState.bootCachePayload.runtimeSnapshot.executionJournal),
+    });
+  }
+  if (dashboardState.orderJournal?.orders?.length) {
+    candidates.push({
+      priority: 60,
+      feed: buildOrderFeedFromJournalSnapshot(
+        dashboardState.orderJournal,
+        dashboardState.orderFeedMeta?.source || "journal_memory",
+        dashboardState.orderFeedMeta?.stream || null,
+      ),
+    });
+  }
+  if (dashboardState.recentOrdersAll?.length) {
+    candidates.push({
+      priority: 50,
       feed: {
         orders: dashboardState.recentOrdersAll,
         journal: dashboardState.orderJournal?.summary || dashboardState.orderJournal || {},
@@ -314,34 +342,6 @@ function getKnownOrderFeedCandidates() {
         source: dashboardState.orderFeedMeta?.source || "memory",
         stream: dashboardState.orderFeedMeta?.stream || null,
       },
-    });
-  }
-  if (dashboardState.orderJournal?.orders?.length) {
-    candidates.push({
-      priority: 80,
-      feed: buildOrderFeedFromJournalSnapshot(
-        dashboardState.orderJournal,
-        dashboardState.orderFeedMeta?.source || "journal_memory",
-        dashboardState.orderFeedMeta?.stream || null,
-      ),
-    });
-  }
-  if (dashboardState.automation?.executionJournal?.orders?.length) {
-    candidates.push({
-      priority: 70,
-      feed: buildOrderFeedFromExecutionJournal(dashboardState.automation.executionJournal),
-    });
-  }
-  if (dashboardState.serverBootstrap?.executionJournal?.orders?.length) {
-    candidates.push({
-      priority: 60,
-      feed: buildOrderFeedFromExecutionJournal(dashboardState.serverBootstrap.executionJournal),
-    });
-  }
-  if (dashboardState.bootCachePayload?.orders?.orders?.length) {
-    candidates.push({
-      priority: 50,
-      feed: dashboardState.bootCachePayload.orders,
     });
   }
   return candidates
@@ -362,38 +362,37 @@ function hydrateOrdersFromKnownSources() {
 }
 
 function buildBootCachePayload() {
-  const automation = dashboardState.automation
+  const runtimeSnapshot = dashboardState.runtimeSnapshot
     ? {
-        ...dashboardState.automation,
-        logs: [],
+        ...(dashboardState.runtimeSnapshot || {}),
+        automationState: dashboardState.automation
+          ? { ...dashboardState.automation, logs: [] }
+          : (dashboardState.runtimeSnapshot.automationState || {}),
+        account: dashboardState.account
+          ? {
+              ...(dashboardState.runtimeSnapshot.account || {}),
+              summary: dashboardState.account.summary || {},
+              fundingSummary: dashboardState.account.fundingSummary || {},
+              balanceCount: dashboardState.account.balanceCount || 0,
+              positionCount: dashboardState.account.positionCount || 0,
+              equityDisplay: dashboardState.account.equityDisplay || null,
+            }
+          : (dashboardState.runtimeSnapshot.account || null),
+        executionJournal: dashboardState.orderJournal
+          ? {
+              orders: Array.isArray(dashboardState.recentOrdersAll) ? dashboardState.recentOrdersAll.slice(0, 80) : [],
+              summary: dashboardState.orderJournal.summary || dashboardState.orderJournal || {},
+              symbols: Array.isArray(dashboardState.orderJournalSymbols) ? dashboardState.orderJournalSymbols : [],
+              lastReconciledAt: dashboardState.orderJournal.lastReconciledAt || "",
+              lastSource: dashboardState.orderJournal.lastSource || "",
+            }
+          : (dashboardState.runtimeSnapshot.executionJournal || null),
       }
     : null;
-  const account = dashboardState.account
-    ? {
-        summary: dashboardState.account.summary || {},
-        fundingSummary: dashboardState.account.fundingSummary || {},
-        balanceCount: dashboardState.account.balanceCount || 0,
-        positionCount: dashboardState.account.positionCount || 0,
-        equityDisplay: dashboardState.account.equityDisplay || null,
-      }
-    : null;
-  const orders = dashboardState.orderJournal
-    ? {
-        orders: Array.isArray(dashboardState.recentOrdersAll) ? dashboardState.recentOrdersAll.slice(0, 80) : [],
-        journal: dashboardState.orderJournal.summary || dashboardState.orderJournal || {},
-        symbols: Array.isArray(dashboardState.orderJournalSymbols) ? dashboardState.orderJournalSymbols : [],
-        lastReconciledAt: dashboardState.orderJournal.lastReconciledAt || "",
-        lastSource: dashboardState.orderJournal.lastSource || "",
-        source: dashboardState.orderFeedMeta?.source || "boot_cache",
-        stream: dashboardState.orderFeedMeta?.stream || null,
-      }
-    : null;
-  if (!automation && !account && !orders) return null;
+  if (!runtimeSnapshot) return null;
   return {
     cachedAtMs: Date.now(),
-    automation,
-    account,
-    orders,
+    runtimeSnapshot,
   };
 }
 
@@ -419,14 +418,21 @@ function restoreDashboardBootCache() {
       window.localStorage.removeItem(BOOT_CACHE_KEY);
       return false;
     }
-    if (payload.account) {
-      applyAccountSummary(payload.account);
-    }
-    if (payload.automation) {
-      renderAutomationState(payload.automation);
-    }
-    if (payload.orders?.orders?.length) {
-      applyRecentOrders(payload.orders);
+    const legacyRuntimeSnapshot = payload.runtimeSnapshot || {
+      automationState: payload.automation || {},
+      account: payload.account || null,
+      executionJournal: payload.orders?.orders?.length
+        ? {
+            orders: payload.orders.orders || [],
+            summary: payload.orders.journal || {},
+            symbols: payload.orders.symbols || [],
+            lastReconciledAt: payload.orders.lastReconciledAt || "",
+            lastSource: payload.orders.lastSource || "",
+          }
+        : null,
+    };
+    if (legacyRuntimeSnapshot) {
+      applyRuntimeSnapshot(legacyRuntimeSnapshot);
     }
     lastBootCacheSerialized = raw;
     return true;
@@ -481,6 +487,25 @@ function applyRuntimeSnapshot(payload = {}) {
     applyRecentOrders(buildOrderFeedFromExecutionJournal(snapshot.executionJournal));
   }
   return snapshot;
+}
+
+function syncRuntimeSnapshotOrderFeed(feed = {}) {
+  const normalized = normalizeOrderFeedPayload(feed);
+  if (!dashboardState.runtimeSnapshot) {
+    dashboardState.runtimeSnapshot = normalizeRuntimeSnapshotPayload({});
+  }
+  const nextExecutionJournal = {
+    orders: normalized.orders || [],
+    summary: normalized.journal || {},
+    symbols: normalized.symbols || [],
+    lastReconciledAt: normalized.lastReconciledAt || "",
+    lastSource: normalized.lastSource || normalized.source || "",
+  };
+  dashboardState.runtimeSnapshot = {
+    ...dashboardState.runtimeSnapshot,
+    executionJournal: nextExecutionJournal,
+    timestamp: Date.now(),
+  };
 }
 
 function formatSignedMoney(value) {
@@ -6350,6 +6375,7 @@ function applyAccountSummary(account) {
 
 function applyRecentOrders(data) {
   const normalized = normalizeOrderFeedPayload(data);
+  syncRuntimeSnapshotOrderFeed(normalized);
   try {
     renderOrderFeed(normalized);
   } catch (error) {
@@ -6439,6 +6465,11 @@ async function refreshOrders() {
       applyRecentOrders(normalized);
       return normalized;
     } catch (error) {
+      if (dashboardState.runtimeSnapshot?.executionJournal?.orders?.length) {
+        applyRecentOrders(buildOrderFeedFromExecutionJournal(dashboardState.runtimeSnapshot.executionJournal));
+        console.warn("refreshOrders fallback -> runtime snapshot", error);
+        return null;
+      }
       if (hydrateOrdersFromKnownSources()) {
         console.warn("refreshOrders fallback -> known sources", error);
         return null;
