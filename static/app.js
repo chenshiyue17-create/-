@@ -284,6 +284,34 @@ function getCurrentRecentOrders() {
   return Array.isArray(dashboardState.recentOrdersAll) ? dashboardState.recentOrdersAll : [];
 }
 
+function getCurrentOrderFeedMeta() {
+  if (dashboardState.orderFeedMeta && typeof dashboardState.orderFeedMeta === "object") {
+    return dashboardState.orderFeedMeta;
+  }
+  const journal = getCurrentExecutionJournal();
+  return {
+    source: journal?.lastSource || "runtime_snapshot",
+    stream: null,
+    journal,
+    symbols: Array.isArray(journal?.symbols) ? journal.symbols : [],
+    lastReconciledAt: journal?.lastReconciledAt || "",
+    lastSource: journal?.lastSource || "",
+  };
+}
+
+function buildCurrentOrderFeedPayload() {
+  const meta = getCurrentOrderFeedMeta();
+  return {
+    orders: getCurrentRecentOrders(),
+    source: meta?.source || "runtime_snapshot",
+    stream: meta?.stream || null,
+    journal: meta?.journal || getCurrentExecutionJournal() || {},
+    symbols: meta?.symbols || [],
+    lastReconciledAt: meta?.lastReconciledAt || "",
+    lastSource: meta?.lastSource || meta?.source || "",
+  };
+}
+
 function normalizeOrderFeedPayload(payload = {}) {
   const source = payload?.source || payload?.lastSource || "rest";
   const stream = payload?.stream || null;
@@ -2386,16 +2414,10 @@ function deriveDeskModePresentation(automation = {}, modeText = "模拟盘") {
 
 function renderDeskOverview() {
   const runtimeSnapshot = getCurrentRuntimeSnapshot() || {};
-  const account = runtimeSnapshot.account && typeof runtimeSnapshot.account === "object"
-    ? runtimeSnapshot.account
-    : (dashboardState.account || {});
+  const account = getCurrentAccountPayload();
   const summary = account.summary || {};
-  const automation = runtimeSnapshot.automationState && typeof runtimeSnapshot.automationState === "object"
-    ? runtimeSnapshot.automationState
-    : (dashboardState.automation || {});
-  const executionJournal = runtimeSnapshot.executionJournal && typeof runtimeSnapshot.executionJournal === "object"
-    ? runtimeSnapshot.executionJournal
-    : (automation.executionJournal || dashboardState.orderJournal || {});
+  const automation = getCurrentAutomationState();
+  const executionJournal = getCurrentExecutionJournal();
   const serverEquityDisplay = account.equityDisplay || automation.equityDisplay || {};
   const serverDisplayTotalEq = Number(serverEquityDisplay.displayTotalEq || 0);
   const serverStartEq = Number(serverEquityDisplay.sessionStartEq || 0);
@@ -2443,7 +2465,7 @@ function renderDeskOverview() {
     ? serverUsesPaperEquity
     : journalUsesPaperEquity(
         executionJournal,
-        Array.isArray(executionJournal.orders) ? executionJournal.orders : (dashboardState.recentOrdersAll || [])
+        Array.isArray(executionJournal.orders) ? executionJournal.orders : getCurrentRecentOrders()
       );
   const sessionEquityMode = serverHasEquityDisplay ? serverUsesSessionEquity : currentEq > 0;
   const journalMetrics = getJournalSummaryMetrics(executionJournal);
@@ -3960,7 +3982,7 @@ function buildOrderLifecycleContext(order, meta = {}) {
 }
 
 function buildOrderPnlContext(order, meta = {}) {
-  const account = dashboardState.account || {};
+  const account = getCurrentAccountPayload();
   const fillPrice = toOrderNumber(order?.avgPx || order?.fillPx || order?.px);
   const filledSize = toOrderNumber(order?.accFillSz || order?.fillSz || order?.sz);
   const currentPrice = getOrderCurrentPrice(order, account);
@@ -4110,7 +4132,7 @@ function buildOrderNetPnlContext(order, pnl) {
 }
 
 function estimateOrderPnl(order, meta = {}) {
-  const account = dashboardState.account || {};
+  const account = getCurrentAccountPayload();
   const fillPrice = toOrderNumber(order?.avgPx || order?.fillPx || order?.px);
   const filledSize = toOrderNumber(order?.accFillSz || order?.fillSz || order?.sz);
   const currentPrice = getOrderCurrentPrice(order, account);
@@ -4684,22 +4706,14 @@ function renderOrderTerminalToolbar(groups, hasVisibleGroups = true) {
   target.querySelectorAll("[data-order-filter]").forEach((button) => {
     button.addEventListener("click", () => {
       dashboardState.orderStateFilter = button.dataset.orderFilter || "all";
-      renderOrderFeed({
-        orders: dashboardState.recentOrdersAll,
-        source: dashboardState.orderFeedMeta?.source,
-        stream: dashboardState.orderFeedMeta?.stream,
-      });
+      renderOrderFeed(buildCurrentOrderFeedPayload());
     });
   });
 
   target.querySelectorAll("[data-order-market-filter]").forEach((button) => {
     button.addEventListener("click", () => {
       dashboardState.orderMarketFilter = button.dataset.orderMarketFilter || "all";
-      renderOrderFeed({
-        orders: dashboardState.recentOrdersAll,
-        source: dashboardState.orderFeedMeta?.source,
-        stream: dashboardState.orderFeedMeta?.stream,
-      });
+      renderOrderFeed(buildCurrentOrderFeedPayload());
     });
   });
 
@@ -4707,11 +4721,7 @@ function renderOrderTerminalToolbar(groups, hasVisibleGroups = true) {
     dashboardState.selectedOrderSymbol = groups[0]?.symbol || "";
     dashboardState.orderStateFilter = "all";
     dashboardState.orderMarketFilter = "all";
-    renderOrderFeed({
-      orders: dashboardState.recentOrdersAll,
-      source: dashboardState.orderFeedMeta?.source,
-      stream: dashboardState.orderFeedMeta?.stream,
-    });
+    renderOrderFeed(buildCurrentOrderFeedPayload());
   });
 }
 
@@ -4730,7 +4740,8 @@ function renderOrderGlobalSummary(groups) {
   const estimated = groups.reduce((sum, group) => sum + Number(group.estimatedPnl || 0), 0);
   const activeSymbols = groups.length;
   const visibleOrders = groups.reduce((sum, group) => sum + Number(group.orderCount || 0), 0);
-  const journal = dashboardState.orderJournal || buildDerivedOrderJournal(groups.flatMap((group) => group.orders || []), dashboardState.orderFeedMeta?.source || "", dashboardState.orderJournalSymbols || []);
+  const currentMeta = getCurrentOrderFeedMeta();
+  const journal = getCurrentExecutionJournal() || buildDerivedOrderJournal(groups.flatMap((group) => group.orders || []), currentMeta?.source || "", currentMeta?.symbols || []);
   const execution = collectOrderExecutionStats(groups.flatMap((group) => group.orders || []));
   const filledCount = Number(journal.filledOrders ?? execution.filled ?? 0);
   const riskCount = Number((journal.canceledOrders ?? 0)) + Number((journal.rejectedOrders ?? 0));
@@ -4880,11 +4891,7 @@ function renderOrderSymbolOverview(groups, meta = {}) {
   target.querySelectorAll(".order-symbol-filter").forEach((button) => {
     button.addEventListener("click", () => {
       dashboardState.selectedOrderSymbol = button.dataset.orderSymbol || "";
-      renderOrderFeed({
-        orders: dashboardState.recentOrdersAll,
-        source: meta?.source,
-        stream: meta?.stream,
-      });
+      renderOrderFeed(buildCurrentOrderFeedPayload());
     });
   });
   target.querySelectorAll(".order-symbol-switch").forEach((button) => {
@@ -4892,11 +4899,7 @@ function renderOrderSymbolOverview(groups, meta = {}) {
       const symbol = button.dataset.orderSymbol || "";
       dashboardState.selectedOrderSymbol = symbol;
       syncOrderContextToSymbol(symbol);
-      renderOrderFeed({
-        orders: dashboardState.recentOrdersAll,
-        source: meta?.source,
-        stream: meta?.stream,
-      });
+      renderOrderFeed(buildCurrentOrderFeedPayload());
       setMessage(`订单终端已切到 ${symbol} 下单上下文。`, "ok");
     });
   });
@@ -5055,11 +5058,7 @@ function renderOrderTimelineBoard(groups, meta = {}) {
       if (group?.orders?.[0]) {
         dashboardState.selectedOrderKey = getOrderKey(group.orders[0]);
       }
-      renderOrderFeed({
-        orders: dashboardState.recentOrdersAll,
-        source: dashboardState.orderFeedMeta?.source,
-        stream: dashboardState.orderFeedMeta?.stream,
-      });
+      renderOrderFeed(buildCurrentOrderFeedPayload());
     });
   });
 }
@@ -5079,7 +5078,7 @@ function renderOrderFeedFallback(data, error) {
     .sort((a, b) => b.count - a.count)
     .slice(0, 8)
     .map((item) => item.symbol);
-  const { allOrders, orderJournal: journal, symbols: orderJournalSymbols } = applyDashboardOrderFeedState(data, {
+  const { allOrders, orderJournal: journal } = applyDashboardOrderFeedState(data, {
     fallbackSymbols: Array.isArray(data?.symbols) && data.symbols.length ? data.symbols : derivedSymbols,
   });
   const totalCount = allOrders.length;
@@ -5111,8 +5110,8 @@ function renderOrderFeedFallback(data, error) {
   if ($("order-summary-risk")) $("order-summary-risk").textContent = String(riskCount);
   if ($("order-summary-rate")) $("order-summary-rate").textContent = totalCount ? formatPercentValue(successRate) : "--";
   if ($("order-summary-source")) $("order-summary-source").textContent = source;
-  if ($("order-summary-journal-source")) $("order-summary-journal-source").textContent = dashboardState.orderJournal.lastSource || "--";
-  if ($("order-summary-reconciled")) $("order-summary-reconciled").textContent = dashboardState.orderJournal.lastReconciledAt ? formatOrderTime(dashboardState.orderJournal.lastReconciledAt) : "--";
+  if ($("order-summary-journal-source")) $("order-summary-journal-source").textContent = journal.lastSource || "--";
+  if ($("order-summary-reconciled")) $("order-summary-reconciled").textContent = journal.lastReconciledAt ? formatOrderTime(journal.lastReconciledAt) : "--";
 
   if ($("orderSummaryInsight")) {
     $("orderSummaryInsight").innerHTML = `<b>订单页已切到稳态简化视图</b><span>最近 ${totalCount} 笔订单仍已加载，成交 ${filledCount} 笔，工作中 ${workingCount} 笔。${error?.message ? ` 原主渲染异常：${escapeHtml(String(error.message))}。` : ""}</span>`;
@@ -5182,14 +5181,15 @@ function renderOrderFeedFallback(data, error) {
         `).join("")}</div></section></div>`
       : '<div class="empty">暂无订单数据</div>';
   }
-  renderOrderDetail(latest || null, dashboardState.orderFeedMeta);
+  renderOrderDetail(latest || null, getCurrentOrderFeedMeta());
 }
 
 function rerenderSelectedOrderDetail() {
-  if (!dashboardState.ordersLoadedOnce || !dashboardState.recentOrdersAll?.length) return;
-  const selectedOrder = dashboardState.recentOrdersAll.find((item) => getOrderKey(item) === dashboardState.selectedOrderKey)
-    || dashboardState.recentOrdersAll[0];
-  renderOrderDetail(selectedOrder, dashboardState.orderFeedMeta);
+  const recentOrders = getCurrentRecentOrders();
+  if (!dashboardState.ordersLoadedOnce || !recentOrders?.length) return;
+  const selectedOrder = recentOrders.find((item) => getOrderKey(item) === dashboardState.selectedOrderKey)
+    || recentOrders[0];
+  renderOrderDetail(selectedOrder, getCurrentOrderFeedMeta());
 }
 
 function renderOrderSummary(data, orders) {
@@ -5203,8 +5203,9 @@ function renderOrderSummary(data, orders) {
       ? "REST 聚合"
         : "REST";
   const stats = collectOrderExecutionStats(orders);
-  const journal = data?.journal || dashboardState.orderJournal || {};
-  const rawJournalSource = journal?.lastSource || data?.lastSource || dashboardState.orderFeedMeta?.lastSource || "";
+  const currentMeta = getCurrentOrderFeedMeta();
+  const journal = data?.journal || getCurrentExecutionJournal() || {};
+  const rawJournalSource = journal?.lastSource || data?.lastSource || currentMeta?.lastSource || "";
   const journalSource = rawJournalSource === "private_ws"
     ? "私有账本"
     : rawJournalSource === "paper_state_recovered"
@@ -5216,7 +5217,7 @@ function renderOrderSummary(data, orders) {
           : rawJournalSource
             ? rawJournalSource
             : "--";
-  const rawReconciledAt = journal?.lastReconciledAt || data?.lastReconciledAt || dashboardState.orderFeedMeta?.lastReconciledAt || "";
+  const rawReconciledAt = journal?.lastReconciledAt || data?.lastReconciledAt || currentMeta?.lastReconciledAt || "";
   const reconciledAt = rawReconciledAt ? formatOrderTime(rawReconciledAt) : "--";
   const totalCount = Number(journal.totalOrders ?? (((data?.orders || []).length) || 0));
   const workingCount = Number(journal.workingOrders ?? stats.working ?? 0);
@@ -5228,7 +5229,7 @@ function renderOrderSummary(data, orders) {
   const arbExitOrders = Number(journal.arbExitOrders ?? 0);
   const arbRollbackOrders = Number(journal.arbRollbackOrders ?? 0);
   const successRate = totalCount ? (filledCount / totalCount) * 100 : stats.successRate;
-  const insight = journal.insight || buildOrderJournalInsight(journal, dashboardState.recentOrdersAll || []);
+  const insight = journal.insight || buildOrderJournalInsight(journal, getCurrentRecentOrders() || []);
   $("order-summary-count").textContent = String(totalCount);
   $("order-summary-working").textContent = String(workingCount);
   $("order-summary-filled").textContent = String(filledCount);
@@ -5283,7 +5284,7 @@ function renderOrderDetail(order, meta = {}) {
   const eventTimeLabel = getOrderEventTimeLabel(order);
   const eventTimeText = getOrderEventTimeText(order);
   const eventTimeHtml = renderOrderTimeStackText(eventTimeText);
-  const relatedCloseOrder = findRelatedCloseOrder(order, dashboardState.recentOrdersAll || []);
+  const relatedCloseOrder = findRelatedCloseOrder(order, getCurrentRecentOrders() || []);
   const relatedCloseTimeText = relatedCloseOrder ? getOrderEventTimeText(relatedCloseOrder) : "--";
   const relatedCloseTimeHtml = renderOrderTimeStackText(relatedCloseTimeText);
   const relatedCloseRole = relatedCloseOrder ? getOrderLifecycleRole(relatedCloseOrder) : null;
@@ -5424,20 +5425,21 @@ function renderOrderFeed(data) {
   const { allOrders } = applyDashboardOrderFeedState(data, {
     fallbackSymbols: fallbackJournal.symbols || [],
   });
+  const currentMeta = getCurrentOrderFeedMeta();
   renderDeskOverview();
   if (dashboardState.automation?.analysis) {
     renderAnalysisState(dashboardState.automation.analysis, dashboardState.automation || {});
   }
-  const baseGroups = groupOrdersBySymbol(allOrders, dashboardState.orderFeedMeta);
+  const baseGroups = groupOrdersBySymbol(allOrders, currentMeta);
   const stateFilter = dashboardState.orderStateFilter || "all";
   const marketFilter = dashboardState.orderMarketFilter || "all";
   const visibleOrders = allOrders.filter(
     (order) => matchesOrderStateFilter(order, stateFilter) && matchesOrderMarketFilter(order, marketFilter)
   );
-  const groups = groupOrdersBySymbol(visibleOrders, dashboardState.orderFeedMeta);
+  const groups = groupOrdersBySymbol(visibleOrders, currentMeta);
   renderOrderSummary(data, allOrders);
   renderOrderGlobalSummary(groups);
-  renderOrderSymbolOverview(groups, dashboardState.orderFeedMeta);
+  renderOrderSymbolOverview(groups, currentMeta);
 
   if (!baseGroups.length) {
     target.className = "orders-feed empty";
@@ -5486,8 +5488,8 @@ function renderOrderFeed(data) {
   const selectedGroup = prioritizedGroups.find((group) => group.symbol === dashboardState.selectedOrderSymbol) || prioritizedGroups[0];
   const selectedGroupOrders = selectedGroup?.orders || [];
   dashboardState.recentOrders = selectedGroupOrders.slice(0, 8);
-  renderOrderTimelineBoard(prioritizedGroups, dashboardState.orderFeedMeta);
-  renderOrderTerminalFocus(selectedGroup, dashboardState.orderFeedMeta);
+  renderOrderTimelineBoard(prioritizedGroups, currentMeta);
+  renderOrderTerminalFocus(selectedGroup, currentMeta);
   renderOrderTerminalToolbar(baseGroups, true);
 
   const allVisibleOrders = prioritizedGroups.flatMap((group) => group.orders);
@@ -5627,7 +5629,7 @@ function renderOrderFeed(data) {
   });
 
   const selectedOrder = allVisibleOrders.find((item) => getOrderKey(item) === dashboardState.selectedOrderKey) || selectedGroupOrders[0] || allVisibleOrders[0] || allOrders[0];
-  renderOrderDetail(selectedOrder, dashboardState.orderFeedMeta);
+  renderOrderDetail(selectedOrder, currentMeta);
   $("metric-order-count").textContent = String(allOrders.length || 0);
   dashboardState.ordersLoadedOnce = true;
 }
@@ -5998,10 +6000,22 @@ function renderAutomationState(state, options = {}) {
     dashboardState.equityCurveCache = sanitizedState.equityCurve.slice();
   }
   if (mergedState?.executionJournal) {
-    dashboardState.orderJournal = mergedState.executionJournal;
-    dashboardState.orderJournalSymbols = Array.isArray(mergedState.executionJournal.symbols) ? mergedState.executionJournal.symbols : [];
+    const journalFeed = buildOrderFeedFromExecutionJournal(mergedState.executionJournal, {
+      source:
+        sanitizedState?.stateSource ||
+        mergedState.executionJournal.lastSource ||
+        getCurrentOrderFeedMeta()?.source ||
+        "runtime_snapshot",
+      stream: getCurrentOrderFeedMeta()?.stream || null,
+    });
+    if (syncSnapshot) {
+      syncRuntimeSnapshotOrderFeed(journalFeed);
+    }
+    applyDashboardOrderFeedState(journalFeed, {
+      fallbackSymbols: Array.isArray(mergedState.executionJournal.symbols) ? mergedState.executionJournal.symbols : [],
+    });
   }
-  if (!dashboardState.recentOrdersAll?.length) {
+  if (!getCurrentRecentOrders()?.length) {
     hydrateOrdersFromCurrentSnapshot();
   }
   renderResearchState(sanitizedState?.research || {});
@@ -6399,7 +6413,7 @@ function applyAccountOverview(account, options = {}) {
 function applyAccountSummary(account, options = {}) {
   const syncSnapshot = options.syncSnapshot !== false;
   dashboardState.account = {
-    ...(dashboardState.account || {}),
+    ...getCurrentAccountPayload(),
     ...account,
   };
   if (syncSnapshot) {
@@ -6432,7 +6446,7 @@ function applyRecentOrders(data, options = {}) {
 
 function prependRecentOrder(order) {
   if (!order || !order.instId) return;
-  const merged = [order, ...(dashboardState.recentOrdersAll || dashboardState.recentOrders || [])];
+  const merged = [order, ...(getCurrentRecentOrders() || dashboardState.recentOrders || [])];
   const deduped = [];
   const seen = new Set();
   for (const item of merged) {
@@ -6444,8 +6458,8 @@ function prependRecentOrder(order) {
   }
   applyRecentOrders({
     orders: deduped,
-    source: dashboardState.orderFeedMeta?.source || "local_echo",
-    stream: dashboardState.orderFeedMeta?.stream || null,
+    source: getCurrentOrderFeedMeta()?.source || "local_echo",
+    stream: getCurrentOrderFeedMeta()?.stream || null,
   });
 }
 
