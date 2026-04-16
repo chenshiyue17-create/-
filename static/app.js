@@ -469,13 +469,23 @@ function applyRuntimeSnapshot(payload = {}) {
   const snapshot = normalizeRuntimeSnapshotPayload(payload);
   dashboardState.runtimeSnapshot = snapshot;
   if (snapshot.account) {
-    applyAccountSummary(snapshot.account);
+    applyAccountSummary(snapshot.account, { syncSnapshot: false });
   }
   if (snapshot.automationState && Object.keys(snapshot.automationState).length) {
-    renderAutomationState(snapshot.automationState);
+    renderAutomationState(snapshot.automationState, { syncSnapshot: false });
   }
-  if (snapshot.executionJournal?.orders?.length) {
-    applyRecentOrders(buildOrderFeedFromExecutionJournal(snapshot.executionJournal));
+  if (snapshot.executionJournal) {
+    applyRecentOrders(
+      buildOrderFeedFromExecutionJournal(snapshot.executionJournal, {
+        source:
+          snapshot.stateSource ||
+          snapshot.executionJournal.lastSource ||
+          dashboardState.orderFeedMeta?.source ||
+          "runtime_snapshot",
+        stream: dashboardState.orderFeedMeta?.stream || null,
+      }),
+      { syncSnapshot: false },
+    );
   }
   return snapshot;
 }
@@ -495,6 +505,21 @@ function syncRuntimeSnapshotAccountSummary(account = {}) {
       balanceCount: account.balanceCount ?? currentAccount.balanceCount ?? 0,
       positionCount: account.positionCount ?? currentAccount.positionCount ?? 0,
       equityDisplay: account.equityDisplay || currentAccount.equityDisplay || null,
+    },
+    timestamp: Date.now(),
+  };
+}
+
+function syncRuntimeSnapshotAutomationState(state = {}) {
+  if (!dashboardState.runtimeSnapshot) {
+    dashboardState.runtimeSnapshot = normalizeRuntimeSnapshotPayload({});
+  }
+  const currentAutomation = dashboardState.runtimeSnapshot.automationState || {};
+  dashboardState.runtimeSnapshot = {
+    ...dashboardState.runtimeSnapshot,
+    automationState: {
+      ...currentAutomation,
+      ...(state || {}),
     },
     timestamp: Date.now(),
   };
@@ -535,6 +560,44 @@ function syncRuntimeSnapshotOrderFeed(feed = {}) {
     ...dashboardState.runtimeSnapshot,
     executionJournal: nextExecutionJournal,
     timestamp: Date.now(),
+  };
+}
+
+function applyDashboardOrderFeedState(data = {}, options = {}) {
+  const normalized = normalizeOrderFeedPayload(data);
+  const allOrders = Array.isArray(normalized.orders) ? normalized.orders : [];
+  const fallbackSymbols = Array.isArray(options.fallbackSymbols) ? options.fallbackSymbols : [];
+  const sourceJournal = normalized.journal || buildDerivedOrderJournal(
+    allOrders,
+    normalized.lastSource || normalized.source || "",
+    normalized.symbols || fallbackSymbols,
+  );
+  const symbols = Array.isArray(normalized.symbols) && normalized.symbols.length
+    ? normalized.symbols
+    : fallbackSymbols;
+
+  dashboardState.recentOrdersAll = allOrders;
+  dashboardState.orderJournal = {
+    ...sourceJournal,
+    orders: allOrders,
+    lastSource: normalized.lastSource || sourceJournal.lastSource || normalized.source || "",
+    lastReconciledAt: normalized.lastReconciledAt || sourceJournal.lastReconciledAt || "",
+  };
+  dashboardState.orderJournalSymbols = symbols;
+  dashboardState.orderFeedMeta = {
+    source: normalized.source || "rest",
+    stream: normalized.stream || null,
+    journal: dashboardState.orderJournal,
+    symbols,
+    lastReconciledAt: dashboardState.orderJournal.lastReconciledAt || "",
+    lastSource: dashboardState.orderJournal.lastSource || "",
+  };
+
+  return {
+    normalized,
+    allOrders,
+    orderJournal: dashboardState.orderJournal,
+    symbols,
   };
 }
 
@@ -5002,9 +5065,23 @@ function renderOrderTimelineBoard(groups, meta = {}) {
 }
 
 function renderOrderFeedFallback(data, error) {
-  const allOrders = Array.isArray(data?.orders) ? data.orders : [];
   const source = data?.source || "fallback";
-  const journal = data?.journal || buildDerivedOrderJournal(allOrders, data?.lastSource || source, data?.symbols || []);
+  const symbolMap = new Map();
+  const initialOrders = Array.isArray(data?.orders) ? data.orders : [];
+  initialOrders.forEach((order) => {
+    const symbol = String(order?.instId || "--").split("-")[0] || "--";
+    const current = symbolMap.get(symbol) || { symbol, count: 0, pnl: 0 };
+    current.count += 1;
+    current.pnl += toOrderNumber(order?.realizedPnl ?? order?.fillPnl ?? order?.pnl ?? 0) + toOrderNumber(order?.fillFee ?? order?.fee ?? 0);
+    symbolMap.set(symbol, current);
+  });
+  const derivedSymbols = Array.from(symbolMap.values())
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 8)
+    .map((item) => item.symbol);
+  const { allOrders, orderJournal: journal, symbols: orderJournalSymbols } = applyDashboardOrderFeedState(data, {
+    fallbackSymbols: Array.isArray(data?.symbols) && data.symbols.length ? data.symbols : derivedSymbols,
+  });
   const totalCount = allOrders.length;
   const filledCount = allOrders.filter((item) => String(item?.state || "") === "filled").length;
   const workingCount = allOrders.filter((item) => ["live", "effective", "partially_filled"].includes(String(item?.state || ""))).length;
@@ -5013,37 +5090,12 @@ function renderOrderFeedFallback(data, error) {
   const latest = allOrders
     .slice()
     .sort((a, b) => Number(b?.uTime || b?.cTime || 0) - Number(a?.uTime || a?.cTime || 0))[0];
-  const symbolMap = new Map();
-  allOrders.forEach((order) => {
-    const symbol = String(order?.instId || "--").split("-")[0] || "--";
-    const current = symbolMap.get(symbol) || { symbol, count: 0, pnl: 0 };
-    current.count += 1;
-    current.pnl += toOrderNumber(order?.realizedPnl ?? order?.fillPnl ?? order?.pnl ?? 0) + toOrderNumber(order?.fillFee ?? order?.fee ?? 0);
-    symbolMap.set(symbol, current);
-  });
   const symbols = Array.from(symbolMap.values())
     .sort((a, b) => b.count - a.count)
     .slice(0, 8);
   const realized = Number(journal.realizedPnl ?? 0);
   const totalFees = Number(journal.totalFees ?? 0);
   const netResult = Number(journal.netPnl ?? (realized + totalFees));
-
-  dashboardState.recentOrdersAll = allOrders;
-  dashboardState.orderJournal = {
-    ...journal,
-    orders: allOrders,
-    lastSource: data?.lastSource || journal.lastSource || source,
-    lastReconciledAt: data?.lastReconciledAt || journal.lastReconciledAt || "",
-  };
-  dashboardState.orderJournalSymbols = Array.isArray(data?.symbols) ? data.symbols : symbols.map((item) => item.symbol);
-  dashboardState.orderFeedMeta = {
-    source,
-    stream: data?.stream || null,
-    journal: dashboardState.orderJournal,
-    symbols: dashboardState.orderJournalSymbols,
-    lastReconciledAt: dashboardState.orderJournal.lastReconciledAt || "",
-    lastSource: dashboardState.orderJournal.lastSource || "",
-  };
   dashboardState.ordersLoadedOnce = true;
   if (!dashboardState.selectedOrderKey && latest) {
     dashboardState.selectedOrderKey = getOrderKey(latest);
@@ -5363,26 +5415,15 @@ function renderOrderDetail(order, meta = {}) {
 }
 
 function renderOrderFeed(data) {
-  const allOrders = data?.orders || [];
   const target = $("recentOrders");
-  const fallbackJournal = buildDerivedOrderJournal(allOrders, data?.lastSource || data?.source || "", data?.symbols || []);
-  const sourceJournal = data?.journal || fallbackJournal;
-  dashboardState.recentOrdersAll = allOrders;
-  dashboardState.orderJournal = {
-    ...sourceJournal,
-    orders: allOrders,
-    lastSource: data?.lastSource || sourceJournal.lastSource || data?.source || "",
-    lastReconciledAt: data?.lastReconciledAt || sourceJournal.lastReconciledAt || "",
-  };
-  dashboardState.orderJournalSymbols = data?.symbols || fallbackJournal.symbols || [];
-  dashboardState.orderFeedMeta = {
-    source: data?.source || "rest",
-    stream: data?.stream || null,
-    journal: dashboardState.orderJournal,
-    symbols: data?.symbols || fallbackJournal.symbols || [],
-    lastReconciledAt: data?.lastReconciledAt || fallbackJournal.lastReconciledAt || "",
-    lastSource: data?.lastSource || fallbackJournal.lastSource || "",
-  };
+  const fallbackJournal = buildDerivedOrderJournal(
+    Array.isArray(data?.orders) ? data.orders : [],
+    data?.lastSource || data?.source || "",
+    data?.symbols || [],
+  );
+  const { allOrders } = applyDashboardOrderFeedState(data, {
+    fallbackSymbols: fallbackJournal.symbols || [],
+  });
   renderDeskOverview();
   if (dashboardState.automation?.analysis) {
     renderAnalysisState(dashboardState.automation.analysis, dashboardState.automation || {});
@@ -5942,11 +5983,15 @@ async function loadAutomationConfig() {
   renderDeskGuards();
 }
 
-function renderAutomationState(state) {
+function renderAutomationState(state, options = {}) {
+  const syncSnapshot = options.syncSnapshot !== false;
   const mergedState = mergeAutomationRuntimeState(getCurrentAutomationState(), state || {});
   const sanitizedState = sanitizeAutomationStateForSwingOnly(mergedState);
   if (isAutomationActuallyRunning(sanitizedState) && /待机|未启动|已停止|已手动停止/.test(String(sanitizedState.statusText || ""))) {
     sanitizedState.statusText = "运行中";
+  }
+  if (syncSnapshot) {
+    syncRuntimeSnapshotAutomationState(sanitizedState);
   }
   dashboardState.automation = sanitizedState;
   if (Array.isArray(sanitizedState.equityCurve) && sanitizedState.equityCurve.length) {
@@ -6324,9 +6369,12 @@ function buildAccountBalanceRows(account) {
   return [...fundingRows, ...tradingRows];
 }
 
-function applyAccountOverview(account) {
+function applyAccountOverview(account, options = {}) {
+  const syncSnapshot = options.syncSnapshot !== false;
   dashboardState.account = account;
-  syncRuntimeSnapshotAccountSummary(account);
+  if (syncSnapshot) {
+    syncRuntimeSnapshotAccountSummary(account);
+  }
   renderRows("balances", buildAccountBalanceRows(account).slice(0, 12), [
     { key: "accountType", label: "账户" },
     { key: "ccy", label: "币种" },
@@ -6348,12 +6396,15 @@ function applyAccountOverview(account) {
   rerenderSelectedOrderDetail();
 }
 
-function applyAccountSummary(account) {
+function applyAccountSummary(account, options = {}) {
+  const syncSnapshot = options.syncSnapshot !== false;
   dashboardState.account = {
     ...(dashboardState.account || {}),
     ...account,
   };
-  syncRuntimeSnapshotAccountSummary(dashboardState.account);
+  if (syncSnapshot) {
+    syncRuntimeSnapshotAccountSummary(dashboardState.account);
+  }
   if (account.balanceCount != null) {
     $("metric-balance-count").textContent = account.balanceCount;
   }
@@ -6365,9 +6416,12 @@ function applyAccountSummary(account) {
   rerenderSelectedOrderDetail();
 }
 
-function applyRecentOrders(data) {
+function applyRecentOrders(data, options = {}) {
+  const syncSnapshot = options.syncSnapshot !== false;
   const normalized = normalizeOrderFeedPayload(data);
-  syncRuntimeSnapshotOrderFeed(normalized);
+  if (syncSnapshot) {
+    syncRuntimeSnapshotOrderFeed(normalized);
+  }
   try {
     renderOrderFeed(normalized);
   } catch (error) {
