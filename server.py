@@ -14015,15 +14015,131 @@ def relay_requests_response(handler: BaseHTTPRequestHandler, response: requests.
 
 def build_index_bootstrap_payload() -> dict[str, Any]:
     try:
-        snapshot = build_runtime_snapshot(
-            CONFIG.current(),
-            include_account=True,
-            include_account_positions=False,
-            remote_timeout=1.5,
+        config = CONFIG.current()
+        snapshot = build_runtime_snapshot_for_endpoint(
+            "/api/focus-snapshot",
+            config,
         )
-        return snapshot.as_focus_payload()
+        return build_runtime_snapshot_response_payload(
+            "/api/focus-snapshot",
+            snapshot,
+            {},
+            config,
+        )
     except Exception:
         return {}
+
+
+@dataclass(frozen=True)
+class RuntimeSnapshotEndpointSpec:
+    include_account: bool
+    include_account_positions: bool
+    remote_timeout: float | None
+
+
+RUNTIME_SNAPSHOT_ENDPOINT_SPECS: dict[str, RuntimeSnapshotEndpointSpec] = {
+    "/api/automation/state": RuntimeSnapshotEndpointSpec(
+        include_account=True,
+        include_account_positions=False,
+        remote_timeout=REMOTE_AUTOMATION_STATE_TIMEOUT,
+    ),
+    "/api/focus-snapshot": RuntimeSnapshotEndpointSpec(
+        include_account=True,
+        include_account_positions=False,
+        remote_timeout=1.5,
+    ),
+    "/api/account/overview": RuntimeSnapshotEndpointSpec(
+        include_account=True,
+        include_account_positions=True,
+        remote_timeout=REMOTE_AUTOMATION_STATE_TIMEOUT,
+    ),
+    "/api/orders/recent": RuntimeSnapshotEndpointSpec(
+        include_account=False,
+        include_account_positions=False,
+        remote_timeout=REMOTE_AUTOMATION_STATE_TIMEOUT,
+    ),
+}
+
+
+def runtime_snapshot_endpoint_spec(path: str) -> RuntimeSnapshotEndpointSpec | None:
+    return RUNTIME_SNAPSHOT_ENDPOINT_SPECS.get(str(path or ""))
+
+
+def build_runtime_snapshot_for_endpoint(
+    path: str,
+    config: dict[str, Any],
+) -> RuntimeSnapshot:
+    spec = runtime_snapshot_endpoint_spec(path)
+    if spec is None:
+        raise KeyError(f"unsupported runtime snapshot endpoint: {path}")
+    return build_runtime_snapshot(
+        config,
+        include_account=spec.include_account,
+        include_account_positions=spec.include_account_positions,
+        remote_timeout=spec.remote_timeout,
+    )
+
+
+def build_runtime_snapshot_response_payload(
+    path: str,
+    snapshot: RuntimeSnapshot,
+    query: dict[str, list[str]],
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    if path == "/api/automation/state":
+        return snapshot.as_automation_state_response()
+    if path == "/api/focus-snapshot":
+        return snapshot.as_focus_payload()
+    if path == "/api/account/overview":
+        if snapshot.account_error and not snapshot.account_payload:
+            raise OkxApiError(f"获取账户数据失败: {snapshot.account_error}")
+        payload = snapshot.as_account_overview_response()
+        if snapshot.execution_mode != "remote":
+            try:
+                payload["route"] = ensure_live_route_ready(config, force=False)
+            except Exception as exc:
+                if not payload.get("summary"):
+                    raise OkxApiError(f"获取账户数据失败: {exc}") from exc
+                payload["routeError"] = str(exc)
+        return payload
+    if path == "/api/orders/recent":
+        inst_type = (query.get("instType") or [""])[0]
+        limit = parse_recent_order_limit(query)
+        include_stream = snapshot.execution_mode != "remote"
+        return snapshot.orders_payload(
+            inst_type=inst_type,
+            limit=limit,
+            stream=PRIVATE_ORDER_STREAM.snapshot() if include_stream else None,
+        )
+    raise KeyError(f"unsupported runtime snapshot endpoint: {path}")
+
+
+def serve_runtime_snapshot_endpoint(
+    handler: BaseHTTPRequestHandler,
+    path: str,
+    query: dict[str, list[str]],
+    config: dict[str, Any],
+) -> bool:
+    spec = runtime_snapshot_endpoint_spec(path)
+    if spec is None:
+        return False
+    try:
+        snapshot = build_runtime_snapshot_for_endpoint(
+            path,
+            config,
+        )
+        payload = build_runtime_snapshot_response_payload(
+            path,
+            snapshot,
+            query,
+            config,
+        )
+        json_response(handler, payload)
+    except OkxApiError as exc:
+        error_response(handler, str(exc), status=502)
+    except Exception as exc:
+        error_response(handler, f"运行态快照构建失败: {exc}", status=502)
+    return True
 
 
 class AppHandler(BaseHTTPRequestHandler):
@@ -14073,56 +14189,17 @@ class AppHandler(BaseHTTPRequestHandler):
         config = CONFIG.current()
         live_only = prefer_live_execution_state(config)
 
+        if serve_runtime_snapshot_endpoint(self, path, query, config):
+            return
+
         if path != "/api/automation/config" and should_proxy_to_remote(config, path):
             try:
-                if path == "/api/focus-snapshot":
-                    snapshot = build_runtime_snapshot(
-                        config,
-                        include_account=True,
-                        include_account_positions=False,
-                        remote_timeout=1.5,
-                    )
-                    payload = snapshot.as_focus_payload()
-                    payload.pop("minerOverview", None)
-                    json_response(self, payload)
-                elif path == "/api/automation/state":
-                    snapshot = build_runtime_snapshot(
-                        config,
-                        include_account=True,
-                        include_account_positions=False,
-                        remote_timeout=REMOTE_AUTOMATION_STATE_TIMEOUT,
-                    )
-                    json_response(self, snapshot.as_automation_state_response())
-                elif path == "/api/health":
+                if path == "/api/health":
                     response = remote_gateway_request(config, "GET", self.path)
                     payload = response.json()
                     payload["executionMode"] = "remote"
                     payload["remoteGatewayUrl"] = remote_gateway_url(config)
                     json_response(self, payload, status=response.status_code)
-                elif path == "/api/orders/recent":
-                    inst_type = (query.get("instType") or [""])[0]
-                    limit = parse_recent_order_limit(query)
-                    snapshot = build_runtime_snapshot(
-                        config,
-                        include_account=False,
-                        include_account_positions=False,
-                        remote_timeout=REMOTE_AUTOMATION_STATE_TIMEOUT,
-                    )
-                    json_response(
-                        self,
-                        snapshot.orders_payload(
-                            inst_type=inst_type,
-                            limit=limit,
-                        ),
-                    )
-                elif path == "/api/account/overview":
-                    snapshot = build_runtime_snapshot(
-                        config,
-                        include_account=True,
-                        include_account_positions=True,
-                        remote_timeout=REMOTE_AUTOMATION_STATE_TIMEOUT,
-                    )
-                    json_response(self, snapshot.as_account_overview_response())
                 else:
                     response = remote_gateway_request(config, "GET", self.path)
                     relay_requests_response(self, response)
@@ -14246,66 +14323,6 @@ class AppHandler(BaseHTTPRequestHandler):
                     "ok": True,
                     "config": ensure_automation_permissions_match_environment(CONFIG.current()),
                 },
-            )
-            return
-
-        if path == "/api/automation/state":
-            snapshot = build_runtime_snapshot(
-                config,
-                include_account=True,
-                include_account_positions=False,
-                force_local=True,
-            )
-            json_response(self, snapshot.as_automation_state_response())
-            return
-
-        if path == "/api/focus-snapshot":
-            snapshot = build_runtime_snapshot(
-                config,
-                include_account=True,
-                include_account_positions=False,
-                force_local=True,
-            )
-            json_response(self, snapshot.as_focus_payload())
-            return
-
-        if path == "/api/account/overview":
-            snapshot = build_runtime_snapshot(
-                config,
-                include_account=True,
-                include_account_positions=True,
-                force_local=True,
-            )
-            if snapshot.account_error and not snapshot.account_payload:
-                error_response(self, f"获取账户数据失败: {snapshot.account_error}", status=502)
-                return
-            payload = snapshot.as_account_overview_response()
-            try:
-                payload["route"] = ensure_live_route_ready(config, force=False)
-            except Exception as exc:
-                if not payload.get("summary"):
-                    error_response(self, f"获取账户数据失败: {exc}", status=502)
-                    return
-                payload["routeError"] = str(exc)
-            json_response(self, payload)
-            return
-
-        if path == "/api/orders/recent":
-            inst_type = (query.get("instType") or [""])[0]
-            limit = parse_recent_order_limit(query)
-            snapshot = build_runtime_snapshot(
-                CONFIG.current(),
-                include_account=False,
-                include_account_positions=False,
-                force_local=True,
-            )
-            json_response(
-                self,
-                snapshot.orders_payload(
-                    inst_type=inst_type,
-                    limit=limit,
-                    stream=PRIVATE_ORDER_STREAM.snapshot(),
-                ),
             )
             return
 
