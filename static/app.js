@@ -220,16 +220,20 @@ const dashboardState = {
 
 let lastBootCacheSerialized = "";
 
-function buildOrderFeedFromExecutionJournal(executionJournal = {}) {
+function buildOrderFeedFromExecutionJournal(executionJournal = {}, options = {}) {
   const journal = executionJournal && typeof executionJournal === "object" ? executionJournal : {};
+  const source = options?.source || "runtime_snapshot";
+  const stream = options?.stream !== undefined
+    ? options.stream
+    : (dashboardState.orderFeedMeta?.stream || null);
   return {
     orders: Array.isArray(journal.orders) ? journal.orders : [],
     journal: journal.summary || {},
     symbols: Array.isArray(journal.symbols) ? journal.symbols : [],
     lastReconciledAt: journal.lastReconciledAt || "",
     lastSource: journal.lastSource || "",
-    source: "focus_snapshot",
-    stream: dashboardState.orderFeedMeta?.stream || null,
+    source,
+    stream,
   };
 }
 
@@ -300,48 +304,48 @@ function normalizeOrderFeedPayload(payload = {}) {
   };
 }
 
-function getKnownOrderFeedCandidates() {
-  const candidates = [];
-  if (dashboardState.runtimeSnapshot?.executionJournal?.orders?.length) {
-    candidates.push({
-      priority: 90,
-      feed: buildOrderFeedFromExecutionJournal(dashboardState.runtimeSnapshot.executionJournal),
+function buildCurrentOrderFeed() {
+  if (dashboardState.runtimeSnapshot?.executionJournal) {
+    return buildOrderFeedFromExecutionJournal(dashboardState.runtimeSnapshot.executionJournal, {
+      source:
+        dashboardState.runtimeSnapshot?.stateSource ||
+        dashboardState.runtimeSnapshot?.executionJournal?.lastSource ||
+        "runtime_snapshot",
+      stream: dashboardState.orderFeedMeta?.stream || null,
     });
   }
-  if (dashboardState.serverBootstrap?.executionJournal?.orders?.length) {
+  if (dashboardState.bootCachePayload?.runtimeSnapshot?.executionJournal) {
+    return buildOrderFeedFromExecutionJournal(dashboardState.bootCachePayload.runtimeSnapshot.executionJournal, {
+      source: "boot_cache",
+      stream: dashboardState.orderFeedMeta?.stream || null,
+    });
+  }
+  if (dashboardState.orderJournal?.orders?.length) {
+    return buildOrderFeedFromJournalSnapshot(
+      dashboardState.orderJournal,
+      dashboardState.orderFeedMeta?.source || "journal_memory",
+      dashboardState.orderFeedMeta?.stream || null,
+    );
+  }
+  return null;
+}
+
+function getKnownOrderFeedCandidates() {
+  const candidates = [];
+  const currentFeed = buildCurrentOrderFeed();
+  if (currentFeed?.orders?.length) {
     candidates.push({
-      priority: 80,
-      feed: buildOrderFeedFromExecutionJournal(dashboardState.serverBootstrap.executionJournal),
+      priority: 90,
+      feed: currentFeed,
     });
   }
   if (dashboardState.bootCachePayload?.runtimeSnapshot?.executionJournal?.orders?.length) {
     candidates.push({
-      priority: 70,
-      feed: buildOrderFeedFromExecutionJournal(dashboardState.bootCachePayload.runtimeSnapshot.executionJournal),
-    });
-  }
-  if (dashboardState.orderJournal?.orders?.length) {
-    candidates.push({
-      priority: 60,
-      feed: buildOrderFeedFromJournalSnapshot(
-        dashboardState.orderJournal,
-        dashboardState.orderFeedMeta?.source || "journal_memory",
-        dashboardState.orderFeedMeta?.stream || null,
-      ),
-    });
-  }
-  if (dashboardState.recentOrdersAll?.length) {
-    candidates.push({
-      priority: 50,
-      feed: {
-        orders: dashboardState.recentOrdersAll,
-        journal: dashboardState.orderJournal?.summary || dashboardState.orderJournal || {},
-        symbols: dashboardState.orderJournalSymbols || [],
-        lastReconciledAt: dashboardState.orderJournal?.lastReconciledAt || "",
-        lastSource: dashboardState.orderJournal?.lastSource || "",
-        source: dashboardState.orderFeedMeta?.source || "memory",
+      priority: 80,
+      feed: buildOrderFeedFromExecutionJournal(dashboardState.bootCachePayload.runtimeSnapshot.executionJournal, {
+        source: "boot_cache",
         stream: dashboardState.orderFeedMeta?.stream || null,
-      },
+      }),
     });
   }
   return candidates
@@ -487,6 +491,25 @@ function applyRuntimeSnapshot(payload = {}) {
     applyRecentOrders(buildOrderFeedFromExecutionJournal(snapshot.executionJournal));
   }
   return snapshot;
+}
+
+function rerenderCurrentOrderFeed() {
+  const currentFeed = buildCurrentOrderFeed();
+  if (currentFeed?.orders?.length) {
+    renderOrderFeed(currentFeed);
+    return true;
+  }
+  if (dashboardState.orderJournal?.orders?.length) {
+    renderOrderFeed(
+      buildOrderFeedFromJournalSnapshot(
+        dashboardState.orderJournal,
+        dashboardState.orderFeedMeta?.source || "journal_memory",
+        dashboardState.orderFeedMeta?.stream || null,
+      ),
+    );
+    return true;
+  }
+  return false;
 }
 
 function syncRuntimeSnapshotOrderFeed(feed = {}) {
@@ -5550,11 +5573,7 @@ function renderOrderFeed(data) {
     button.addEventListener("click", () => {
       dashboardState.selectedOrderKey = button.dataset.orderKey;
       dashboardState.selectedOrderSymbol = button.dataset.orderSymbol || dashboardState.selectedOrderSymbol;
-      renderOrderFeed({
-        orders: dashboardState.recentOrdersAll,
-        source: dashboardState.orderFeedMeta?.source,
-        stream: dashboardState.orderFeedMeta?.stream,
-      });
+      rerenderCurrentOrderFeed();
     });
   });
 
@@ -5566,11 +5585,7 @@ function renderOrderFeed(data) {
       if (group?.orders?.[0]) {
         dashboardState.selectedOrderKey = getOrderKey(group.orders[0]);
       }
-      renderOrderFeed({
-        orders: dashboardState.recentOrdersAll,
-        source: dashboardState.orderFeedMeta?.source,
-        stream: dashboardState.orderFeedMeta?.stream,
-      });
+      rerenderCurrentOrderFeed();
     });
   });
 
@@ -5582,11 +5597,7 @@ function renderOrderFeed(data) {
         ...(dashboardState.orderExpandedSymbols || {}),
         [symbol]: !dashboardState.orderExpandedSymbols?.[symbol],
       };
-      renderOrderFeed({
-        orders: dashboardState.recentOrdersAll,
-        source: dashboardState.orderFeedMeta?.source,
-        stream: dashboardState.orderFeedMeta?.stream,
-      });
+      rerenderCurrentOrderFeed();
     });
   });
 
@@ -6442,13 +6453,15 @@ async function refreshOrders() {
       const data = await request("/api/orders/recent?limit=80");
       const normalized = normalizeOrderFeedPayload(data);
       if (!normalized?.orders?.length) {
+        const currentFeed = buildCurrentOrderFeed();
+        if (currentFeed?.orders?.length) {
+          applyRecentOrders(currentFeed);
+          return currentFeed;
+        }
         try {
           const snapshot = await request("/api/focus-snapshot", { timeoutMs: 12000 });
-          const snapshotFeed = normalizeOrderFeedPayload({
-            executionJournal: snapshot?.executionJournal || null,
-            source: "focus_snapshot",
-            stream: dashboardState.orderFeedMeta?.stream || null,
-          });
+          applyRuntimeSnapshot(snapshot);
+          const snapshotFeed = buildCurrentOrderFeed();
           if (snapshotFeed.orders?.length) {
             applyRecentOrders(snapshotFeed);
             return snapshotFeed;
@@ -6465,8 +6478,9 @@ async function refreshOrders() {
       applyRecentOrders(normalized);
       return normalized;
     } catch (error) {
-      if (dashboardState.runtimeSnapshot?.executionJournal?.orders?.length) {
-        applyRecentOrders(buildOrderFeedFromExecutionJournal(dashboardState.runtimeSnapshot.executionJournal));
+      const currentFeed = buildCurrentOrderFeed();
+      if (currentFeed?.orders?.length) {
+        applyRecentOrders(currentFeed);
         console.warn("refreshOrders fallback -> runtime snapshot", error);
         return null;
       }
