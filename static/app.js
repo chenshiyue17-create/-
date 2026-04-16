@@ -5426,9 +5426,10 @@ function renderOrderFeed(data) {
     fallbackSymbols: fallbackJournal.symbols || [],
   });
   const currentMeta = getCurrentOrderFeedMeta();
+  const currentAutomation = getCurrentAutomationState();
   renderDeskOverview();
-  if (dashboardState.automation?.analysis) {
-    renderAnalysisState(dashboardState.automation.analysis, dashboardState.automation || {});
+  if (currentAutomation?.analysis) {
+    renderAnalysisState(currentAutomation.analysis, currentAutomation || {});
   }
   const baseGroups = groupOrdersBySymbol(allOrders, currentMeta);
   const stateFilter = dashboardState.orderStateFilter || "all";
@@ -6306,10 +6307,11 @@ async function refreshAutomationState() {
         state = normalized.automationState || {};
         source = "focus_snapshot";
       } catch (snapshotError) {
-        if (dashboardState.automation) {
-          const fallbackState = mergeAutomationRuntimeState(dashboardState.automation || {}, {
-            statusText: dashboardState.automation.statusText || "运行中",
-            modeText: dashboardState.automation.modeText || "已切到本地缓存视图",
+        const currentAutomation = getCurrentAutomationState();
+        if (currentAutomation && Object.keys(currentAutomation).length) {
+          const fallbackState = mergeAutomationRuntimeState(currentAutomation || {}, {
+            statusText: currentAutomation.statusText || "运行中",
+            modeText: currentAutomation.modeText || "已切到本地缓存视图",
             lastError: primaryError?.message || snapshotError?.message || "",
           });
           renderAutomationState(fallbackState);
@@ -6952,7 +6954,7 @@ async function boot() {
 
   $("rail-strategy-toggle")?.addEventListener("click", async () => {
     try {
-      if (dashboardState.automation?.running) {
+      if (getCurrentAutomationState()?.running) {
         await stopAutomation();
       } else {
         await startAutomation();
