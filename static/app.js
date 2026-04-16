@@ -213,7 +213,6 @@ const dashboardState = {
   ordersLoadedOnce: false,
   equityDisplayCache: null,
   equityCurveCache: [],
-  serverBootstrap: null,
   bootCachePayload: null,
   runtimeSnapshot: null,
 };
@@ -330,39 +329,16 @@ function buildCurrentOrderFeed() {
   return null;
 }
 
-function getKnownOrderFeedCandidates() {
-  const candidates = [];
+function hydrateOrdersFromCurrentSnapshot() {
   const currentFeed = buildCurrentOrderFeed();
-  if (currentFeed?.orders?.length) {
-    candidates.push({
-      priority: 90,
-      feed: currentFeed,
-    });
+  if (!currentFeed?.orders?.length) return false;
+  try {
+    applyRecentOrders(currentFeed);
+    return true;
+  } catch (error) {
+    console.error("hydrateOrdersFromCurrentSnapshot failed", error, currentFeed);
+    return false;
   }
-  if (dashboardState.bootCachePayload?.runtimeSnapshot?.executionJournal?.orders?.length) {
-    candidates.push({
-      priority: 80,
-      feed: buildOrderFeedFromExecutionJournal(dashboardState.bootCachePayload.runtimeSnapshot.executionJournal, {
-        source: "boot_cache",
-        stream: dashboardState.orderFeedMeta?.stream || null,
-      }),
-    });
-  }
-  return candidates
-    .filter((item) => item.feed?.orders?.length)
-    .sort((left, right) => right.priority - left.priority);
-}
-
-function hydrateOrdersFromKnownSources() {
-  for (const candidate of getKnownOrderFeedCandidates()) {
-    try {
-      applyRecentOrders(candidate.feed);
-      return true;
-    } catch (error) {
-      console.error("hydrateOrdersFromKnownSources failed", candidate, error);
-    }
-  }
-  return false;
 }
 
 function buildBootCachePayload() {
@@ -450,7 +426,6 @@ function restoreServerBootstrap() {
   try {
     const payload = window.__OKX_BOOTSTRAP__;
     if (!payload || typeof payload !== "object") return false;
-    dashboardState.serverBootstrap = payload;
     applyRuntimeSnapshot(payload);
     return true;
   } catch (error) {
@@ -1546,7 +1521,7 @@ function setWorkspaceView(view, { persist = true, scroll = true } = {}) {
     refreshSnapshot().catch(() => {});
   }
   if (key === "orders") {
-    hydrateOrdersFromKnownSources();
+    hydrateOrdersFromCurrentSnapshot();
   }
   if (key === "orders") {
     refreshOrders().catch(() => {});
@@ -5978,7 +5953,7 @@ function renderAutomationState(state) {
     dashboardState.orderJournalSymbols = Array.isArray(mergedState.executionJournal.symbols) ? mergedState.executionJournal.symbols : [];
   }
   if (!dashboardState.recentOrdersAll?.length) {
-    hydrateOrdersFromKnownSources();
+    hydrateOrdersFromCurrentSnapshot();
   }
   renderResearchState(sanitizedState?.research || {});
   renderAnalysisState(sanitizedState?.analysis || {}, sanitizedState);
@@ -6470,9 +6445,9 @@ async function refreshOrders() {
           console.warn("refreshOrders focus-snapshot fallback failed", snapshotError);
         }
       }
-      if (!normalized?.orders?.length && getKnownOrderFeedCandidates().length) {
-        console.warn("refreshOrders empty response -> keep known order feed");
-        hydrateOrdersFromKnownSources();
+      if (!normalized?.orders?.length && buildCurrentOrderFeed()?.orders?.length) {
+        console.warn("refreshOrders empty response -> keep current runtime snapshot feed");
+        hydrateOrdersFromCurrentSnapshot();
         return normalized;
       }
       applyRecentOrders(normalized);
@@ -6484,8 +6459,8 @@ async function refreshOrders() {
         console.warn("refreshOrders fallback -> runtime snapshot", error);
         return null;
       }
-      if (hydrateOrdersFromKnownSources()) {
-        console.warn("refreshOrders fallback -> known sources", error);
+      if (hydrateOrdersFromCurrentSnapshot()) {
+        console.warn("refreshOrders fallback -> current runtime snapshot", error);
         return null;
       }
       throw error;
@@ -6609,7 +6584,7 @@ async function boot() {
   setPendingEnvironmentUi();
   restoreServerBootstrap();
   restoreDashboardBootCache();
-  hydrateOrdersFromKnownSources();
+  hydrateOrdersFromCurrentSnapshot();
 
   const healthPromise = (async () => {
     try {
@@ -7035,7 +7010,7 @@ async function boot() {
       rememberBootError(result.reason);
     }
   });
-  hydrateOrdersFromKnownSources();
+  hydrateOrdersFromCurrentSnapshot();
   refreshOrders().catch(() => {});
   if (bootErrors.length) {
     const summary = bootErrors[0];
