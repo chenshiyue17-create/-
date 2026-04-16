@@ -2469,13 +2469,19 @@ class RuntimeSnapshot:
             payload["remoteGatewayUrl"] = self.remote_gateway_url
         return payload
 
-    def orders_payload(self, *, inst_type: str = "", limit: int | None = None) -> dict[str, Any]:
+    def orders_payload(
+        self,
+        *,
+        inst_type: str = "",
+        limit: int | None = None,
+        stream: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         journal = slice_execution_journal_snapshot(
             self.execution_journal,
             inst_type=inst_type,
             limit=limit,
         )
-        return {
+        payload = {
             "ok": True,
             "orders": journal.get("orders") or [],
             "journal": journal.get("summary") or {},
@@ -2485,6 +2491,9 @@ class RuntimeSnapshot:
             "lastSource": journal.get("lastSource") or "",
             "source": journal.get("lastSource") or self.remote_state_source or "runtime_snapshot",
         }
+        if stream is not None:
+            payload["stream"] = copy.deepcopy(stream)
+        return payload
 
 
 def load_local_runtime_account_payload(
@@ -14032,31 +14041,21 @@ class AppHandler(BaseHTTPRequestHandler):
                     payload["remoteGatewayUrl"] = remote_gateway_url(config)
                     json_response(self, payload, status=response.status_code)
                 elif path == "/api/orders/recent":
+                    inst_type = (query.get("instType") or [""])[0]
                     limit = parse_recent_order_limit(query)
-                    response = remote_gateway_request(config, "GET", self.path)
-                    payload = response.json()
-                    orders = payload.get("orders") or []
-                    if isinstance(orders, list):
-                        if live_only:
-                            orders = [item for item in orders if not is_paper_execution_order(item)]
-                        inst_type = (query.get("instType") or [""])[0]
-                        cached_orders = get_stored_local_orders(
-                            inst_type,
-                            limit=MAX_RECENT_ORDER_LIMIT,
-                            live_only=live_only,
-                        )
-                        stream_orders = PRIVATE_ORDER_STREAM.get_recent_orders(inst_type, limit=MAX_RECENT_ORDER_LIMIT)
-                        if live_only:
-                            stream_orders = [item for item in stream_orders if not is_paper_execution_order(item)]
-                        merged_orders = merge_order_feeds(orders, stream_orders, cached_orders, limit=MAX_RECENT_ORDER_LIMIT)
-                        persist_local_orders(merged_orders, source="remote_proxy", live_only=live_only)
-                        journal = get_execution_journal_snapshot(inst_type, limit=limit, live_only=live_only)
-                        payload["orders"] = journal.get("orders") or backfill_paper_execution_metrics(merged_orders[:limit])
-                        payload["journal"] = journal.get("summary") or {}
-                        payload["symbols"] = journal.get("symbols") or payload.get("symbols") or []
-                        payload["lastSource"] = journal.get("lastSource") or payload.get("lastSource") or payload.get("source") or "remote_proxy"
-                        payload["lastReconciledAt"] = journal.get("lastReconciledAt") or payload.get("lastReconciledAt") or now_local_iso()
-                    json_response(self, payload, status=response.status_code)
+                    snapshot = build_runtime_snapshot(
+                        config,
+                        include_account=False,
+                        include_account_positions=False,
+                        remote_timeout=REMOTE_AUTOMATION_STATE_TIMEOUT,
+                    )
+                    json_response(
+                        self,
+                        snapshot.orders_payload(
+                            inst_type=inst_type,
+                            limit=limit,
+                        ),
+                    )
                 elif path == "/api/account/overview":
                     snapshot = build_runtime_snapshot(
                         config,
@@ -14233,120 +14232,22 @@ class AppHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/orders/recent":
-            config = CONFIG.current()
-            valid, message = validate_config(config)
-            if not valid:
-                error_response(self, message, status=400)
-                return
             inst_type = (query.get("instType") or [""])[0]
             limit = parse_recent_order_limit(query)
-            cached_journal = get_execution_journal_snapshot(inst_type, limit=limit, live_only=live_only)
-            cached_orders = cached_journal.get("orders") or []
-            stream_orders = PRIVATE_ORDER_STREAM.get_recent_orders(inst_type, limit=limit)
-            if live_only:
-                stream_orders = [item for item in stream_orders if not is_paper_execution_order(item)]
-            merged_live_orders = merge_order_feeds(stream_orders, cached_orders, limit=limit)
-            has_private_credentials = live_only
-            if merged_live_orders and not has_private_credentials:
-                json_response(
-                    self,
-                    {
-                        "ok": True,
-                        "orders": merged_live_orders,
-                        "source": "private_ws" if stream_orders else "local_cache",
-                        "journal": cached_journal.get("summary") or {},
-                        "executionJournal": cached_journal,
-                        "symbols": cached_journal.get("symbols") or [],
-                        "lastReconciledAt": cached_journal.get("lastReconciledAt") or "",
-                        "lastSource": cached_journal.get("lastSource") or "",
-                        "stream": PRIVATE_ORDER_STREAM.snapshot(),
-                    },
-                )
-                return
-            try:
-                ensure_live_route_ready(config, force=False)
-                client = OkxClient(config)
-                if inst_type:
-                    result = client.get_recent_orders(inst_type)
-                    fills_result = client.get_recent_fills(inst_type, limit=100)
-                    merged_orders = merge_order_feeds(result.get("data", []), stream_orders, cached_orders, limit=limit)
-                    merged_orders = enrich_execution_orders_with_fills(merged_orders, fills_result.get("data", []))
-                    persist_local_orders(
-                        merged_orders,
-                        source="rest_multi" if (stream_orders or cached_orders) else "rest",
-                        live_only=live_only,
-                    )
-                    journal = get_execution_journal_snapshot(inst_type, limit=limit, live_only=live_only)
-                    json_response(
-                        self,
-                        {
-                            "ok": True,
-                            "orders": journal.get("orders") or merged_orders,
-                            "source": "rest_multi" if (stream_orders or cached_orders) else "rest",
-                            "journal": journal.get("summary") or {},
-                            "executionJournal": journal,
-                            "symbols": journal.get("symbols") or [],
-                            "lastReconciledAt": journal.get("lastReconciledAt") or "",
-                            "lastSource": journal.get("lastSource") or "",
-                            "stream": PRIVATE_ORDER_STREAM.snapshot(),
-                        },
-                    )
-                    return
-
-                merged_orders: list[dict[str, Any]] = []
-                recent_fills: list[dict[str, Any]] = []
-                errors: list[str] = []
-                for fallback_type in ("SPOT", "SWAP"):
-                    try:
-                        fallback_result = client.get_recent_orders(fallback_type)
-                        merged_orders.extend(fallback_result.get("data", []))
-                    except Exception as fallback_exc:
-                        errors.append(f"{fallback_type}: {fallback_exc}")
-                    try:
-                        fills_result = client.get_recent_fills(fallback_type, limit=100)
-                        recent_fills.extend(fills_result.get("data", []))
-                    except Exception as fill_exc:
-                        errors.append(f"{fallback_type} fills: {fill_exc}")
-
-                if not merged_orders and errors:
-                    raise OkxApiError("; ".join(errors))
-
-                merged_orders = merge_order_feeds(merged_orders, stream_orders, cached_orders, limit=limit)
-                merged_orders = enrich_execution_orders_with_fills(merged_orders, recent_fills)
-                persist_local_orders(merged_orders, source="rest_multi", live_only=live_only)
-                journal = get_execution_journal_snapshot(inst_type, limit=limit, live_only=live_only)
-                json_response(
-                    self,
-                    {
-                        "ok": True,
-                        "orders": journal.get("orders") or merged_orders[:20],
-                        "source": "rest_multi",
-                        "journal": journal.get("summary") or {},
-                        "executionJournal": journal,
-                        "symbols": journal.get("symbols") or [],
-                        "lastReconciledAt": journal.get("lastReconciledAt") or "",
-                        "lastSource": journal.get("lastSource") or "",
-                        "stream": PRIVATE_ORDER_STREAM.snapshot(),
-                    },
-                )
-            except Exception as exc:
-                if merged_live_orders:
-                    json_response(
-                        self,
-                        {
-                            "ok": True,
-                            "orders": merged_live_orders,
-                            "source": "private_ws" if stream_orders else "local_cache",
-                            "journal": cached_journal.get("summary") or {},
-                            "executionJournal": cached_journal,
-                            "symbols": cached_journal.get("symbols") or [],
-                            "lastReconciledAt": cached_journal.get("lastReconciledAt") or "",
-                            "lastSource": cached_journal.get("lastSource") or "",
-                            "stream": PRIVATE_ORDER_STREAM.snapshot(),
-                        },
-                    )
-                    return
-                error_response(self, f"获取订单失败: {exc}", status=502)
+            snapshot = build_runtime_snapshot(
+                CONFIG.current(),
+                include_account=False,
+                include_account_positions=False,
+                force_local=True,
+            )
+            json_response(
+                self,
+                snapshot.orders_payload(
+                    inst_type=inst_type,
+                    limit=limit,
+                    stream=PRIVATE_ORDER_STREAM.snapshot(),
+                ),
+            )
             return
 
         if path == "/api/market/ticker":
