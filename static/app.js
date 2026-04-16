@@ -249,6 +249,14 @@ function buildOrderFeedFromJournalSnapshot(journal = {}, source = "journal_cache
   };
 }
 
+function getCurrentRuntimeSnapshot() {
+  if (dashboardState.runtimeSnapshot && typeof dashboardState.runtimeSnapshot === "object") {
+    return dashboardState.runtimeSnapshot;
+  }
+  const cachedSnapshot = dashboardState.bootCachePayload?.runtimeSnapshot;
+  return cachedSnapshot && typeof cachedSnapshot === "object" ? cachedSnapshot : null;
+}
+
 function normalizeOrderFeedPayload(payload = {}) {
   const source = payload?.source || payload?.lastSource || "rest";
   const stream = payload?.stream || null;
@@ -304,18 +312,13 @@ function normalizeOrderFeedPayload(payload = {}) {
 }
 
 function buildCurrentOrderFeed() {
-  if (dashboardState.runtimeSnapshot?.executionJournal) {
-    return buildOrderFeedFromExecutionJournal(dashboardState.runtimeSnapshot.executionJournal, {
+  const snapshot = getCurrentRuntimeSnapshot();
+  if (snapshot?.executionJournal) {
+    return buildOrderFeedFromExecutionJournal(snapshot.executionJournal, {
       source:
-        dashboardState.runtimeSnapshot?.stateSource ||
-        dashboardState.runtimeSnapshot?.executionJournal?.lastSource ||
+        snapshot?.stateSource ||
+        snapshot?.executionJournal?.lastSource ||
         "runtime_snapshot",
-      stream: dashboardState.orderFeedMeta?.stream || null,
-    });
-  }
-  if (dashboardState.bootCachePayload?.runtimeSnapshot?.executionJournal) {
-    return buildOrderFeedFromExecutionJournal(dashboardState.bootCachePayload.runtimeSnapshot.executionJournal, {
-      source: "boot_cache",
       stream: dashboardState.orderFeedMeta?.stream || null,
     });
   }
@@ -565,35 +568,6 @@ function journalUsesPaperEquity(journal = {}, explicitOrders = null) {
   }
   const lastSource = String(source.lastSource || source.summary?.lastSource || "").trim().toLowerCase();
   return lastSource.includes("paper");
-}
-
-function journalLooksStale(metrics, analysisNetResult, sessionPnlAmount) {
-  if (!metrics?.hasData) return false;
-  const net = metrics.netPnl;
-  if (!Number.isFinite(net)) return false;
-  let staleVotes = 0;
-  if (Number.isFinite(analysisNetResult)) {
-    const analysisGap = Math.abs(net - analysisNetResult);
-    if (analysisGap > Math.max(300, Math.abs(analysisNetResult) * 3 + 120)) staleVotes += 1;
-  }
-  if (Number.isFinite(sessionPnlAmount)) {
-    const sessionGap = Math.abs(net - sessionPnlAmount);
-    if (sessionGap > Math.max(600, Math.abs(sessionPnlAmount) * 2.5 + 200)) staleVotes += 1;
-  }
-  return staleVotes > 0;
-}
-
-function selectBestExecutionJournal(primaryJournal, fallbackJournal, analysisNetResult, sessionPnlAmount) {
-  const primary = getJournalSummaryMetrics(primaryJournal || {});
-  const fallback = getJournalSummaryMetrics(fallbackJournal || {});
-  if (!primary.hasData) return fallback.raw || primary.raw || {};
-  if (!fallback.hasData) return primary.raw || fallback.raw || {};
-  const primaryStale = journalLooksStale(primary, analysisNetResult, sessionPnlAmount);
-  const fallbackStale = journalLooksStale(fallback, analysisNetResult, sessionPnlAmount);
-  if (primaryStale && !fallbackStale) return fallback.raw;
-  if (fallbackStale && !primaryStale) return primary.raw;
-  if (fallback.lastReconciledAt && fallback.lastReconciledAt > primary.lastReconciledAt) return fallback.raw;
-  return primary.raw;
 }
 
 function formatStrategyMode(mode) {
@@ -2320,10 +2294,18 @@ function deriveDeskModePresentation(automation = {}, modeText = "模拟盘") {
 }
 
 function renderDeskOverview() {
-  const account = dashboardState.account || {};
+  const runtimeSnapshot = getCurrentRuntimeSnapshot() || {};
+  const account = runtimeSnapshot.account && typeof runtimeSnapshot.account === "object"
+    ? runtimeSnapshot.account
+    : (dashboardState.account || {});
   const summary = account.summary || {};
-  const automation = dashboardState.automation || {};
-  const serverEquityDisplay = automation.equityDisplay || account.equityDisplay || {};
+  const automation = runtimeSnapshot.automationState && typeof runtimeSnapshot.automationState === "object"
+    ? runtimeSnapshot.automationState
+    : (dashboardState.automation || {});
+  const executionJournal = runtimeSnapshot.executionJournal && typeof runtimeSnapshot.executionJournal === "object"
+    ? runtimeSnapshot.executionJournal
+    : (automation.executionJournal || dashboardState.orderJournal || {});
+  const serverEquityDisplay = account.equityDisplay || automation.equityDisplay || {};
   const serverDisplayTotalEq = Number(serverEquityDisplay.displayTotalEq || 0);
   const serverStartEq = Number(serverEquityDisplay.sessionStartEq || 0);
   const serverPnlAmount = Number(serverEquityDisplay.pnlAmount || 0);
@@ -2366,15 +2348,13 @@ function renderDeskOverview() {
   const stateTargetEq = Number(automation.targetBalanceEq || 0);
   const stateTargetProgressPct = Number(automation.targetBalanceProgressPct || 0);
   const analysis = automation.analysis || {};
-  const executionJournal = selectBestExecutionJournal(
-    automation.executionJournal || {},
-    dashboardState.orderJournal || {},
-    extractAbilityNetPnl(analysis),
-    pnlAmount
-  );
-  const paperEquityMode = journalUsesPaperEquity(executionJournal, dashboardState.recentOrdersAll || [])
-    || journalUsesPaperEquity(dashboardState.orderJournal || {}, dashboardState.recentOrdersAll || []);
-  const sessionEquityMode = currentEq > 0;
+  const paperEquityMode = serverHasEquityDisplay
+    ? serverUsesPaperEquity
+    : journalUsesPaperEquity(
+        executionJournal,
+        Array.isArray(executionJournal.orders) ? executionJournal.orders : (dashboardState.recentOrdersAll || [])
+      );
+  const sessionEquityMode = serverHasEquityDisplay ? serverUsesSessionEquity : currentEq > 0;
   const journalMetrics = getJournalSummaryMetrics(executionJournal);
   const realizedNet = Number(journalMetrics.realizedPnl ?? 0);
   const feeNet = Number(journalMetrics.totalFees ?? 0);
