@@ -257,6 +257,33 @@ function getCurrentRuntimeSnapshot() {
   return cachedSnapshot && typeof cachedSnapshot === "object" ? cachedSnapshot : null;
 }
 
+function getCurrentAutomationState() {
+  const snapshot = getCurrentRuntimeSnapshot();
+  return snapshot?.automationState && typeof snapshot.automationState === "object"
+    ? snapshot.automationState
+    : (dashboardState.automation || {});
+}
+
+function getCurrentAccountPayload() {
+  const snapshot = getCurrentRuntimeSnapshot();
+  return snapshot?.account && typeof snapshot.account === "object"
+    ? snapshot.account
+    : (dashboardState.account || {});
+}
+
+function getCurrentExecutionJournal() {
+  const snapshot = getCurrentRuntimeSnapshot();
+  return snapshot?.executionJournal && typeof snapshot.executionJournal === "object"
+    ? snapshot.executionJournal
+    : (dashboardState.orderJournal || {});
+}
+
+function getCurrentRecentOrders() {
+  const snapshotOrders = getCurrentExecutionJournal()?.orders;
+  if (Array.isArray(snapshotOrders) && snapshotOrders.length) return snapshotOrders;
+  return Array.isArray(dashboardState.recentOrdersAll) ? dashboardState.recentOrdersAll : [];
+}
+
 function normalizeOrderFeedPayload(payload = {}) {
   const source = payload?.source || payload?.lastSource || "rest";
   const stream = payload?.stream || null;
@@ -345,12 +372,13 @@ function hydrateOrdersFromCurrentSnapshot() {
 }
 
 function buildBootCachePayload() {
-  const runtimeSnapshot = dashboardState.runtimeSnapshot
+  const currentRuntimeSnapshot = getCurrentRuntimeSnapshot();
+  const runtimeSnapshot = currentRuntimeSnapshot
     ? {
-        ...(dashboardState.runtimeSnapshot || {}),
-        automationState: dashboardState.automation
-          ? { ...dashboardState.automation, logs: [] }
-          : (dashboardState.runtimeSnapshot.automationState || {}),
+        ...(currentRuntimeSnapshot || {}),
+        automationState: getCurrentAutomationState()
+          ? { ...getCurrentAutomationState(), logs: [] }
+          : (currentRuntimeSnapshot.automationState || {}),
       }
     : null;
   if (!runtimeSnapshot) return null;
@@ -1082,7 +1110,7 @@ function isAutomationActuallyRunning(automation = {}) {
 }
 
 function syncRailStrategyButtons() {
-  const running = isAutomationActuallyRunning(dashboardState.automation);
+  const running = isAutomationActuallyRunning(getCurrentAutomationState());
   const blocked = isLiveRouteBlocked();
   const toggle = $("rail-strategy-toggle");
 
@@ -1095,7 +1123,7 @@ function syncRailStrategyButtons() {
 }
 
 function renderRailStrategyControls() {
-  const automation = dashboardState.automation || {};
+  const automation = getCurrentAutomationState();
   const envPreset = inferEnvPreset(
     $("envPreset")?.value || "custom",
     $("baseUrl")?.value || "",
@@ -2201,8 +2229,8 @@ function renderAnalysisState(analysis, runtimeState = {}) {
     if (data.executionAbilityNetPnl) dockSummaryBits.push(`近场净收益 ${formatSignedMoney(data.executionAbilityNetPnl)}U`);
     if (data.blockers?.length) dockSummaryBits.push(`阻断 ${data.blockers[0]}`);
     else if (data.warnings?.length) dockSummaryBits.push(`提醒 ${data.warnings[0]}`);
-    const journal = dashboardState.orderJournal || {};
-    const recentOrders = dashboardState.recentOrdersAll || [];
+    const journal = getCurrentExecutionJournal();
+    const recentOrders = getCurrentRecentOrders();
     const filledCount = Number(journal.filledOrders ?? recentOrders.filter((item) => String(item?.state || "") === "filled").length);
     const latestFilled = recentOrders.find((item) => String(item?.state || "") === "filled");
     if (filledCount > 0) {
@@ -3724,7 +3752,7 @@ function buildOrderMarginContext(order) {
   };
 }
 
-function getOrderCurrentPrice(order, account = dashboardState.account || {}) {
+function getOrderCurrentPrice(order, account = getCurrentAccountPayload()) {
   const instId = String(order?.instId || "");
   const tickerPrice = toOrderNumber(liveMarketState.tickers?.[instId]?.last);
   if (tickerPrice > 0) return tickerPrice;
@@ -3747,7 +3775,7 @@ function getOrderCurrentPrice(order, account = dashboardState.account || {}) {
   return 0;
 }
 
-function getSpotOrderHolding(order, account = dashboardState.account || {}) {
+function getSpotOrderHolding(order, account = getCurrentAccountPayload()) {
   const instId = String(order?.instId || "");
   const baseCcy = instId.split("-")[0] || "";
   if (!baseCcy) {
@@ -3762,7 +3790,7 @@ function getSpotOrderHolding(order, account = dashboardState.account || {}) {
 }
 
 function buildOrderLifecycleContext(order, meta = {}) {
-  const account = dashboardState.account || {};
+  const account = getCurrentAccountPayload();
   const state = String(order?.state || "");
   const filledSize = toOrderNumber(order?.accFillSz || order?.fillSz || order?.sz);
   const side = String(order?.side || "").toLowerCase();
@@ -4504,7 +4532,7 @@ function getOrderEventTimeText(order) {
   return formatOrderTime(order?.fillTime || order?.uTime || order?.cTime);
 }
 
-function findRelatedCloseOrder(order, orders = dashboardState.recentOrdersAll || []) {
+function findRelatedCloseOrder(order, orders = getCurrentRecentOrders()) {
   if (!order || getOrderLifecycleRole(order).closeLike) return null;
   const currentKey = getOrderKey(order);
   const instId = String(order?.instId || "");
@@ -5832,7 +5860,7 @@ function renderPortfolioWatchlist(entries = []) {
 }
 
 function renderStrategyPortfolio() {
-  const automation = dashboardState.automation || {};
+  const automation = getCurrentAutomationState();
   const draft = normalizeAutomationConfigForCompare(collectAutomationConfig());
   const watchlist = (automation.watchlist && automation.watchlist.length)
     ? automation.watchlist
@@ -5914,13 +5942,8 @@ async function loadAutomationConfig() {
   renderDeskGuards();
 }
 
-async function loadMinerConfig() {
-  const data = await request("/api/miner/config");
-  fillMinerForm(data.config || {});
-}
-
 function renderAutomationState(state) {
-  const mergedState = mergeAutomationRuntimeState(dashboardState.automation || {}, state || {});
+  const mergedState = mergeAutomationRuntimeState(getCurrentAutomationState(), state || {});
   const sanitizedState = sanitizeAutomationStateForSwingOnly(mergedState);
   if (isAutomationActuallyRunning(sanitizedState) && /待机|未启动|已停止|已手动停止/.test(String(sanitizedState.statusText || ""))) {
     sanitizedState.statusText = "运行中";
@@ -6130,7 +6153,7 @@ async function runLiveAnalysis({ silent = false } = {}) {
   }
 }
 
-function shouldAutoAnalyze(state = dashboardState.automation) {
+function shouldAutoAnalyze(state = getCurrentAutomationState()) {
   const analysis = state?.analysis || {};
   if (state?.running) return false;
   if (!analysis.lastAnalyzedAt) return true;
