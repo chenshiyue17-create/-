@@ -215,6 +215,7 @@ const dashboardState = {
   equityCurveCache: [],
   serverBootstrap: null,
   bootCachePayload: null,
+  runtimeSnapshot: null,
 };
 
 let lastBootCacheSerialized = "";
@@ -440,20 +441,46 @@ function restoreServerBootstrap() {
     const payload = window.__OKX_BOOTSTRAP__;
     if (!payload || typeof payload !== "object") return false;
     dashboardState.serverBootstrap = payload;
-    if (payload.account) {
-      applyAccountSummary(payload.account);
-    }
-    if (payload.automationState) {
-      renderAutomationState(payload.automationState);
-    }
-    if (payload.executionJournal?.orders?.length) {
-      applyRecentOrders(buildOrderFeedFromExecutionJournal(payload.executionJournal));
-    }
+    applyRuntimeSnapshot(payload);
     return true;
   } catch (error) {
     console.error("restoreServerBootstrap failed", error);
     return false;
   }
+}
+
+function normalizeRuntimeSnapshotPayload(payload = {}) {
+  const snapshot = payload && typeof payload === "object" ? payload : {};
+  const automationState = snapshot.automationState && typeof snapshot.automationState === "object"
+    ? snapshot.automationState
+    : (snapshot.state && typeof snapshot.state === "object" ? snapshot.state : {});
+  const account = snapshot.account && typeof snapshot.account === "object" ? snapshot.account : null;
+  const executionJournal = snapshot.executionJournal && typeof snapshot.executionJournal === "object"
+    ? snapshot.executionJournal
+    : (automationState.executionJournal && typeof automationState.executionJournal === "object"
+      ? automationState.executionJournal
+      : null);
+  return {
+    ...snapshot,
+    automationState,
+    account,
+    executionJournal,
+  };
+}
+
+function applyRuntimeSnapshot(payload = {}) {
+  const snapshot = normalizeRuntimeSnapshotPayload(payload);
+  dashboardState.runtimeSnapshot = snapshot;
+  if (snapshot.account) {
+    applyAccountSummary(snapshot.account);
+  }
+  if (snapshot.automationState && Object.keys(snapshot.automationState).length) {
+    renderAutomationState(snapshot.automationState);
+  }
+  if (snapshot.executionJournal?.orders?.length) {
+    applyRecentOrders(buildOrderFeedFromExecutionJournal(snapshot.executionJournal));
+  }
+  return snapshot;
 }
 
 function formatSignedMoney(value) {
@@ -6196,11 +6223,13 @@ async function refreshAutomationState() {
     let source = "automation_state";
     try {
       const data = await request("/api/automation/state", { timeoutMs: 4500 });
-      state = data.state || {};
+      const snapshot = applyRuntimeSnapshot(data);
+      state = snapshot.automationState || {};
     } catch (primaryError) {
       try {
         const snapshot = await request("/api/focus-snapshot", { timeoutMs: 6500 });
-        state = snapshot.automationState || {};
+        const normalized = applyRuntimeSnapshot(snapshot);
+        state = normalized.automationState || {};
         source = "focus_snapshot";
       } catch (snapshotError) {
         if (dashboardState.automation) {
@@ -6218,10 +6247,6 @@ async function refreshAutomationState() {
         }
         throw primaryError;
       }
-    }
-    renderAutomationState(state || {});
-    if (state?.executionJournal?.orders?.length) {
-      applyRecentOrders(buildOrderFeedFromExecutionJournal(state.executionJournal));
     }
     dashboardState.automationStateMeta = { source, error: "" };
     if (shouldAutoAnalyze(state || {})) {
@@ -6426,12 +6451,7 @@ async function refreshOrders() {
 async function refreshDeskState() {
   return runSingleFlight("deskState", async () => {
     const data = await request("/api/focus-snapshot", { timeoutMs: 30000 });
-    if (data.account) applyAccountSummary(data.account);
-    if (data.automationState) renderAutomationState(data.automationState);
-    if (data.executionJournal?.orders?.length) {
-      applyRecentOrders(buildOrderFeedFromExecutionJournal(data.executionJournal));
-    }
-    return data;
+    return applyRuntimeSnapshot(data);
   });
 }
 

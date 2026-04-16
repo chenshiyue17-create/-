@@ -24,6 +24,7 @@ import urllib.parse
 import urllib.request
 import ssl
 import errno
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_UP
 from http import HTTPStatus
@@ -2345,6 +2346,147 @@ def compose_runtime_snapshot_payload(
     return payload
 
 
+def slice_execution_journal_snapshot(
+    journal: dict[str, Any] | None,
+    *,
+    inst_type: str = "",
+    limit: int | None = None,
+) -> dict[str, Any]:
+    snapshot = copy.deepcopy(journal or {})
+    orders = list(snapshot.get("orders") or [])
+    normalized_type = str(inst_type or "").strip().upper()
+    if normalized_type:
+        orders = [
+            item for item in orders
+            if str((item or {}).get("instType") or "").strip().upper() == normalized_type
+        ]
+    orders.sort(
+        key=lambda row: int((row or {}).get("uTime") or (row or {}).get("cTime") or 0),
+        reverse=True,
+    )
+    effective_limit = max(1, int(limit or 80))
+    limited_orders = orders[:effective_limit]
+    summary = build_execution_journal_summary(limited_orders)
+    return {
+        "orders": limited_orders,
+        "summary": {key: value for key, value in summary.items() if key != "symbols"},
+        "symbols": summary.get("symbols") or [],
+        "lastReconciledAt": str(snapshot.get("lastReconciledAt") or ""),
+        "lastSource": str(snapshot.get("lastSource") or ""),
+    }
+
+
+@dataclass
+class RuntimeSnapshot:
+    automation_state: dict[str, Any] = field(default_factory=dict)
+    execution_journal: dict[str, Any] = field(default_factory=dict)
+    account_payload: dict[str, Any] = field(default_factory=dict)
+    timestamp: int = 0
+    execution_mode: str = "local"
+    remote_gateway_url: str = ""
+    remote_state_loaded: bool = True
+    remote_state_source: str = ""
+    remote_state_error: str = ""
+    account_error: str = ""
+    account_warning: str = ""
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any] | None) -> "RuntimeSnapshot":
+        raw = copy.deepcopy(payload or {})
+        automation_state = raw.get("automationState")
+        if not isinstance(automation_state, dict):
+            automation_state = raw.get("state") if isinstance(raw.get("state"), dict) else {}
+        account_payload = raw.get("account") if isinstance(raw.get("account"), dict) else {}
+        return cls(
+            automation_state=automation_state or {},
+            execution_journal=raw.get("executionJournal") if isinstance(raw.get("executionJournal"), dict) else {},
+            account_payload=account_payload or {},
+            timestamp=int(raw.get("timestamp") or time.time()),
+            execution_mode=str(raw.get("executionMode") or "local"),
+            remote_gateway_url=str(raw.get("remoteGatewayUrl") or ""),
+            remote_state_loaded=bool(raw.get("remoteStateLoaded", True)),
+            remote_state_source=str(
+                raw.get("remoteStateSource")
+                or (automation_state or {}).get("stateSource")
+                or ("remote_live" if str(raw.get("executionMode") or "") == "remote" else "local_live")
+            ),
+            remote_state_error=str(raw.get("remoteStateError") or ""),
+            account_error=str(raw.get("accountError") or ""),
+            account_warning=str(raw.get("accountWarning") or ""),
+        )
+
+    def as_focus_payload(self) -> dict[str, Any]:
+        payload = {
+            "ok": True,
+            "automationState": copy.deepcopy(self.automation_state),
+            "executionJournal": copy.deepcopy(self.execution_journal),
+            "timestamp": int(self.timestamp or time.time()),
+        }
+        if self.account_payload:
+            payload["account"] = copy.deepcopy(self.account_payload)
+        if self.account_error:
+            payload["accountError"] = self.account_error
+        if self.account_warning:
+            payload["accountWarning"] = self.account_warning
+        if self.execution_mode == "remote":
+            payload["executionMode"] = "remote"
+            payload["remoteGatewayUrl"] = self.remote_gateway_url
+        return payload
+
+    def as_automation_state_response(self) -> dict[str, Any]:
+        payload = {
+            "ok": True,
+            "state": copy.deepcopy(self.automation_state),
+            "remoteStateLoaded": self.remote_state_loaded,
+            "remoteStateSource": self.remote_state_source or (
+                str(self.automation_state.get("stateSource") or "")
+            ),
+        }
+        if self.remote_state_error:
+            payload["remoteStateError"] = self.remote_state_error
+        return payload
+
+    def as_account_overview_response(self) -> dict[str, Any]:
+        payload = {
+            "ok": True,
+            **copy.deepcopy(self.account_payload),
+        }
+        if not self.account_payload:
+            payload["summary"] = {}
+            payload["balanceCount"] = 0
+            payload["positionCount"] = 0
+        payload["equityDisplay"] = copy.deepcopy(
+            (self.account_payload or {}).get("equityDisplay")
+            or (self.automation_state.get("equityDisplay") if isinstance(self.automation_state, dict) else {})
+            or {}
+        )
+        if self.account_warning:
+            payload["accountWarning"] = self.account_warning
+        if self.account_error:
+            payload["accountError"] = self.account_error
+        if self.execution_mode == "remote":
+            payload["executionMode"] = "remote"
+            payload["remoteGatewayUrl"] = self.remote_gateway_url
+        return payload
+
+    def orders_payload(self, *, inst_type: str = "", limit: int | None = None) -> dict[str, Any]:
+        journal = slice_execution_journal_snapshot(
+            self.execution_journal,
+            inst_type=inst_type,
+            limit=limit,
+        )
+        return {
+            "ok": True,
+            "orders": journal.get("orders") or [],
+            "journal": journal.get("summary") or {},
+            "executionJournal": journal,
+            "symbols": journal.get("symbols") or [],
+            "lastReconciledAt": journal.get("lastReconciledAt") or "",
+            "lastSource": journal.get("lastSource") or "",
+            "source": journal.get("lastSource") or self.remote_state_source or "runtime_snapshot",
+        }
+
+
 def load_local_runtime_account_payload(
     config: dict[str, Any],
     *,
@@ -2540,6 +2682,29 @@ def build_remote_runtime_snapshot_payload(
         normalized["remoteStateSource"] = "local_fallback"
         normalized["remoteStateError"] = fallback_error
         return normalized
+
+
+def build_runtime_snapshot(
+    config: dict[str, Any] | None = None,
+    *,
+    include_account: bool = True,
+    include_account_positions: bool = False,
+    remote_timeout: float | None = None,
+    force_local: bool = False,
+) -> RuntimeSnapshot:
+    current = config or CONFIG.current()
+    if not force_local and should_proxy_to_remote(current, "/api/focus-snapshot"):
+        payload = build_remote_runtime_snapshot_payload(
+            current,
+            timeout=remote_timeout,
+        )
+    else:
+        payload = build_local_runtime_snapshot_payload(
+            current,
+            include_account=include_account,
+            include_account_positions=include_account_positions,
+        )
+    return RuntimeSnapshot.from_payload(payload)
 
 
 def stamp_runtime_state_sync(
@@ -13782,83 +13947,13 @@ def relay_requests_response(handler: BaseHTTPRequestHandler, response: requests.
 
 def build_index_bootstrap_payload() -> dict[str, Any]:
     try:
-        config = CONFIG.current()
-        live_only = prefer_live_execution_state(config)
-        execution_journal = get_execution_journal_snapshot(
-            limit=DEFAULT_RECENT_ORDER_LIMIT,
-            live_only=live_only,
+        snapshot = build_runtime_snapshot(
+            CONFIG.current(),
+            include_account=True,
+            include_account_positions=False,
+            remote_timeout=1.5,
         )
-        automation_state: dict[str, Any] = {}
-        account_payload: dict[str, Any] = {}
-
-        if should_proxy_to_remote(config, "/api/focus-snapshot"):
-            try:
-                response = remote_gateway_request(
-                    config,
-                    "GET",
-                    "/api/focus-snapshot",
-                    timeout=1.5,
-                )
-                remote_payload = response.json() if response.content else {}
-                remote_automation = load_remote_automation_config_for_proxy(config)
-                if isinstance(remote_payload.get("automationState"), dict):
-                    automation_state = enrich_remote_dip_swing_runtime_state(
-                        remote_payload.get("automationState") or {},
-                        remote_automation,
-                        config,
-                    )
-                remote_journal = remote_payload.get("executionJournal") or {}
-                if isinstance(remote_journal, dict) and remote_journal.get("orders"):
-                    execution_journal = remote_journal
-                if isinstance(remote_payload.get("account"), dict):
-                    account_payload = copy.deepcopy(remote_payload.get("account") or {})
-            except Exception:
-                cached_state, _cached_ts = load_cached_remote_automation_state(config)
-                if cached_state:
-                    automation_state = copy.deepcopy(cached_state)
-
-        if not automation_state:
-            automation_state = sanitize_only_dip_swing_runtime_state(
-                AUTOMATION_ENGINE.snapshot(),
-                AUTOMATION_CONFIG.current(),
-            )
-
-        automation_state["executionJournal"] = execution_journal
-        automation_state["equityDisplay"] = build_equity_display(
-            account_payload.get("summary") or None,
-            automation_state,
-            execution_journal,
-        )
-        payload: dict[str, Any] = {
-            "automationState": automation_state,
-            "executionJournal": execution_journal,
-            "timestamp": int(time.time()),
-        }
-        if account_payload:
-            account_payload["equityDisplay"] = build_equity_display(
-                account_payload.get("summary") or {},
-                automation_state,
-                execution_journal,
-            )
-            payload["account"] = account_payload
-        else:
-            current_eq = automation_state.get("currentEq")
-            session_start_eq = automation_state.get("sessionStartEq")
-            if current_eq or session_start_eq:
-                payload["account"] = {
-                    "summary": {
-                        "displayTotalEq": current_eq or 0,
-                        "totalEq": current_eq or 0,
-                    },
-                    "balanceCount": 0,
-                    "positionCount": 0,
-                    "equityDisplay": build_equity_display(
-                        None,
-                        automation_state,
-                        execution_journal,
-                    ),
-                }
-        return payload
+        return snapshot.as_focus_payload()
     except Exception:
         return {}
 
@@ -13912,116 +14007,30 @@ class AppHandler(BaseHTTPRequestHandler):
 
         if path != "/api/automation/config" and should_proxy_to_remote(config, path):
             try:
-                if path in ("/api/health", "/api/focus-snapshot"):
+                if path == "/api/focus-snapshot":
+                    snapshot = build_runtime_snapshot(
+                        config,
+                        include_account=True,
+                        include_account_positions=False,
+                        remote_timeout=1.5,
+                    )
+                    payload = snapshot.as_focus_payload()
+                    payload.pop("minerOverview", None)
+                    json_response(self, payload)
+                elif path == "/api/automation/state":
+                    snapshot = build_runtime_snapshot(
+                        config,
+                        include_account=True,
+                        include_account_positions=False,
+                        remote_timeout=REMOTE_AUTOMATION_STATE_TIMEOUT,
+                    )
+                    json_response(self, snapshot.as_automation_state_response())
+                elif path == "/api/health":
                     response = remote_gateway_request(config, "GET", self.path)
                     payload = response.json()
-                    if path == "/api/focus-snapshot":
-                        remote_automation = load_remote_automation_config_for_proxy(config)
-                        if isinstance(payload.get("automationState"), dict):
-                            payload["automationState"] = enrich_remote_dip_swing_runtime_state(
-                                payload.get("automationState") or {},
-                                remote_automation,
-                                CONFIG.current(),
-                            )
-                        payload.pop("minerOverview", None)
                     payload["executionMode"] = "remote"
                     payload["remoteGatewayUrl"] = remote_gateway_url(config)
                     json_response(self, payload, status=response.status_code)
-                elif path == "/api/automation/state":
-                    try:
-                        response = remote_gateway_request(
-                            config,
-                            "GET",
-                            self.path,
-                            timeout=REMOTE_AUTOMATION_STATE_TIMEOUT,
-                        )
-                        payload = response.json()
-                        remote_automation = load_remote_automation_config_for_proxy(config)
-                        if isinstance(payload.get("state"), dict):
-                            payload["state"] = enrich_remote_dip_swing_runtime_state(
-                                payload.get("state") or {},
-                                remote_automation,
-                                CONFIG.current(),
-                            )
-                            local_journal = get_execution_journal_snapshot(limit=80, live_only=live_only)
-                            if (local_journal.get("orders") or local_journal.get("summary")):
-                                payload["state"]["executionJournal"] = local_journal
-                            payload["state"]["equityDisplay"] = build_equity_display(
-                                None,
-                                payload.get("state") or {},
-                                payload["state"].get("executionJournal") or local_journal,
-                            )
-                            payload["state"] = stamp_runtime_state_sync(
-                                payload.get("state") or {},
-                                source="remote_live",
-                                loaded=True,
-                                fetched_at=now_local_iso(),
-                                age_seconds=0.0,
-                                stale=False,
-                            )
-                            store_cached_remote_automation_state(config, payload["state"])
-                        payload["remoteStateLoaded"] = True
-                        payload["remoteStateSource"] = "remote_live"
-                        json_response(self, payload, status=response.status_code)
-                    except Exception as exc:
-                        local_journal = get_execution_journal_snapshot(limit=80, live_only=live_only)
-                        fallback_error = summarize_remote_runtime_error(exc)
-                        cached_state, cached_ts = load_cached_remote_automation_state(config)
-                        if cached_state:
-                            fallback_state = copy.deepcopy(cached_state)
-                            if (local_journal.get("orders") or local_journal.get("summary")):
-                                fallback_state["executionJournal"] = local_journal
-                            fallback_state["equityDisplay"] = build_equity_display(
-                                None,
-                                fallback_state,
-                                fallback_state.get("executionJournal") or local_journal,
-                            )
-                            warnings = list((fallback_state.get("analysis") or {}).get("warnings") or [])
-                            warnings.append(fallback_error)
-                            fallback_state.setdefault("analysis", {})["warnings"] = warnings[-6:]
-                            fallback_state = stamp_runtime_state_sync(
-                                fallback_state,
-                                source="remote_cache",
-                                loaded=False,
-                                error=fallback_error,
-                                fetched_at=fallback_state.get("stateFetchedAt") or now_local_iso(),
-                                age_seconds=time.time() - cached_ts if cached_ts else 0.0,
-                                stale=True,
-                            )
-                        else:
-                            fallback_state = sanitize_only_dip_swing_runtime_state(
-                                AUTOMATION_ENGINE.snapshot(),
-                                AUTOMATION_CONFIG.current(),
-                            )
-                            if (local_journal.get("orders") or local_journal.get("summary")):
-                                fallback_state["executionJournal"] = local_journal
-                            fallback_state["equityDisplay"] = build_equity_display(
-                                None,
-                                fallback_state,
-                                fallback_state.get("executionJournal") or local_journal,
-                            )
-                            warnings = list((fallback_state.get("analysis") or {}).get("warnings") or [])
-                            warnings.append(fallback_error)
-                            fallback_state.setdefault("analysis", {})["warnings"] = warnings[-6:]
-                            fallback_state = stamp_runtime_state_sync(
-                                fallback_state,
-                                source="local_fallback",
-                                loaded=False,
-                                error=fallback_error,
-                                fetched_at=now_local_iso(),
-                                age_seconds=0.0,
-                                stale=True,
-                            )
-                        json_response(
-                            self,
-                            {
-                                "ok": True,
-                                "state": fallback_state,
-                                "remoteStateLoaded": False,
-                                "remoteStateSource": fallback_state.get("stateSource") or "local_fallback",
-                                "remoteStateError": fallback_error,
-                            },
-                        )
                 elif path == "/api/orders/recent":
                     limit = parse_recent_order_limit(query)
                     response = remote_gateway_request(config, "GET", self.path)
@@ -14049,36 +14058,13 @@ class AppHandler(BaseHTTPRequestHandler):
                         payload["lastReconciledAt"] = journal.get("lastReconciledAt") or payload.get("lastReconciledAt") or now_local_iso()
                     json_response(self, payload, status=response.status_code)
                 elif path == "/api/account/overview":
-                    response = remote_gateway_request(config, "GET", self.path)
-                    payload = response.json() if response.content else {}
-                    remote_runtime_state: dict[str, Any] = {}
-                    try:
-                        runtime_response = remote_gateway_request(
-                            config,
-                            "GET",
-                            "/api/automation/state",
-                            timeout=REMOTE_AUTOMATION_STATE_TIMEOUT,
-                        )
-                        runtime_payload = runtime_response.json() if runtime_response.content else {}
-                        remote_automation = load_remote_automation_config_for_proxy(config)
-                        if isinstance(runtime_payload.get("state"), dict):
-                            remote_runtime_state = enrich_remote_dip_swing_runtime_state(
-                                runtime_payload.get("state") or {},
-                                remote_automation,
-                                CONFIG.current(),
-                            )
-                    except Exception:
-                        cached_runtime_state, _cached_ts = load_cached_remote_automation_state(config)
-                        remote_runtime_state = cached_runtime_state or {}
-                    payload["equityDisplay"] = build_equity_display(
-                        payload.get("summary") or {},
-                        remote_runtime_state,
-                        get_execution_journal_snapshot(
-                            limit=DEFAULT_RECENT_ORDER_LIMIT,
-                            live_only=live_only,
-                        ),
+                    snapshot = build_runtime_snapshot(
+                        config,
+                        include_account=True,
+                        include_account_positions=True,
+                        remote_timeout=REMOTE_AUTOMATION_STATE_TIMEOUT,
                     )
-                    json_response(self, payload, status=response.status_code)
+                    json_response(self, snapshot.as_account_overview_response())
                 else:
                     response = remote_gateway_request(config, "GET", self.path)
                     relay_requests_response(self, response)
@@ -14206,114 +14192,44 @@ class AppHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/automation/state":
-            state = sanitize_only_dip_swing_runtime_state(AUTOMATION_ENGINE.snapshot(), AUTOMATION_CONFIG.current())
-            state["executionJournal"] = get_execution_journal_snapshot(
-                limit=DEFAULT_RECENT_ORDER_LIMIT,
-                live_only=live_only,
+            snapshot = build_runtime_snapshot(
+                config,
+                include_account=True,
+                include_account_positions=False,
+                force_local=True,
             )
-            state["equityDisplay"] = build_equity_display(
-                None,
-                state,
-                state.get("executionJournal") or {},
-            )
-            state = stamp_runtime_state_sync(
-                state,
-                source="local_live",
-                loaded=True,
-                fetched_at=now_local_iso(),
-                age_seconds=0.0,
-                stale=False,
-            )
-            json_response(self, {"ok": True, "state": state})
+            json_response(self, snapshot.as_automation_state_response())
             return
 
         if path == "/api/focus-snapshot":
-            payload: dict[str, Any] = {
-                "ok": True,
-                "automationState": sanitize_only_dip_swing_runtime_state(
-                    AUTOMATION_ENGINE.snapshot(),
-                    AUTOMATION_CONFIG.current(),
-                ),
-                "executionJournal": get_execution_journal_snapshot(
-                    limit=DEFAULT_RECENT_ORDER_LIMIT,
-                    live_only=live_only,
-                ),
-                "timestamp": int(time.time()),
-            }
-
-            valid, message = validate_config(config)
-            def load_account() -> dict[str, Any]:
-                if not valid:
-                    raise RuntimeError(message)
-                def fetch() -> dict[str, Any]:
-                    ensure_live_route_ready(config, force=False)
-                    client = OkxClient(config)
-                    snapshot = fetch_account_snapshot(client, include_positions=False)
-                    return {
-                        "summary": snapshot["summary"],
-                        "fundingSummary": snapshot.get("fundingSummary", {}),
-                        "balanceCount": snapshot.get("balanceCount", 0),
-                        "positionCount": snapshot.get("positionCount", 0),
-                    }
-
-                data, error_text, cached = load_cached_focus_section("account", 12.0, fetch)
-                if error_text and cached:
-                    payload["accountWarning"] = f"账户快照沿用缓存: {error_text}"
-                return data
-
-            jobs = {
-                "account": load_account,
-            }
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                future_map = {
-                    executor.submit(loader): key for key, loader in jobs.items()
-                }
-                for future in concurrent.futures.as_completed(future_map):
-                    key = future_map[future]
-                    try:
-                        payload[key] = future.result()
-                    except Exception as exc:
-                        payload[f"{key}Error"] = str(exc)
-
-            json_response(self, payload)
+            snapshot = build_runtime_snapshot(
+                config,
+                include_account=True,
+                include_account_positions=False,
+                force_local=True,
+            )
+            json_response(self, snapshot.as_focus_payload())
             return
 
         if path == "/api/account/overview":
-            config = CONFIG.current()
-            valid, message = validate_config(config)
-            if not valid:
-                error_response(self, message, status=400)
+            snapshot = build_runtime_snapshot(
+                config,
+                include_account=True,
+                include_account_positions=True,
+                force_local=True,
+            )
+            if snapshot.account_error and not snapshot.account_payload:
+                error_response(self, f"获取账户数据失败: {snapshot.account_error}", status=502)
                 return
+            payload = snapshot.as_account_overview_response()
             try:
-                route = ensure_live_route_ready(config, force=False)
-                client = OkxClient(config)
-                snapshot = fetch_account_snapshot(client, include_positions=True)
-                json_response(
-                    self,
-                    {
-                        "ok": True,
-                        "summary": snapshot["summary"],
-                        "balances": snapshot["balances"],
-                        "tradingBalances": snapshot.get("tradingBalances", []),
-                        "fundingBalances": snapshot.get("fundingBalances", []),
-                        "fundingSummary": snapshot.get("fundingSummary", {}),
-                        "positions": snapshot["positions"],
-                        "balanceCount": snapshot.get("balanceCount", 0),
-                        "positionCount": snapshot.get("positionCount", 0),
-                        "fundingWarning": snapshot.get("fundingWarning", ""),
-                        "equityDisplay": build_equity_display(
-                            snapshot.get("summary") or {},
-                            AUTOMATION_STATE.current(),
-                            get_execution_journal_snapshot(
-                                limit=DEFAULT_RECENT_ORDER_LIMIT,
-                                live_only=live_only,
-                            ),
-                        ),
-                        "route": route,
-                    },
-                )
+                payload["route"] = ensure_live_route_ready(config, force=False)
             except Exception as exc:
-                error_response(self, f"获取账户数据失败: {exc}", status=502)
+                if not payload.get("summary"):
+                    error_response(self, f"获取账户数据失败: {exc}", status=502)
+                    return
+                payload["routeError"] = str(exc)
+            json_response(self, payload)
             return
 
         if path == "/api/orders/recent":
