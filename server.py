@@ -118,6 +118,8 @@ REMOTE_AUTOMATION_CONFIG_LOCK = threading.RLock()
 REMOTE_AUTOMATION_CONFIG_CACHE: dict[str, Any] = {"ts": 0.0, "url": "", "config": {}}
 REMOTE_AUTOMATION_STATE_LOCK = threading.RLock()
 REMOTE_AUTOMATION_STATE_CACHE: dict[str, Any] = {"ts": 0.0, "url": "", "state": {}}
+REMOTE_RUNTIME_SNAPSHOT_LOCK = threading.RLock()
+REMOTE_RUNTIME_SNAPSHOT_CACHE: dict[str, Any] = {"ts": 0.0, "url": "", "payload": {}}
 ONLY_STRATEGY_PRESET = "dip_swing"
 ONLY_STRATEGY_LABEL = "利润循环"
 ONLY_STRATEGY_FALLBACK_DECISION = "持续开仓"
@@ -2264,6 +2266,280 @@ def store_cached_remote_automation_state(config: dict[str, Any], state: dict[str
         REMOTE_AUTOMATION_STATE_CACHE["ts"] = time.time()
         REMOTE_AUTOMATION_STATE_CACHE["url"] = cache_key
         REMOTE_AUTOMATION_STATE_CACHE["state"] = copy.deepcopy(state)
+
+
+def remote_runtime_snapshot_cache_key(config: dict[str, Any] | None) -> str:
+    current = config or {}
+    return str(remote_gateway_url(current) or "").rstrip("/")
+
+
+def load_cached_remote_runtime_snapshot(config: dict[str, Any]) -> tuple[dict[str, Any], float]:
+    cache_key = remote_runtime_snapshot_cache_key(config)
+    if not cache_key:
+        return {}, 0.0
+    with REMOTE_RUNTIME_SNAPSHOT_LOCK:
+        cached_key = str(REMOTE_RUNTIME_SNAPSHOT_CACHE.get("url") or "")
+        cached_ts = float(REMOTE_RUNTIME_SNAPSHOT_CACHE.get("ts") or 0.0)
+        cached_payload = REMOTE_RUNTIME_SNAPSHOT_CACHE.get("payload") or {}
+        if cached_key != cache_key or not isinstance(cached_payload, dict) or not cached_payload:
+            return {}, 0.0
+        return copy.deepcopy(cached_payload), cached_ts
+
+
+def store_cached_remote_runtime_snapshot(config: dict[str, Any], payload: dict[str, Any]) -> None:
+    cache_key = remote_runtime_snapshot_cache_key(config)
+    if not cache_key or not isinstance(payload, dict) or not payload:
+        return
+    with REMOTE_RUNTIME_SNAPSHOT_LOCK:
+        REMOTE_RUNTIME_SNAPSHOT_CACHE["ts"] = time.time()
+        REMOTE_RUNTIME_SNAPSHOT_CACHE["url"] = cache_key
+        REMOTE_RUNTIME_SNAPSHOT_CACHE["payload"] = copy.deepcopy(payload)
+
+
+def synthesize_runtime_account_payload(automation_state: dict[str, Any] | None = None) -> dict[str, Any]:
+    state = automation_state or {}
+    current_eq = safe_decimal(state.get("currentEq"), "0")
+    session_start_eq = safe_decimal(state.get("sessionStartEq"), "0")
+    if current_eq <= 0 and session_start_eq <= 0:
+        return {}
+    display_total_eq = current_eq if current_eq > 0 else session_start_eq
+    return {
+        "summary": {
+            "displayTotalEq": decimal_to_str(display_total_eq),
+            "totalEq": decimal_to_str(display_total_eq),
+        },
+        "balanceCount": 0,
+        "positionCount": 0,
+    }
+
+
+def compose_runtime_snapshot_payload(
+    automation_state: dict[str, Any] | None,
+    execution_journal: dict[str, Any] | None,
+    *,
+    account_payload: dict[str, Any] | None = None,
+    timestamp: int | None = None,
+) -> dict[str, Any]:
+    state = copy.deepcopy(automation_state or {})
+    journal = copy.deepcopy(execution_journal or {})
+    account = copy.deepcopy(account_payload or {}) or synthesize_runtime_account_payload(state)
+    state["executionJournal"] = journal
+    state["equityDisplay"] = build_equity_display(
+        (account.get("summary") or {}) if account else None,
+        state,
+        journal,
+    )
+    payload: dict[str, Any] = {
+        "ok": True,
+        "automationState": state,
+        "executionJournal": journal,
+        "timestamp": int(timestamp or time.time()),
+    }
+    if account:
+        account["equityDisplay"] = build_equity_display(
+            account.get("summary") or {},
+            state,
+            journal,
+        )
+        payload["account"] = account
+    return payload
+
+
+def load_local_runtime_account_payload(
+    config: dict[str, Any],
+    *,
+    include_positions: bool = False,
+) -> tuple[dict[str, Any], str]:
+    valid, message = validate_config(config)
+    if not valid:
+        return {}, message
+
+    def fetch_account_payload() -> dict[str, Any]:
+        ensure_live_route_ready(config, force=False)
+        client = OkxClient(config)
+        snapshot = fetch_account_snapshot(client, include_positions=include_positions)
+        payload = {
+            "summary": snapshot.get("summary") or {},
+            "fundingSummary": snapshot.get("fundingSummary", {}),
+            "balanceCount": snapshot.get("balanceCount", 0),
+            "positionCount": snapshot.get("positionCount", 0),
+        }
+        if include_positions:
+            payload["balances"] = snapshot.get("balances", [])
+            payload["tradingBalances"] = snapshot.get("tradingBalances", [])
+            payload["fundingBalances"] = snapshot.get("fundingBalances", [])
+            payload["positions"] = snapshot.get("positions", [])
+            payload["fundingWarning"] = snapshot.get("fundingWarning", "")
+        return payload
+
+    try:
+        if include_positions:
+            return fetch_account_payload(), ""
+        payload, error_text, cached = load_cached_focus_section("account", 12.0, fetch_account_payload)
+        account_payload = payload or {}
+        if error_text and cached:
+            account_payload = copy.deepcopy(account_payload)
+            account_payload["warning"] = f"账户快照沿用缓存: {error_text}"
+        return account_payload, ""
+    except Exception as exc:
+        return {}, str(exc)
+
+
+def build_local_runtime_snapshot_payload(
+    config: dict[str, Any] | None = None,
+    *,
+    include_account: bool = True,
+    include_account_positions: bool = False,
+) -> dict[str, Any]:
+    current = config or CONFIG.current()
+    live_only = prefer_live_execution_state(current)
+    automation_state = sanitize_only_dip_swing_runtime_state(
+        AUTOMATION_ENGINE.snapshot(),
+        AUTOMATION_CONFIG.current(),
+    )
+    automation_state = stamp_runtime_state_sync(
+        automation_state,
+        source="local_live",
+        loaded=True,
+        fetched_at=now_local_iso(),
+        age_seconds=0.0,
+        stale=False,
+    )
+    execution_journal = get_execution_journal_snapshot(
+        limit=DEFAULT_RECENT_ORDER_LIMIT,
+        live_only=live_only,
+    )
+    account_payload: dict[str, Any] = {}
+    account_error = ""
+    if include_account:
+        account_payload, account_error = load_local_runtime_account_payload(
+            current,
+            include_positions=include_account_positions,
+        )
+    payload = compose_runtime_snapshot_payload(
+        automation_state,
+        execution_journal,
+        account_payload=account_payload,
+    )
+    if account_error:
+        payload["accountError"] = account_error
+    if account_payload.get("warning"):
+        payload["accountWarning"] = str(account_payload.get("warning") or "")
+    return payload
+
+
+def normalize_remote_runtime_snapshot_payload(
+    config: dict[str, Any],
+    payload: dict[str, Any] | None,
+    *,
+    loaded: bool,
+    source: str,
+    error: str = "",
+    age_seconds: float = 0.0,
+    stale: bool = False,
+) -> dict[str, Any]:
+    raw = copy.deepcopy(payload or {})
+    remote_automation = load_remote_automation_config_for_proxy(config)
+    state_candidate = raw.get("automationState")
+    if not isinstance(state_candidate, dict):
+        state_candidate = raw.get("state") if isinstance(raw.get("state"), dict) else {}
+    automation_state = enrich_remote_dip_swing_runtime_state(
+        state_candidate or {},
+        remote_automation,
+        CONFIG.current(),
+    )
+    automation_state = stamp_runtime_state_sync(
+        automation_state,
+        source=source,
+        loaded=loaded,
+        error=error,
+        fetched_at=automation_state.get("stateFetchedAt") or now_local_iso(),
+        age_seconds=age_seconds,
+        stale=stale,
+    )
+    execution_journal = raw.get("executionJournal")
+    if not isinstance(execution_journal, dict):
+        execution_journal = automation_state.get("executionJournal") if isinstance(automation_state.get("executionJournal"), dict) else {}
+    account_payload = raw.get("account") if isinstance(raw.get("account"), dict) else {}
+    normalized = compose_runtime_snapshot_payload(
+        automation_state,
+        execution_journal,
+        account_payload=account_payload,
+        timestamp=raw.get("timestamp") or int(time.time()),
+    )
+    normalized["executionMode"] = "remote"
+    normalized["remoteGatewayUrl"] = remote_gateway_url(config)
+    return normalized
+
+
+def build_remote_runtime_snapshot_payload(
+    config: dict[str, Any],
+    *,
+    timeout: float | None = None,
+) -> dict[str, Any]:
+    request_timeout = timeout if timeout is not None else REMOTE_AUTOMATION_STATE_TIMEOUT
+    try:
+        response = remote_gateway_request(
+            config,
+            "GET",
+            "/api/focus-snapshot",
+            timeout=request_timeout,
+        )
+        payload = response.json() if response.content else {}
+        normalized = normalize_remote_runtime_snapshot_payload(
+            config,
+            payload,
+            loaded=True,
+            source="remote_live",
+            age_seconds=0.0,
+            stale=False,
+        )
+        store_cached_remote_runtime_snapshot(config, normalized)
+        store_cached_remote_automation_state(config, normalized.get("automationState") or {})
+        return normalized
+    except Exception as exc:
+        fallback_error = summarize_remote_runtime_error(exc)
+        cached_payload, cached_ts = load_cached_remote_runtime_snapshot(config)
+        if cached_payload:
+            normalized = normalize_remote_runtime_snapshot_payload(
+                config,
+                cached_payload,
+                loaded=False,
+                source="remote_cache",
+                error=fallback_error,
+                age_seconds=time.time() - cached_ts if cached_ts else 0.0,
+                stale=True,
+            )
+            normalized["remoteStateLoaded"] = False
+            normalized["remoteStateSource"] = "remote_cache"
+            normalized["remoteStateError"] = fallback_error
+            return normalized
+
+        fallback_payload = build_local_runtime_snapshot_payload(config, include_account=True)
+        fallback_state = copy.deepcopy(fallback_payload.get("automationState") or {})
+        warnings = list((fallback_state.get("analysis") or {}).get("warnings") or [])
+        warnings.append(fallback_error)
+        fallback_state.setdefault("analysis", {})["warnings"] = warnings[-6:]
+        fallback_state = stamp_runtime_state_sync(
+            fallback_state,
+            source="local_fallback",
+            loaded=False,
+            error=fallback_error,
+            fetched_at=now_local_iso(),
+            age_seconds=0.0,
+            stale=True,
+        )
+        normalized = compose_runtime_snapshot_payload(
+            fallback_state,
+            fallback_payload.get("executionJournal") or {},
+            account_payload=fallback_payload.get("account") or {},
+        )
+        normalized["executionMode"] = "remote"
+        normalized["remoteGatewayUrl"] = remote_gateway_url(config)
+        normalized["remoteStateLoaded"] = False
+        normalized["remoteStateSource"] = "local_fallback"
+        normalized["remoteStateError"] = fallback_error
+        return normalized
 
 
 def stamp_runtime_state_sync(
@@ -14063,6 +14339,7 @@ class AppHandler(BaseHTTPRequestHandler):
                         "orders": merged_live_orders,
                         "source": "private_ws" if stream_orders else "local_cache",
                         "journal": cached_journal.get("summary") or {},
+                        "executionJournal": cached_journal,
                         "symbols": cached_journal.get("symbols") or [],
                         "lastReconciledAt": cached_journal.get("lastReconciledAt") or "",
                         "lastSource": cached_journal.get("lastSource") or "",
@@ -14091,6 +14368,7 @@ class AppHandler(BaseHTTPRequestHandler):
                             "orders": journal.get("orders") or merged_orders,
                             "source": "rest_multi" if (stream_orders or cached_orders) else "rest",
                             "journal": journal.get("summary") or {},
+                            "executionJournal": journal,
                             "symbols": journal.get("symbols") or [],
                             "lastReconciledAt": journal.get("lastReconciledAt") or "",
                             "lastSource": journal.get("lastSource") or "",
@@ -14128,6 +14406,7 @@ class AppHandler(BaseHTTPRequestHandler):
                         "orders": journal.get("orders") or merged_orders[:20],
                         "source": "rest_multi",
                         "journal": journal.get("summary") or {},
+                        "executionJournal": journal,
                         "symbols": journal.get("symbols") or [],
                         "lastReconciledAt": journal.get("lastReconciledAt") or "",
                         "lastSource": journal.get("lastSource") or "",
@@ -14143,6 +14422,7 @@ class AppHandler(BaseHTTPRequestHandler):
                             "orders": merged_live_orders,
                             "source": "private_ws" if stream_orders else "local_cache",
                             "journal": cached_journal.get("summary") or {},
+                            "executionJournal": cached_journal,
                             "symbols": cached_journal.get("symbols") or [],
                             "lastReconciledAt": cached_journal.get("lastReconciledAt") or "",
                             "lastSource": cached_journal.get("lastSource") or "",

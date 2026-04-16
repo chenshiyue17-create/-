@@ -245,6 +245,60 @@ function buildOrderFeedFromJournalSnapshot(journal = {}, source = "journal_cache
   };
 }
 
+function normalizeOrderFeedPayload(payload = {}) {
+  const source = payload?.source || payload?.lastSource || "rest";
+  const stream = payload?.stream || null;
+  const directOrders = Array.isArray(payload?.orders) ? payload.orders : [];
+  const executionJournal = payload?.executionJournal && typeof payload.executionJournal === "object"
+    ? payload.executionJournal
+    : null;
+  const journalPayload = payload?.journal && typeof payload.journal === "object"
+    ? payload.journal
+    : null;
+
+  if (directOrders.length) {
+    return {
+      ...payload,
+      orders: directOrders,
+      source,
+      stream,
+      journal: journalPayload || executionJournal?.summary || {},
+      symbols: payload?.symbols || executionJournal?.symbols || [],
+      lastReconciledAt: payload?.lastReconciledAt || executionJournal?.lastReconciledAt || "",
+      lastSource: payload?.lastSource || executionJournal?.lastSource || source,
+      executionJournal: executionJournal || null,
+    };
+  }
+
+  if (executionJournal?.orders?.length) {
+    return {
+      ...buildOrderFeedFromExecutionJournal(executionJournal),
+      source,
+      stream,
+      executionJournal,
+    };
+  }
+
+  if (journalPayload?.orders?.length) {
+    return {
+      ...buildOrderFeedFromJournalSnapshot(journalPayload, source, stream),
+      executionJournal: executionJournal || null,
+    };
+  }
+
+  return {
+    ...payload,
+    orders: [],
+    source,
+    stream,
+    journal: journalPayload || executionJournal?.summary || {},
+    symbols: payload?.symbols || executionJournal?.symbols || [],
+    lastReconciledAt: payload?.lastReconciledAt || executionJournal?.lastReconciledAt || "",
+    lastSource: payload?.lastSource || executionJournal?.lastSource || source,
+    executionJournal: executionJournal || null,
+  };
+}
+
 function getKnownOrderFeedCandidates() {
   const candidates = [];
   if (dashboardState.recentOrdersAll?.length) {
@@ -1419,7 +1473,7 @@ function setWorkspaceView(view, { persist = true, scroll = true } = {}) {
   if (key === "orders") {
     hydrateOrdersFromKnownSources();
   }
-  if (key === "orders" && !dashboardState.ordersLoadedOnce) {
+  if (key === "orders") {
     refreshOrders().catch(() => {});
   }
   syncOrderPolling();
@@ -5039,18 +5093,20 @@ function renderOrderSummary(data, orders) {
         : "REST";
   const stats = collectOrderExecutionStats(orders);
   const journal = data?.journal || dashboardState.orderJournal || {};
-  const journalSource = journal?.lastSource === "private_ws"
+  const rawJournalSource = journal?.lastSource || data?.lastSource || dashboardState.orderFeedMeta?.lastSource || "";
+  const journalSource = rawJournalSource === "private_ws"
     ? "私有账本"
-    : journal?.lastSource === "paper_state_recovered"
+    : rawJournalSource === "paper_state_recovered"
       ? "本地恢复"
-      : journal?.lastSource === "rest_multi"
+      : rawJournalSource === "rest_multi"
         ? "REST 聚合"
-        : journal?.lastSource === "rest"
+        : rawJournalSource === "rest"
           ? "REST"
-          : journal?.lastSource
-            ? journal.lastSource
+          : rawJournalSource
+            ? rawJournalSource
             : "--";
-  const reconciledAt = journal?.lastReconciledAt ? formatOrderTime(journal.lastReconciledAt) : "--";
+  const rawReconciledAt = journal?.lastReconciledAt || data?.lastReconciledAt || dashboardState.orderFeedMeta?.lastReconciledAt || "";
+  const reconciledAt = rawReconciledAt ? formatOrderTime(rawReconciledAt) : "--";
   const totalCount = Number(journal.totalOrders ?? (((data?.orders || []).length) || 0));
   const workingCount = Number(journal.workingOrders ?? stats.working ?? 0);
   const filledCount = Number(journal.filledOrders ?? stats.filled ?? 0);
@@ -6268,11 +6324,12 @@ function applyAccountSummary(account) {
 }
 
 function applyRecentOrders(data) {
+  const normalized = normalizeOrderFeedPayload(data);
   try {
-    renderOrderFeed(data);
+    renderOrderFeed(normalized);
   } catch (error) {
-    console.error("applyRecentOrders failed, falling back to stable renderer", error, data);
-    renderOrderFeedFallback(data, error);
+    console.error("applyRecentOrders failed, falling back to stable renderer", error, normalized);
+    renderOrderFeedFallback(normalized, error);
   }
 }
 
@@ -6332,13 +6389,30 @@ async function refreshOrders() {
   return runSingleFlight("orders", async () => {
     try {
       const data = await request("/api/orders/recent?limit=80");
-      if (!data?.orders?.length && getKnownOrderFeedCandidates().length) {
+      const normalized = normalizeOrderFeedPayload(data);
+      if (!normalized?.orders?.length) {
+        try {
+          const snapshot = await request("/api/focus-snapshot", { timeoutMs: 12000 });
+          const snapshotFeed = normalizeOrderFeedPayload({
+            executionJournal: snapshot?.executionJournal || null,
+            source: "focus_snapshot",
+            stream: dashboardState.orderFeedMeta?.stream || null,
+          });
+          if (snapshotFeed.orders?.length) {
+            applyRecentOrders(snapshotFeed);
+            return snapshotFeed;
+          }
+        } catch (snapshotError) {
+          console.warn("refreshOrders focus-snapshot fallback failed", snapshotError);
+        }
+      }
+      if (!normalized?.orders?.length && getKnownOrderFeedCandidates().length) {
         console.warn("refreshOrders empty response -> keep known order feed");
         hydrateOrdersFromKnownSources();
-        return data;
+        return normalized;
       }
-      applyRecentOrders(data);
-      return data;
+      applyRecentOrders(normalized);
+      return normalized;
     } catch (error) {
       if (hydrateOrdersFromKnownSources()) {
         console.warn("refreshOrders fallback -> known sources", error);
