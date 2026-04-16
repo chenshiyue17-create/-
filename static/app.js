@@ -348,25 +348,6 @@ function buildBootCachePayload() {
         automationState: dashboardState.automation
           ? { ...dashboardState.automation, logs: [] }
           : (dashboardState.runtimeSnapshot.automationState || {}),
-        account: dashboardState.account
-          ? {
-              ...(dashboardState.runtimeSnapshot.account || {}),
-              summary: dashboardState.account.summary || {},
-              fundingSummary: dashboardState.account.fundingSummary || {},
-              balanceCount: dashboardState.account.balanceCount || 0,
-              positionCount: dashboardState.account.positionCount || 0,
-              equityDisplay: dashboardState.account.equityDisplay || null,
-            }
-          : (dashboardState.runtimeSnapshot.account || null),
-        executionJournal: dashboardState.orderJournal
-          ? {
-              orders: Array.isArray(dashboardState.recentOrdersAll) ? dashboardState.recentOrdersAll.slice(0, 80) : [],
-              summary: dashboardState.orderJournal.summary || dashboardState.orderJournal || {},
-              symbols: Array.isArray(dashboardState.orderJournalSymbols) ? dashboardState.orderJournalSymbols : [],
-              lastReconciledAt: dashboardState.orderJournal.lastReconciledAt || "",
-              lastSource: dashboardState.orderJournal.lastSource || "",
-            }
-          : (dashboardState.runtimeSnapshot.executionJournal || null),
       }
     : null;
   if (!runtimeSnapshot) return null;
@@ -466,6 +447,26 @@ function applyRuntimeSnapshot(payload = {}) {
     applyRecentOrders(buildOrderFeedFromExecutionJournal(snapshot.executionJournal));
   }
   return snapshot;
+}
+
+function syncRuntimeSnapshotAccountSummary(account = {}) {
+  if (!dashboardState.runtimeSnapshot) {
+    dashboardState.runtimeSnapshot = normalizeRuntimeSnapshotPayload({});
+  }
+  const currentAccount = dashboardState.runtimeSnapshot.account || {};
+  dashboardState.runtimeSnapshot = {
+    ...dashboardState.runtimeSnapshot,
+    account: {
+      ...currentAccount,
+      ...(account || {}),
+      summary: account.summary || currentAccount.summary || {},
+      fundingSummary: account.fundingSummary || currentAccount.fundingSummary || {},
+      balanceCount: account.balanceCount ?? currentAccount.balanceCount ?? 0,
+      positionCount: account.positionCount ?? currentAccount.positionCount ?? 0,
+      equityDisplay: account.equityDisplay || currentAccount.equityDisplay || null,
+    },
+    timestamp: Date.now(),
+  };
 }
 
 function rerenderCurrentOrderFeed() {
@@ -6322,6 +6323,7 @@ function buildAccountBalanceRows(account) {
 
 function applyAccountOverview(account) {
   dashboardState.account = account;
+  syncRuntimeSnapshotAccountSummary(account);
   renderRows("balances", buildAccountBalanceRows(account).slice(0, 12), [
     { key: "accountType", label: "账户" },
     { key: "ccy", label: "币种" },
@@ -6348,6 +6350,7 @@ function applyAccountSummary(account) {
     ...(dashboardState.account || {}),
     ...account,
   };
+  syncRuntimeSnapshotAccountSummary(dashboardState.account);
   if (account.balanceCount != null) {
     $("metric-balance-count").textContent = account.balanceCount;
   }

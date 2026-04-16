@@ -121,6 +121,9 @@ REMOTE_AUTOMATION_STATE_LOCK = threading.RLock()
 REMOTE_AUTOMATION_STATE_CACHE: dict[str, Any] = {"ts": 0.0, "url": "", "state": {}}
 REMOTE_RUNTIME_SNAPSHOT_LOCK = threading.RLock()
 REMOTE_RUNTIME_SNAPSHOT_CACHE: dict[str, Any] = {"ts": 0.0, "url": "", "payload": {}}
+RUNTIME_SNAPSHOT_CACHE_LOCK = threading.RLock()
+RUNTIME_SNAPSHOT_CACHE: dict[str, dict[str, Any]] = {}
+RUNTIME_SNAPSHOT_CACHE_TTL_SECONDS = 1.5
 ONLY_STRATEGY_PRESET = "dip_swing"
 ONLY_STRATEGY_LABEL = "利润循环"
 ONLY_STRATEGY_FALLBACK_DECISION = "持续开仓"
@@ -2693,6 +2696,51 @@ def build_remote_runtime_snapshot_payload(
         return normalized
 
 
+def runtime_snapshot_cache_key(
+    config: dict[str, Any],
+    *,
+    include_account: bool,
+    include_account_positions: bool,
+    remote_timeout: float | None,
+    force_local: bool,
+) -> str:
+    current = config or {}
+    execution_mode = str(current.get("executionMode") or "local")
+    remote_url = remote_gateway_url(current) if should_proxy_to_remote(current, "/api/focus-snapshot") else ""
+    return json.dumps(
+        {
+            "executionMode": execution_mode,
+            "remoteUrl": remote_url,
+            "includeAccount": bool(include_account),
+            "includeAccountPositions": bool(include_account_positions),
+            "forceLocal": bool(force_local),
+            "remoteTimeout": float(remote_timeout) if remote_timeout is not None else None,
+            "liveOnly": bool(prefer_live_execution_state(current)),
+        },
+        sort_keys=True,
+        ensure_ascii=False,
+    )
+
+
+def load_cached_runtime_snapshot(key: str) -> dict[str, Any] | None:
+    with RUNTIME_SNAPSHOT_CACHE_LOCK:
+        cached = RUNTIME_SNAPSHOT_CACHE.get(key)
+        if not cached:
+            return None
+        if time.time() - float(cached.get("ts") or 0.0) > RUNTIME_SNAPSHOT_CACHE_TTL_SECONDS:
+            RUNTIME_SNAPSHOT_CACHE.pop(key, None)
+            return None
+        return copy.deepcopy(cached.get("payload") or {})
+
+
+def store_cached_runtime_snapshot(key: str, payload: dict[str, Any]) -> None:
+    with RUNTIME_SNAPSHOT_CACHE_LOCK:
+        RUNTIME_SNAPSHOT_CACHE[key] = {
+            "ts": time.time(),
+            "payload": copy.deepcopy(payload or {}),
+        }
+
+
 def build_runtime_snapshot(
     config: dict[str, Any] | None = None,
     *,
@@ -2702,6 +2750,16 @@ def build_runtime_snapshot(
     force_local: bool = False,
 ) -> RuntimeSnapshot:
     current = config or CONFIG.current()
+    cache_key = runtime_snapshot_cache_key(
+        current,
+        include_account=include_account,
+        include_account_positions=include_account_positions,
+        remote_timeout=remote_timeout,
+        force_local=force_local,
+    )
+    cached_payload = load_cached_runtime_snapshot(cache_key)
+    if cached_payload:
+        return RuntimeSnapshot.from_payload(cached_payload)
     if not force_local and should_proxy_to_remote(current, "/api/focus-snapshot"):
         payload = build_remote_runtime_snapshot_payload(
             current,
@@ -2713,6 +2771,7 @@ def build_runtime_snapshot(
             include_account=include_account,
             include_account_positions=include_account_positions,
         )
+    store_cached_runtime_snapshot(cache_key, payload)
     return RuntimeSnapshot.from_payload(payload)
 
 
