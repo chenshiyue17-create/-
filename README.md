@@ -62,3 +62,25 @@ python3 server.py
 5. 如果要上实盘，必须显式勾选：
    - `允许实盘自动交易`
    - 如需开机自跑，再勾 `允许实盘自动启动`
+
+## 集成模块：MiroFish
+
+项目内已经集成了 MiroFish 源码，位置：
+
+- `/Users/cc/Documents/New project/okx-local-app/vendor/MiroFish`
+
+快速使用：
+
+```bash
+cd /Users/cc/Documents/New\ project/okx-local-app
+./scripts/mirofish-setup.sh
+./scripts/mirofish-dev.sh
+```
+
+默认地址：
+- 前端：`http://127.0.0.1:3000`
+- 后端：`http://127.0.0.1:5001`
+
+详细说明见：
+
+- [MIROFISH_INTEGRATION.md](/Users/cc/Documents/New%20project/okx-local-app/MIROFISH_INTEGRATION.md)
