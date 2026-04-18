@@ -74,9 +74,20 @@ fi
 cp "$ROOT_DIR/server.py" "$RESOURCES_DIR/app/server.py"
 rm -rf "$RESOURCES_DIR/app/static"
 cp -R "$ROOT_DIR/static" "$RESOURCES_DIR/app/static"
+rm -rf "$RESOURCES_DIR/app/scripts"
+mkdir -p "$RESOURCES_DIR/app/scripts"
+if [ -d "$ROOT_DIR/scripts" ]; then
+  cp -R "$ROOT_DIR/scripts/." "$RESOURCES_DIR/app/scripts/"
+fi
 rm -rf "$RESOURCES_DIR/app/vendor"
 mkdir -p "$RESOURCES_DIR/app/vendor"
-cp -R "$ROOT_DIR/vendor/solominer" "$RESOURCES_DIR/app/vendor/solominer"
+if [ -d "$ROOT_DIR/vendor/solominer" ]; then
+  cp -R "$ROOT_DIR/vendor/solominer" "$RESOURCES_DIR/app/vendor/solominer"
+fi
+if [ -d "$ROOT_DIR/vendor/MiroFish" ]; then
+  cp -R "$ROOT_DIR/vendor/MiroFish" "$RESOURCES_DIR/app/vendor/MiroFish"
+  rm -rf "$RESOURCES_DIR/app/vendor/MiroFish/.git"
+fi
 find "$RESOURCES_DIR/app/vendor" -name '__pycache__' -type d -prune -exec rm -rf {} +
 
 codesign --force --deep --sign - "$APP_BUNDLE" >/dev/null 2>&1 || true
