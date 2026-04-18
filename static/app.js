@@ -161,7 +161,7 @@ const requestFlightMap = new Map();
 const AUTO_ANALYSIS_INTERVAL_MS = 45000;
 const AUTO_ANALYSIS_DEBOUNCE_MS = 1200;
 const LOCAL_REQUEST_TIMEOUT_MS = 12000;
-const BOOT_CACHE_KEY = "okx-desk-boot-cache-v3";
+const BOOT_CACHE_KEY = "okx-desk-boot-cache-v4";
 const BOOT_CACHE_MAX_AGE_MS = 12 * 60 * 60 * 1000;
 
 const MAINSTREAM_MARKETS = [
@@ -257,6 +257,38 @@ function getCurrentRuntimeSnapshot() {
   return cachedSnapshot && typeof cachedSnapshot === "object" ? cachedSnapshot : null;
 }
 
+function setRuntimeSnapshot(snapshot = {}) {
+  const normalized = normalizeRuntimeSnapshotPayload(snapshot);
+  dashboardState.runtimeSnapshot = normalized;
+  return normalized;
+}
+
+function patchRuntimeSnapshot(patch = {}) {
+  const current = normalizeRuntimeSnapshotPayload(getCurrentRuntimeSnapshot() || {});
+  const next = normalizeRuntimeSnapshotPayload({
+    ...current,
+    ...(patch || {}),
+    automationState: patch.automationState
+      ? {
+          ...(current.automationState || {}),
+          ...(patch.automationState || {}),
+        }
+      : current.automationState,
+    account: patch.account
+      ? {
+          ...(current.account || {}),
+          ...(patch.account || {}),
+        }
+      : current.account,
+    executionJournal: patch.executionJournal
+      ? patch.executionJournal
+      : current.executionJournal,
+    timestamp: patch.timestamp || Date.now(),
+  });
+  dashboardState.runtimeSnapshot = next;
+  return next;
+}
+
 function getCurrentAutomationState() {
   const snapshot = getCurrentRuntimeSnapshot();
   return snapshot?.automationState && typeof snapshot.automationState === "object"
@@ -281,6 +313,7 @@ function getCurrentExecutionJournal() {
 function getCurrentRecentOrders() {
   const snapshotOrders = getCurrentExecutionJournal()?.orders;
   if (Array.isArray(snapshotOrders) && snapshotOrders.length) return snapshotOrders;
+  if (getCurrentRuntimeSnapshot()) return [];
   return Array.isArray(dashboardState.recentOrdersAll) ? dashboardState.recentOrdersAll : [];
 }
 
@@ -368,20 +401,22 @@ function normalizeOrderFeedPayload(payload = {}) {
 
 function buildCurrentOrderFeed() {
   const snapshot = getCurrentRuntimeSnapshot();
+  const currentMeta = getCurrentOrderFeedMeta();
   if (snapshot?.executionJournal) {
     return buildOrderFeedFromExecutionJournal(snapshot.executionJournal, {
       source:
         snapshot?.stateSource ||
         snapshot?.executionJournal?.lastSource ||
+        currentMeta?.source ||
         "runtime_snapshot",
-      stream: dashboardState.orderFeedMeta?.stream || null,
+      stream: currentMeta?.stream || null,
     });
   }
-  if (dashboardState.orderJournal?.orders?.length) {
+  if (currentMeta?.journal?.orders?.length) {
     return buildOrderFeedFromJournalSnapshot(
-      dashboardState.orderJournal,
-      dashboardState.orderFeedMeta?.source || "journal_memory",
-      dashboardState.orderFeedMeta?.stream || null,
+      currentMeta.journal,
+      currentMeta?.source || "journal_memory",
+      currentMeta?.stream || null,
     );
   }
   return null;
@@ -494,8 +529,7 @@ function normalizeRuntimeSnapshotPayload(payload = {}) {
 }
 
 function applyRuntimeSnapshot(payload = {}) {
-  const snapshot = normalizeRuntimeSnapshotPayload(payload);
-  dashboardState.runtimeSnapshot = snapshot;
+  const snapshot = setRuntimeSnapshot(payload);
   if (snapshot.account) {
     applyAccountSummary(snapshot.account, { syncSnapshot: false });
   }
@@ -519,12 +553,8 @@ function applyRuntimeSnapshot(payload = {}) {
 }
 
 function syncRuntimeSnapshotAccountSummary(account = {}) {
-  if (!dashboardState.runtimeSnapshot) {
-    dashboardState.runtimeSnapshot = normalizeRuntimeSnapshotPayload({});
-  }
-  const currentAccount = dashboardState.runtimeSnapshot.account || {};
-  dashboardState.runtimeSnapshot = {
-    ...dashboardState.runtimeSnapshot,
+  const currentAccount = getCurrentAccountPayload() || {};
+  patchRuntimeSnapshot({
     account: {
       ...currentAccount,
       ...(account || {}),
@@ -534,23 +564,16 @@ function syncRuntimeSnapshotAccountSummary(account = {}) {
       positionCount: account.positionCount ?? currentAccount.positionCount ?? 0,
       equityDisplay: account.equityDisplay || currentAccount.equityDisplay || null,
     },
-    timestamp: Date.now(),
-  };
+  });
 }
 
 function syncRuntimeSnapshotAutomationState(state = {}) {
-  if (!dashboardState.runtimeSnapshot) {
-    dashboardState.runtimeSnapshot = normalizeRuntimeSnapshotPayload({});
-  }
-  const currentAutomation = dashboardState.runtimeSnapshot.automationState || {};
-  dashboardState.runtimeSnapshot = {
-    ...dashboardState.runtimeSnapshot,
+  patchRuntimeSnapshot({
     automationState: {
-      ...currentAutomation,
+      ...(getCurrentAutomationState() || {}),
       ...(state || {}),
     },
-    timestamp: Date.now(),
-  };
+  });
 }
 
 function rerenderCurrentOrderFeed() {
@@ -559,24 +582,11 @@ function rerenderCurrentOrderFeed() {
     renderOrderFeed(currentFeed);
     return true;
   }
-  if (dashboardState.orderJournal?.orders?.length) {
-    renderOrderFeed(
-      buildOrderFeedFromJournalSnapshot(
-        dashboardState.orderJournal,
-        dashboardState.orderFeedMeta?.source || "journal_memory",
-        dashboardState.orderFeedMeta?.stream || null,
-      ),
-    );
-    return true;
-  }
   return false;
 }
 
 function syncRuntimeSnapshotOrderFeed(feed = {}) {
   const normalized = normalizeOrderFeedPayload(feed);
-  if (!dashboardState.runtimeSnapshot) {
-    dashboardState.runtimeSnapshot = normalizeRuntimeSnapshotPayload({});
-  }
   const nextExecutionJournal = {
     orders: normalized.orders || [],
     summary: normalized.journal || {},
@@ -584,11 +594,9 @@ function syncRuntimeSnapshotOrderFeed(feed = {}) {
     lastReconciledAt: normalized.lastReconciledAt || "",
     lastSource: normalized.lastSource || normalized.source || "",
   };
-  dashboardState.runtimeSnapshot = {
-    ...dashboardState.runtimeSnapshot,
+  patchRuntimeSnapshot({
     executionJournal: nextExecutionJournal,
-    timestamp: Date.now(),
-  };
+  });
 }
 
 function applyDashboardOrderFeedState(data = {}, options = {}) {
