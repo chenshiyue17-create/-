@@ -16,10 +16,9 @@ from typing import Dict, Any, List, Optional, Callable
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 
-from openai import OpenAI
-
 from ..config import Config
 from ..utils.logger import get_logger
+from ..utils.llm_client import LLMClient
 from ..utils.locale import get_language_instruction, t
 from .zep_entity_reader import EntityNode, ZepEntityReader
 
@@ -231,13 +230,10 @@ class SimulationConfigGenerator:
         self.api_key = api_key or Config.LLM_API_KEY
         self.base_url = base_url or Config.LLM_BASE_URL
         self.model_name = model_name or Config.LLM_MODEL_NAME
-        
-        if not self.api_key:
-            raise ValueError("LLM_API_KEY 未配置")
-        
-        self.client = OpenAI(
+        self.llm_client = LLMClient(
             api_key=self.api_key,
-            base_url=self.base_url
+            base_url=self.base_url,
+            model=self.model_name,
         )
     
     def generate_config(
@@ -440,38 +436,14 @@ class SimulationConfigGenerator:
         
         for attempt in range(max_attempts):
             try:
-                response = self.client.chat.completions.create(
-                    model=self.model_name,
+                return self.llm_client.chat_json(
                     messages=[
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": prompt}
                     ],
-                    response_format={"type": "json_object"},
-                    temperature=0.7 - (attempt * 0.1)  # 每次重试降低温度
-                    # 不设置max_tokens，让LLM自由发挥
+                    temperature=0.7 - (attempt * 0.1),
+                    max_tokens=6000,
                 )
-                
-                content = response.choices[0].message.content
-                finish_reason = response.choices[0].finish_reason
-                
-                # 检查是否被截断
-                if finish_reason == 'length':
-                    logger.warning(f"LLM输出被截断 (attempt {attempt+1})")
-                    content = self._fix_truncated_json(content)
-                
-                # 尝试解析JSON
-                try:
-                    return json.loads(content)
-                except json.JSONDecodeError as e:
-                    logger.warning(f"JSON解析失败 (attempt {attempt+1}): {str(e)[:80]}")
-                    
-                    # 尝试修复JSON
-                    fixed = self._try_fix_config_json(content)
-                    if fixed:
-                        return fixed
-                    
-                    last_error = e
-                    
             except Exception as e:
                 logger.warning(f"LLM调用失败 (attempt {attempt+1}): {str(e)[:80]}")
                 last_error = e
@@ -988,4 +960,3 @@ class SimulationConfigGenerator:
                 "influence_weight": 1.0
             }
     
-

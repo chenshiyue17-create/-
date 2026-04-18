@@ -4,6 +4,7 @@
 """
 
 import os
+import shutil
 from dotenv import load_dotenv
 
 # 加载项目根目录的 .env 文件
@@ -27,6 +28,13 @@ class Config:
     # JSON配置 - 禁用ASCII转义，让中文直接显示（而不是 \uXXXX 格式）
     JSON_AS_ASCII = False
     
+    # 运行模式
+    MIROFISH_LLM_BACKEND = os.environ.get('MIROFISH_LLM_BACKEND', 'codex').strip().lower()
+    MIROFISH_GRAPH_BACKEND = os.environ.get('MIROFISH_GRAPH_BACKEND', 'local').strip().lower()
+    MIROFISH_CODEX_COMMAND = os.environ.get('MIROFISH_CODEX_COMMAND') or shutil.which('codex')
+    MIROFISH_CODEX_MODEL = os.environ.get('MIROFISH_CODEX_MODEL', '').strip()
+    MIROFISH_CODEX_TIMEOUT_SECONDS = int(os.environ.get('MIROFISH_CODEX_TIMEOUT_SECONDS', '240'))
+
     # LLM配置（统一使用OpenAI格式）
     LLM_API_KEY = os.environ.get('LLM_API_KEY')
     LLM_BASE_URL = os.environ.get('LLM_BASE_URL', 'https://api.openai.com/v1')
@@ -62,14 +70,24 @@ class Config:
     REPORT_AGENT_MAX_TOOL_CALLS = int(os.environ.get('REPORT_AGENT_MAX_TOOL_CALLS', '5'))
     REPORT_AGENT_MAX_REFLECTION_ROUNDS = int(os.environ.get('REPORT_AGENT_MAX_REFLECTION_ROUNDS', '2'))
     REPORT_AGENT_TEMPERATURE = float(os.environ.get('REPORT_AGENT_TEMPERATURE', '0.5'))
+
+    @classmethod
+    def use_codex_llm(cls) -> bool:
+        return cls.MIROFISH_LLM_BACKEND == 'codex'
+
+    @classmethod
+    def use_local_graph_backend(cls) -> bool:
+        return cls.MIROFISH_GRAPH_BACKEND == 'local'
     
     @classmethod
     def validate(cls):
         """验证必要配置"""
         errors = []
-        if not cls.LLM_API_KEY:
+        if cls.use_codex_llm():
+            if not cls.MIROFISH_CODEX_COMMAND:
+                errors.append("Codex CLI 未找到")
+        elif not cls.LLM_API_KEY:
             errors.append("LLM_API_KEY 未配置")
-        if not cls.ZEP_API_KEY:
+        if not cls.use_local_graph_backend() and not cls.ZEP_API_KEY:
             errors.append("ZEP_API_KEY 未配置")
         return errors
-

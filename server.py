@@ -10312,7 +10312,6 @@ MIROFISH_API_BASE = f"{MIROFISH_APP_BASE.rstrip('/')}-api"
 
 
 class MiroFishRuntimeManager:
-    REQUIRED_ENV_KEYS = ("LLM_API_KEY", "ZEP_API_KEY")
     COMMAND_SEARCH_DIRS = (
         "/opt/homebrew/bin",
         "/usr/local/bin",
@@ -10341,25 +10340,63 @@ class MiroFishRuntimeManager:
         return f"http://127.0.0.1:{MIROFISH_BACKEND_PORT}/health"
 
     def _discover_command_path(self, name: str) -> str:
-        direct = shutil.which(name)
-        if direct:
-            return direct
+        seen: set[str] = set()
         for raw_dir in self.COMMAND_SEARCH_DIRS:
             directory = Path(raw_dir).expanduser()
             candidate = directory / name
+            resolved = str(candidate)
+            if resolved in seen:
+                continue
+            seen.add(resolved)
             if candidate.exists() and os.access(candidate, os.X_OK):
-                return str(candidate)
+                return resolved
+        direct = shutil.which(name)
+        if direct:
+            return direct
         return ""
 
     def _command_paths(self) -> dict[str, str]:
         return {
             "node": self._discover_command_path("node"),
             "npm": self._discover_command_path("npm"),
+            "npm_cli": self._discover_npm_cli(),
             "uv": self._discover_command_path("uv"),
+            "codex": self._discover_command_path("codex"),
         }
+
+    def _discover_npm_cli(self) -> str:
+        candidates = [
+            Path("/opt/homebrew/lib/node_modules/npm/bin/npm-cli.js"),
+            Path("/usr/local/lib/node_modules/npm/bin/npm-cli.js"),
+            Path("~/.npm-global/lib/node_modules/npm/bin/npm-cli.js").expanduser(),
+        ]
+        for candidate in candidates:
+            try:
+                if candidate.exists() and candidate.is_file():
+                    return str(candidate.resolve())
+            except OSError:
+                continue
+        npm_path = shutil.which("npm")
+        if npm_path:
+            npm_candidate = Path(npm_path).expanduser().resolve()
+            if npm_candidate.name == "npm-cli.js":
+                return str(npm_candidate)
+            guessed = npm_candidate.parent.parent / "lib" / "node_modules" / "npm" / "bin" / "npm-cli.js"
+            if guessed.exists():
+                return str(guessed.resolve())
+        return ""
 
     def _runtime_env(self, command_paths: dict[str, str] | None = None) -> dict[str, str]:
         env = dict(os.environ)
+        for key in (
+            "PYTHONHOME",
+            "PYTHONPATH",
+            "PYTHONEXECUTABLE",
+            "PYTHONSTARTUP",
+            "VIRTUAL_ENV",
+            "__PYVENV_LAUNCHER__",
+        ):
+            env.pop(key, None)
         commands = command_paths or self._command_paths()
         path_entries = [str(item).strip() for item in (env.get("PATH") or "").split(os.pathsep) if str(item).strip()]
         for command in commands.values():
@@ -10388,14 +10425,59 @@ class MiroFishRuntimeManager:
             values[key.strip()] = value.strip()
         return values
 
-    def _missing_env_keys(self) -> list[str]:
-        values = self._parse_env_file()
+    def _env_backends(self, values: dict[str, str] | None = None) -> tuple[str, str]:
+        env_values = values or self._parse_env_file()
+        llm_backend = str(env_values.get("MIROFISH_LLM_BACKEND") or "codex").strip().lower() or "codex"
+        graph_backend = str(env_values.get("MIROFISH_GRAPH_BACKEND") or "local").strip().lower() or "local"
+        return llm_backend, graph_backend
+
+    def _is_blank_env_value(self, value: str) -> bool:
+        text = str(value or "").strip()
+        return not text or text.lower().startswith("your_")
+
+    def _missing_env_keys(self, values: dict[str, str] | None = None) -> list[str]:
+        env_values = values or self._parse_env_file()
+        llm_backend, graph_backend = self._env_backends(env_values)
         missing: list[str] = []
-        for key in self.REQUIRED_ENV_KEYS:
-            value = str(values.get(key) or "").strip()
-            if not value or "your_" in value.lower():
-                missing.append(key)
+        if llm_backend != "codex" and self._is_blank_env_value(env_values.get("LLM_API_KEY", "")):
+            missing.append("LLM_API_KEY")
+        if graph_backend != "local" and self._is_blank_env_value(env_values.get("ZEP_API_KEY", "")):
+            missing.append("ZEP_API_KEY")
         return missing
+
+    def _missing_commands(
+        self,
+        env_values: dict[str, str] | None = None,
+        commands: dict[str, str] | None = None,
+    ) -> list[str]:
+        env_backends = self._env_backends(env_values)
+        command_paths = commands or self._command_paths()
+        missing: list[str] = []
+        if not command_paths.get("node"):
+            missing.append("node")
+        if not command_paths.get("npm_cli"):
+            missing.append("npm")
+        if not command_paths.get("uv"):
+            missing.append("uv")
+        llm_backend, _graph_backend = env_backends
+        if llm_backend == "codex":
+            configured = str((env_values or {}).get("MIROFISH_CODEX_COMMAND") or "").strip()
+            codex_available = bool(configured or command_paths.get("codex"))
+            if not codex_available:
+                missing.append("codex")
+        return missing
+
+    def _runtime_env_file_values(self, command_paths: dict[str, str] | None = None) -> dict[str, str]:
+        values = self._parse_env_file()
+        commands = command_paths or self._command_paths()
+        llm_backend, graph_backend = self._env_backends(values)
+        values.setdefault("MIROFISH_LLM_BACKEND", llm_backend)
+        values.setdefault("MIROFISH_GRAPH_BACKEND", graph_backend)
+        if llm_backend == "codex":
+            configured_codex = str(values.get("MIROFISH_CODEX_COMMAND") or "").strip()
+            values["MIROFISH_CODEX_COMMAND"] = configured_codex or str(commands.get("codex") or "codex")
+            values.setdefault("MIROFISH_CODEX_TIMEOUT_SECONDS", "240")
+        return values
 
     def _frontend_deps_ready(self) -> bool:
         return (MIROFISH_FRONTEND_DIR / "node_modules").exists()
@@ -10504,7 +10586,7 @@ class MiroFishRuntimeManager:
     def _build_frontend_locked(self) -> None:
         self._ensure_runtime_dir()
         commands = self._command_paths()
-        if not commands["npm"] or not commands["node"]:
+        if not commands["npm_cli"] or not commands["node"]:
             raise RuntimeError("缺少 Node.js / npm，无法构建 MiroFish 前端")
         if not self._frontend_deps_ready():
             raise RuntimeError("MiroFish 前端依赖未安装，请先执行集成初始化")
@@ -10513,8 +10595,8 @@ class MiroFishRuntimeManager:
         env["VITE_API_BASE_URL"] = MIROFISH_API_BASE
         with open(MIROFISH_LOG_PATH, "a", encoding="utf-8") as log_handle:
             subprocess.run(
-                [commands["npm"], "run", "build"],
-                cwd=str(MIROFISH_ROOT),
+                [commands["node"], commands["npm_cli"], "run", "build"],
+                cwd=str(MIROFISH_FRONTEND_DIR),
                 env=env,
                 stdout=log_handle,
                 stderr=log_handle,
@@ -10527,11 +10609,13 @@ class MiroFishRuntimeManager:
             self._cleanup_dead_backend()
             return
         commands = self._command_paths()
-        if not commands["uv"]:
-            raise RuntimeError("缺少 uv，无法启动 MiroFish 后端")
+        env_values = self._runtime_env_file_values(commands)
+        missing_commands = self._missing_commands(env_values, commands)
+        if missing_commands:
+            raise RuntimeError(f"MiroFish 缺少必要命令: {', '.join(missing_commands)}")
         if not self._backend_deps_ready():
             raise RuntimeError("MiroFish 后端依赖未安装，请先执行集成初始化")
-        missing_env = self._missing_env_keys()
+        missing_env = self._missing_env_keys(env_values)
         if missing_env:
             raise RuntimeError(f"MiroFish 缺少必要环境变量: {', '.join(missing_env)}")
         self._ensure_runtime_dir()
@@ -10541,6 +10625,8 @@ class MiroFishRuntimeManager:
         env["FLASK_HOST"] = "127.0.0.1"
         env["FLASK_PORT"] = str(MIROFISH_BACKEND_PORT)
         env["FLASK_DEBUG"] = "False"
+        for key, value in env_values.items():
+            env.setdefault(key, value)
         process = subprocess.Popen(
             [commands["uv"], "run", "python", "run.py"],
             cwd=str(MIROFISH_BACKEND_DIR),
@@ -10574,8 +10660,11 @@ class MiroFishRuntimeManager:
         with self.lock:
             self._cleanup_dead_backend()
             commands = self._command_paths()
+            env_values = self._runtime_env_file_values(commands)
             env_exists = MIROFISH_ENV_PATH.exists()
-            missing_env = self._missing_env_keys()
+            llm_backend, graph_backend = self._env_backends(env_values)
+            missing_env = self._missing_env_keys(env_values)
+            missing_commands = self._missing_commands(env_values, commands)
             frontend_built = self._frontend_dist_index().exists()
             frontend_stale = self._frontend_sources_stale()
             backend_running = bool(self.backend_process and self.backend_process.poll() is None)
@@ -10593,7 +10682,10 @@ class MiroFishRuntimeManager:
                 "appBase": MIROFISH_APP_BASE,
                 "apiBase": MIROFISH_API_BASE,
                 "envExists": env_exists,
+                "llmBackend": llm_backend,
+                "graphBackend": graph_backend,
                 "missingEnvKeys": missing_env,
+                "missingCommands": missing_commands,
                 "commands": commands,
                 "startedAt": self.started_at,
                 "logTail": tail_lines(MIROFISH_LOG_PATH, 40),
@@ -10601,19 +10693,23 @@ class MiroFishRuntimeManager:
             status["setupRequired"] = not (
                 status["frontendDepsReady"]
                 and status["backendDepsReady"]
-                and env_exists
             )
-            status["ready"] = bool(frontend_built and backend_healthy and not missing_env)
+            status["ready"] = bool(frontend_built and backend_healthy and not missing_env and not missing_commands)
             status["launchable"] = bool(
                 status["frontendDepsReady"]
                 and status["backendDepsReady"]
                 and env_exists
                 and not missing_env
+                and not missing_commands
             )
             status["summary"] = (
                 "MiroFish 已集成到当前工作台"
                 if status["ready"]
-                else "MiroFish 已接入项目，但还没进入可用状态"
+                else (
+                    "MiroFish 已接入项目，当前等待依赖安装完成"
+                    if status["setupRequired"]
+                    else "MiroFish 已接入项目，但还没进入可用状态"
+                )
             )
             return status
 

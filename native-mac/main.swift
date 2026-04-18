@@ -265,12 +265,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
         let serverRuntime = runtimeURL.appendingPathComponent("server.py")
         let staticSource = sourceURL.appendingPathComponent("static", isDirectory: true)
         let staticRuntime = runtimeURL.appendingPathComponent("static", isDirectory: true)
+        let scriptsSource = sourceURL.appendingPathComponent("scripts", isDirectory: true)
+        let scriptsRuntime = runtimeURL.appendingPathComponent("scripts", isDirectory: true)
         let vendorSource = sourceURL.appendingPathComponent("vendor", isDirectory: true)
         let vendorRuntime = runtimeURL.appendingPathComponent("vendor", isDirectory: true)
 
         try copyItemReplacing(source: serverSource, destination: serverRuntime)
         if fileManager.fileExists(atPath: staticSource.path) {
             try copyItemReplacing(source: staticSource, destination: staticRuntime)
+        }
+        if fileManager.fileExists(atPath: scriptsSource.path) {
+            try copyItemReplacing(source: scriptsSource, destination: scriptsRuntime)
         }
         if fileManager.fileExists(atPath: vendorSource.path) {
             try copyItemReplacing(source: vendorSource, destination: vendorRuntime)
@@ -282,6 +287,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
         let interestingRoots = [
             sourceURL.appendingPathComponent("server.py"),
             sourceURL.appendingPathComponent("static", isDirectory: true),
+            sourceURL.appendingPathComponent("scripts", isDirectory: true),
             sourceURL.appendingPathComponent("vendor", isDirectory: true),
         ]
         var totalBytes: UInt64 = 0

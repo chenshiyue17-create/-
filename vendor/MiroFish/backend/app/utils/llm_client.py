@@ -5,6 +5,9 @@ LLM客户端封装
 
 import json
 import re
+import subprocess
+import tempfile
+from pathlib import Path
 from typing import Optional, Dict, Any, List
 from openai import OpenAI
 
@@ -23,14 +26,22 @@ class LLMClient:
         self.api_key = api_key or Config.LLM_API_KEY
         self.base_url = base_url or Config.LLM_BASE_URL
         self.model = model or Config.LLM_MODEL_NAME
-        
-        if not self.api_key:
-            raise ValueError("LLM_API_KEY 未配置")
-        
-        self.client = OpenAI(
-            api_key=self.api_key,
-            base_url=self.base_url
-        )
+        self.codex_command = Config.MIROFISH_CODEX_COMMAND
+        self.codex_model = Config.MIROFISH_CODEX_MODEL
+        self.timeout_seconds = Config.MIROFISH_CODEX_TIMEOUT_SECONDS
+        self.use_codex = Config.use_codex_llm() and not self.api_key
+
+        if self.use_codex:
+            if not self.codex_command:
+                raise ValueError("Codex CLI 未配置")
+            self.client = None
+        else:
+            if not self.api_key:
+                raise ValueError("LLM_API_KEY 未配置")
+            self.client = OpenAI(
+                api_key=self.api_key,
+                base_url=self.base_url
+            )
     
     def chat(
         self,
@@ -51,19 +62,21 @@ class LLMClient:
         Returns:
             模型响应文本
         """
+        if self.use_codex:
+            return self._chat_with_codex(messages=messages, response_format=response_format)
+
         kwargs = {
             "model": self.model,
             "messages": messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
-        
+
         if response_format:
             kwargs["response_format"] = response_format
-        
+
         response = self.client.chat.completions.create(**kwargs)
         content = response.choices[0].message.content
-        # 部分模型（如MiniMax M2.5）会在content中包含<think>思考内容，需要移除
         content = re.sub(r'<think>[\s\S]*?</think>', '', content).strip()
         return content
     
@@ -101,3 +114,52 @@ class LLMClient:
         except json.JSONDecodeError:
             raise ValueError(f"LLM返回的JSON格式无效: {cleaned_response}")
 
+    def _chat_with_codex(
+        self,
+        messages: List[Dict[str, str]],
+        response_format: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        prompt_parts: List[str] = []
+        for message in messages:
+            role = str(message.get("role") or "user").upper()
+            prompt_parts.append(f"{role}:\n{message.get('content', '')}".strip())
+        if response_format and response_format.get("type") == "json_object":
+            prompt_parts.append("FINAL REQUIREMENT:\nReturn only one valid JSON object. Do not add markdown fences or commentary.")
+        prompt = "\n\n".join(prompt_parts).strip()
+
+        with tempfile.NamedTemporaryFile(prefix="mirofish-codex-", suffix=".txt", delete=False) as handle:
+            output_path = Path(handle.name)
+        try:
+            command = [
+                self.codex_command,
+                "exec",
+                "--skip-git-repo-check",
+                "--sandbox",
+                "danger-full-access",
+                "--cd",
+                str(Path(__file__).resolve().parents[3]),
+                "--output-last-message",
+                str(output_path),
+                "--color",
+                "never",
+            ]
+            if self.codex_model:
+                command.extend(["--model", self.codex_model])
+            result = subprocess.run(
+                command,
+                input=prompt,
+                text=True,
+                capture_output=True,
+                timeout=self.timeout_seconds,
+            )
+            if result.returncode != 0:
+                stderr = (result.stderr or result.stdout or "").strip()
+                raise RuntimeError(stderr or "Codex CLI 执行失败")
+            content = output_path.read_text(encoding="utf-8", errors="ignore").strip()
+            content = re.sub(r'<think>[\s\S]*?</think>', '', content).strip()
+            return content
+        finally:
+            try:
+                output_path.unlink(missing_ok=True)
+            except Exception:
+                pass

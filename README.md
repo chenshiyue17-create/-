@@ -69,17 +69,44 @@ python3 server.py
 
 - `/Users/cc/Documents/New project/okx-local-app/vendor/MiroFish`
 
-快速使用：
+它现在不是单独跑的外部项目，而是已经内嵌到当前 OKX Local App 工作台里：
+
+- 页面入口：`/mirofish/`
+- 代理接口：`/mirofish-api/*`
+- 桌面导航：`仿真推演`
+
+默认模式已经切成：
+
+- `MIROFISH_LLM_BACKEND=codex`
+- `MIROFISH_GRAPH_BACKEND=local`
+
+所以默认不需要再额外配置：
+
+- `LLM_API_KEY`
+- `ZEP_API_KEY`
+
+一次性初始化：
 
 ```bash
 cd /Users/cc/Documents/New\ project/okx-local-app
 ./scripts/mirofish-setup.sh
+```
+
+然后直接打开当前桌面，在导航里进入 `仿真推演`，点：
+
+- `初始化`
+- `启动`
+
+如果你要调试上游 dev server，再执行：
+
+```bash
 ./scripts/mirofish-dev.sh
 ```
 
-默认地址：
+开发模式默认地址：
 - 前端：`http://127.0.0.1:3000`
 - 后端：`http://127.0.0.1:5001`
+- 当前桌面集成入口：`http://127.0.0.1:8765/mirofish/`
 
 详细说明见：
 
