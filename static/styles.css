@@ -932,6 +932,7 @@ body {
 .ticket-grid,
 .bot-status-bar,
 .bot-panels,
+.mirofish-grid,
 .automation-grid {
   display: grid;
   gap: 14px;
@@ -1000,6 +1001,99 @@ body {
 .automation-grid {
   margin-top: 20px;
   grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.mirofish-hero {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-top: 18px;
+  padding: 18px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background:
+    linear-gradient(180deg, rgba(69, 214, 196, 0.08), rgba(69, 214, 196, 0.02)),
+    rgba(255, 255, 255, 0.02);
+}
+
+.mirofish-hero-copy {
+  display: grid;
+  gap: 8px;
+}
+
+.mirofish-hero-copy strong {
+  font-size: 28px;
+  line-height: 1.05;
+}
+
+.mirofish-hero-copy p {
+  margin: 0;
+  max-width: 760px;
+  color: var(--muted);
+  line-height: 1.6;
+}
+
+.mirofish-grid {
+  margin-top: 18px;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.mirofish-card {
+  display: grid;
+  gap: 8px;
+  padding: 16px;
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.mirofish-card span {
+  color: var(--accent-2);
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.mirofish-card strong {
+  font-size: 26px;
+  line-height: 1.02;
+}
+
+.mirofish-card small {
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+.mirofish-embed-shell,
+.mirofish-log-shell {
+  margin-top: 18px;
+  padding: 16px;
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+#mirofish-frame {
+  display: block;
+  width: 100%;
+  min-height: 880px;
+  margin-top: 14px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(7, 11, 18, 0.92);
+}
+
+.mirofish-log-tail {
+  margin: 14px 0 0;
+  padding: 16px;
+  min-height: 180px;
+  max-height: 420px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text);
+  background: rgba(7, 11, 18, 0.92);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  font-family: "SFMono-Regular", "Menlo", "Monaco", monospace;
+  font-size: 12px;
+  line-height: 1.55;
 }
 
 .preset-surface {
@@ -1553,7 +1647,8 @@ select:focus {
 
 .data-columns,
 .ticker-grid,
-.ticket-grid {
+.ticket-grid,
+.mirofish-grid {
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
@@ -2565,6 +2660,7 @@ select:focus {
 
 body[data-view="focus"] .panel[data-view-group~="focus"],
 body[data-view="research"] .panel[data-view-group~="research"],
+body[data-view="mirofish"] .panel[data-view-group~="mirofish"],
 body[data-view="trade"] .panel[data-view-group~="trade"],
 body[data-view="orders"] .panel[data-view-group~="orders"],
 body[data-view="market"] .panel[data-view-group~="market"],

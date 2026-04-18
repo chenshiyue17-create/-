@@ -25,6 +25,7 @@
         <nav class="nav">
           <button class="nav-link active" type="button" data-view="focus">聚焦工作台</button>
           <button class="nav-link" type="button" data-view="research">策略研究</button>
+          <button class="nav-link" type="button" data-view="mirofish">仿真推演</button>
           <button class="nav-link" type="button" data-view="trade">交易配置</button>
           <button class="nav-link" type="button" data-view="orders">订单终端</button>
           <button class="nav-link" type="button" data-view="market">行情监控</button>
@@ -665,6 +666,70 @@
           <div class="notice" id="automation-message">默认参数已预填，建议先保存配置，再在模拟盘启动自动化。</div>
         </section>
 
+        <section class="panel panel-mirofish" id="mirofish" data-view-group="mirofish">
+          <div class="section-title">
+            <div>
+              <div class="eyebrow">Simulation Lab</div>
+              <h2>MiroFish 仿真推演已接入当前桌面</h2>
+            </div>
+            <div class="actions">
+              <button id="mirofish-refresh" class="btn btn-ghost" type="button">刷新状态</button>
+              <button id="mirofish-setup" class="btn btn-secondary" type="button">初始化</button>
+              <button id="mirofish-start" class="btn btn-primary" type="button">启动</button>
+              <button id="mirofish-stop" class="btn btn-ghost" type="button">停止</button>
+            </div>
+          </div>
+          <div class="mirofish-hero">
+            <div class="mirofish-hero-copy">
+              <div class="eyebrow">Same App / Same Desk</div>
+              <strong id="mirofish-status-main">等待同步 MiroFish 运行态</strong>
+              <p id="mirofish-status-sub">
+                这里不是新开一个项目，而是在当前 OKX Local App 内直接内嵌 MiroFish。初始化后即可在下方同页操作。
+              </p>
+            </div>
+            <span class="pill" id="mirofish-status-pill">待同步</span>
+          </div>
+          <div class="mirofish-grid">
+            <div class="mirofish-card">
+              <span>运行状态</span>
+              <strong id="mirofish-runtime-ready">未就绪</strong>
+              <small id="mirofish-runtime-summary">等待检查依赖、环境变量和后端状态。</small>
+            </div>
+            <div class="mirofish-card">
+              <span>前端构建</span>
+              <strong id="mirofish-frontend-state">未构建</strong>
+              <small id="mirofish-frontend-sub">dist、依赖和源码新旧状态</small>
+            </div>
+            <div class="mirofish-card">
+              <span>后端服务</span>
+              <strong id="mirofish-backend-state">未启动</strong>
+              <small id="mirofish-backend-sub">Flask 运行态与健康检查</small>
+            </div>
+            <div class="mirofish-card">
+              <span>环境变量</span>
+              <strong id="mirofish-env-state">待检查</strong>
+              <small id="mirofish-env-sub">LLM / ZEP 等关键项</small>
+            </div>
+          </div>
+          <div class="notice" id="mirofish-message">MiroFish 已接入本项目。先点“初始化”，再点“启动”，下方会直接内嵌工作区。</div>
+          <div class="mirofish-embed-shell">
+            <div class="block-head">
+              <div>
+                <h3>内嵌工作区</h3>
+                <small id="mirofish-frame-meta" class="subtle">当前页直接打开 /mirofish/，不再额外新开工程。</small>
+              </div>
+              <span class="pill" id="mirofish-frame-pill">等待加载</span>
+            </div>
+            <iframe id="mirofish-frame" title="MiroFish 仿真推演工作区" loading="lazy"></iframe>
+          </div>
+          <div class="mirofish-log-shell">
+            <div class="block-head">
+              <h3>最近日志</h3>
+            </div>
+            <pre id="mirofish-log-tail" class="mirofish-log-tail">等待日志输出</pre>
+          </div>
+        </section>
+
         <section class="panel panel-grid" id="snapshot" data-view-group="trade">
           <div class="section-title">
             <div class="eyebrow">账户快照</div>
@@ -931,6 +996,6 @@
     </div>
 
     <!-- BOOTSTRAP_DATA -->
-    <script src="/app.js?v=20260418-runtime-snapshot11"></script>
+    <script src="/app.js?v=20260418-runtime-snapshot12"></script>
   </body>
 </html>

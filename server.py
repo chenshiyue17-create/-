@@ -11,10 +11,12 @@ import hashlib
 import hmac
 import json
 import ipaddress
+import mimetypes
 import os
 import re
 import secrets
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -39,6 +41,11 @@ from requests.adapters import HTTPAdapter
 
 APP_DIR = Path(__file__).resolve().parent
 STATIC_DIR = APP_DIR / "static"
+MIROFISH_ROOT = APP_DIR / "vendor" / "MiroFish"
+MIROFISH_FRONTEND_DIR = MIROFISH_ROOT / "frontend"
+MIROFISH_FRONTEND_DIST_DIR = MIROFISH_FRONTEND_DIR / "dist"
+MIROFISH_BACKEND_DIR = MIROFISH_ROOT / "backend"
+MIROFISH_ENV_PATH = MIROFISH_ROOT / ".env"
 DATA_DIR = Path(os.environ.get("OKX_LOCAL_APP_DATA_DIR", APP_DIR / "data"))
 CONFIG_PATH = DATA_DIR / "local-config.json"
 AUTOMATION_CONFIG_PATH = DATA_DIR / "automation-config.json"
@@ -50,6 +57,8 @@ MAC_LOTTO_STATUS_PATH = DATA_DIR / "mac-lotto-status.json"
 MAC_LOTTO_LOG_PATH = DATA_DIR / "mac-lotto.log"
 HOST = os.environ.get("OKX_LOCAL_APP_HOST", "127.0.0.1")
 PORT = int(os.environ.get("OKX_LOCAL_APP_PORT", "8765"))
+MIROFISH_BACKEND_PORT = int(os.environ.get("OKX_LOCAL_APP_MIROFISH_BACKEND_PORT", "5180"))
+MIROFISH_APP_BASE = str(os.environ.get("OKX_LOCAL_APP_MIROFISH_BASE") or "/mirofish/").strip() or "/mirofish/"
 RUNTIME_SYNC_STAMP = str(os.environ.get("OKX_LOCAL_APP_RUNTIME_SYNC_STAMP") or "").strip()
 RUNTIME_SOURCE_LABEL = str(os.environ.get("OKX_LOCAL_APP_RUNTIME_SOURCE_LABEL") or "").strip()
 MAX_LOG_ENTRIES = 120
@@ -58,6 +67,8 @@ SECURE_FILE_MAGIC = "okx-local-app-secure-v1"
 KEYCHAIN_SERVICE = "com.cc.okxlocalapp.local-file-key"
 KEYCHAIN_ACCOUNT = "default"
 FALLBACK_SECRET_FILE = DATA_DIR / ".local-file-key"
+MIROFISH_RUNTIME_DIR = DATA_DIR / "mirofish-runtime"
+MIROFISH_LOG_PATH = MIROFISH_RUNTIME_DIR / "backend.log"
 VENDOR_ROOT = APP_DIR.parent / "btc-lotto-miner-app" / "vendor"
 HASHRATE_BENCHMARK_CACHE: dict[str, Any] = {"ts": 0.0, "hashrate": 0.0, "duration": 0.0}
 MINER_OPTIONS_CACHE: dict[str, Any] = {"ts": 0.0, "items": []}
@@ -10287,6 +10298,329 @@ def tail_lines(path: Path, count: int = 20) -> list[str]:
     return lines[-count:]
 
 
+def normalize_mirofish_base(base: str) -> str:
+    text = str(base or "").strip() or "/mirofish/"
+    if not text.startswith("/"):
+        text = f"/{text}"
+    if not text.endswith("/"):
+        text = f"{text}/"
+    return text
+
+
+MIROFISH_APP_BASE = normalize_mirofish_base(MIROFISH_APP_BASE)
+MIROFISH_API_BASE = f"{MIROFISH_APP_BASE.rstrip('/')}-api"
+
+
+class MiroFishRuntimeManager:
+    REQUIRED_ENV_KEYS = ("LLM_API_KEY", "ZEP_API_KEY")
+    COMMAND_SEARCH_DIRS = (
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+        "/opt/local/bin",
+        "/usr/bin",
+        "/bin",
+        "~/.local/bin",
+        "~/.npm-global/bin",
+        "~/.cargo/bin",
+        "~/Library/pnpm",
+    )
+
+    def __init__(self) -> None:
+        self.lock = threading.RLock()
+        self.backend_process: subprocess.Popen[str] | None = None
+        self.backend_log_handle: Any = None
+        self.started_at = ""
+
+    def _frontend_dist_index(self) -> Path:
+        return MIROFISH_FRONTEND_DIST_DIR / "index.html"
+
+    def _setup_script(self) -> Path:
+        return APP_DIR / "scripts" / "mirofish-setup.sh"
+
+    def _backend_health_url(self) -> str:
+        return f"http://127.0.0.1:{MIROFISH_BACKEND_PORT}/health"
+
+    def _discover_command_path(self, name: str) -> str:
+        direct = shutil.which(name)
+        if direct:
+            return direct
+        for raw_dir in self.COMMAND_SEARCH_DIRS:
+            directory = Path(raw_dir).expanduser()
+            candidate = directory / name
+            if candidate.exists() and os.access(candidate, os.X_OK):
+                return str(candidate)
+        return ""
+
+    def _command_paths(self) -> dict[str, str]:
+        return {
+            "node": self._discover_command_path("node"),
+            "npm": self._discover_command_path("npm"),
+            "uv": self._discover_command_path("uv"),
+        }
+
+    def _runtime_env(self, command_paths: dict[str, str] | None = None) -> dict[str, str]:
+        env = dict(os.environ)
+        commands = command_paths or self._command_paths()
+        path_entries = [str(item).strip() for item in (env.get("PATH") or "").split(os.pathsep) if str(item).strip()]
+        for command in commands.values():
+            command_path = str(command or "").strip()
+            if not command_path:
+                continue
+            directory = str(Path(command_path).expanduser().resolve().parent)
+            if directory not in path_entries:
+                path_entries.insert(0, directory)
+        env["PATH"] = os.pathsep.join(path_entries)
+        return env
+
+    def _parse_env_file(self) -> dict[str, str]:
+        values: dict[str, str] = {}
+        if not MIROFISH_ENV_PATH.exists():
+            return values
+        try:
+            text = MIROFISH_ENV_PATH.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            return values
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                continue
+            key, value = stripped.split("=", 1)
+            values[key.strip()] = value.strip()
+        return values
+
+    def _missing_env_keys(self) -> list[str]:
+        values = self._parse_env_file()
+        missing: list[str] = []
+        for key in self.REQUIRED_ENV_KEYS:
+            value = str(values.get(key) or "").strip()
+            if not value or "your_" in value.lower():
+                missing.append(key)
+        return missing
+
+    def _frontend_deps_ready(self) -> bool:
+        return (MIROFISH_FRONTEND_DIR / "node_modules").exists()
+
+    def _backend_deps_ready(self) -> bool:
+        return (MIROFISH_BACKEND_DIR / ".venv").exists()
+
+    def _frontend_sources_stale(self) -> bool:
+        index_path = self._frontend_dist_index()
+        if not index_path.exists():
+            return True
+        try:
+            dist_ts = index_path.stat().st_mtime
+        except OSError:
+            return True
+        source_roots = [
+            MIROFISH_FRONTEND_DIR / "src",
+            MIROFISH_ROOT / "locales",
+            MIROFISH_FRONTEND_DIR / "vite.config.js",
+            MIROFISH_FRONTEND_DIR / "index.html",
+            MIROFISH_FRONTEND_DIR / "package.json",
+            MIROFISH_ROOT / "package.json",
+        ]
+        for root in source_roots:
+            if not root.exists():
+                continue
+            paths = [root]
+            if root.is_dir():
+                paths = [path for path in root.rglob("*") if path.is_file()]
+            for path in paths:
+                try:
+                    if path.stat().st_mtime > dist_ts:
+                        return True
+                except OSError:
+                    continue
+        return False
+
+    def _backend_healthy(self, timeout: float = 1.5) -> bool:
+        try:
+            response = requests.get(self._backend_health_url(), timeout=timeout)
+            response.raise_for_status()
+            payload = response.json()
+            return str(payload.get("status") or "").lower() == "ok"
+        except Exception:
+            return False
+
+    def _cleanup_dead_backend(self) -> None:
+        if self.backend_process and self.backend_process.poll() is None:
+            return
+        if self.backend_log_handle:
+            try:
+                self.backend_log_handle.close()
+            except Exception:
+                pass
+        self.backend_process = None
+        self.backend_log_handle = None
+        self.started_at = ""
+
+    def _stop_backend_locked(self) -> None:
+        process = self.backend_process
+        if process and process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except Exception:
+                process.terminate()
+            try:
+                process.wait(timeout=8)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except Exception:
+                    process.kill()
+        self._cleanup_dead_backend()
+
+    def stop(self) -> dict[str, Any]:
+        with self.lock:
+            self._stop_backend_locked()
+            return self.snapshot()
+
+    def _ensure_runtime_dir(self) -> None:
+        MIROFISH_RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+        ensure_private_permissions(MIROFISH_RUNTIME_DIR, is_dir=True)
+
+    def setup(self) -> dict[str, Any]:
+        with self.lock:
+            script_path = self._setup_script()
+            if not script_path.exists():
+                raise RuntimeError("MiroFish 安装脚本不存在")
+            self._ensure_runtime_dir()
+            commands = self._command_paths()
+            env = self._runtime_env(commands)
+            env.setdefault("MIROFISH_APP_BASE", MIROFISH_APP_BASE)
+            env.setdefault("VITE_API_BASE_URL", MIROFISH_API_BASE)
+            with open(MIROFISH_LOG_PATH, "a", encoding="utf-8") as log_handle:
+                subprocess.run(
+                    [str(script_path)],
+                    cwd=str(APP_DIR),
+                    env=env,
+                    stdout=log_handle,
+                    stderr=log_handle,
+                    text=True,
+                    check=True,
+                )
+            return self.snapshot()
+
+    def _build_frontend_locked(self) -> None:
+        self._ensure_runtime_dir()
+        commands = self._command_paths()
+        if not commands["npm"] or not commands["node"]:
+            raise RuntimeError("缺少 Node.js / npm，无法构建 MiroFish 前端")
+        if not self._frontend_deps_ready():
+            raise RuntimeError("MiroFish 前端依赖未安装，请先执行集成初始化")
+        env = self._runtime_env(commands)
+        env["MIROFISH_APP_BASE"] = MIROFISH_APP_BASE
+        env["VITE_API_BASE_URL"] = MIROFISH_API_BASE
+        with open(MIROFISH_LOG_PATH, "a", encoding="utf-8") as log_handle:
+            subprocess.run(
+                [commands["npm"], "run", "build"],
+                cwd=str(MIROFISH_ROOT),
+                env=env,
+                stdout=log_handle,
+                stderr=log_handle,
+                text=True,
+                check=True,
+            )
+
+    def _start_backend_locked(self) -> None:
+        if self._backend_healthy():
+            self._cleanup_dead_backend()
+            return
+        commands = self._command_paths()
+        if not commands["uv"]:
+            raise RuntimeError("缺少 uv，无法启动 MiroFish 后端")
+        if not self._backend_deps_ready():
+            raise RuntimeError("MiroFish 后端依赖未安装，请先执行集成初始化")
+        missing_env = self._missing_env_keys()
+        if missing_env:
+            raise RuntimeError(f"MiroFish 缺少必要环境变量: {', '.join(missing_env)}")
+        self._ensure_runtime_dir()
+        self._stop_backend_locked()
+        log_handle = open(MIROFISH_LOG_PATH, "a", encoding="utf-8")
+        env = self._runtime_env(commands)
+        env["FLASK_HOST"] = "127.0.0.1"
+        env["FLASK_PORT"] = str(MIROFISH_BACKEND_PORT)
+        env["FLASK_DEBUG"] = "False"
+        process = subprocess.Popen(
+            [commands["uv"], "run", "python", "run.py"],
+            cwd=str(MIROFISH_BACKEND_DIR),
+            env=env,
+            stdout=log_handle,
+            stderr=log_handle,
+            text=True,
+            start_new_session=True,
+        )
+        self.backend_process = process
+        self.backend_log_handle = log_handle
+        self.started_at = now_local_iso()
+        deadline = time.time() + 20.0
+        while time.time() < deadline:
+            if self._backend_healthy(timeout=1.2):
+                return
+            if process.poll() is not None:
+                break
+            time.sleep(0.5)
+        self._stop_backend_locked()
+        raise RuntimeError("MiroFish 后端启动失败，请检查日志")
+
+    def ensure_started(self) -> dict[str, Any]:
+        with self.lock:
+            if self._frontend_sources_stale():
+                self._build_frontend_locked()
+            self._start_backend_locked()
+            return self.snapshot()
+
+    def snapshot(self) -> dict[str, Any]:
+        with self.lock:
+            self._cleanup_dead_backend()
+            commands = self._command_paths()
+            env_exists = MIROFISH_ENV_PATH.exists()
+            missing_env = self._missing_env_keys()
+            frontend_built = self._frontend_dist_index().exists()
+            frontend_stale = self._frontend_sources_stale()
+            backend_running = bool(self.backend_process and self.backend_process.poll() is None)
+            backend_healthy = self._backend_healthy()
+            status = {
+                "installed": MIROFISH_ROOT.exists(),
+                "frontendBuilt": frontend_built,
+                "frontendStale": frontend_stale,
+                "frontendDepsReady": self._frontend_deps_ready(),
+                "backendDepsReady": self._backend_deps_ready(),
+                "backendRunning": backend_running,
+                "backendHealthy": backend_healthy,
+                "backendPid": self.backend_process.pid if backend_running and self.backend_process else 0,
+                "backendPort": MIROFISH_BACKEND_PORT,
+                "appBase": MIROFISH_APP_BASE,
+                "apiBase": MIROFISH_API_BASE,
+                "envExists": env_exists,
+                "missingEnvKeys": missing_env,
+                "commands": commands,
+                "startedAt": self.started_at,
+                "logTail": tail_lines(MIROFISH_LOG_PATH, 40),
+            }
+            status["setupRequired"] = not (
+                status["frontendDepsReady"]
+                and status["backendDepsReady"]
+                and env_exists
+            )
+            status["ready"] = bool(frontend_built and backend_healthy and not missing_env)
+            status["launchable"] = bool(
+                status["frontendDepsReady"]
+                and status["backendDepsReady"]
+                and env_exists
+                and not missing_env
+            )
+            status["summary"] = (
+                "MiroFish 已集成到当前工作台"
+                if status["ready"]
+                else "MiroFish 已接入项目，但还没进入可用状态"
+            )
+            return status
+
+
+MIROFISH_RUNTIME = MiroFishRuntimeManager()
+
+
 class MacLottoManager:
     def __init__(self) -> None:
         self.processes: dict[str, dict[str, Any]] = {}
@@ -14142,6 +14476,149 @@ def serve_runtime_snapshot_endpoint(
     return True
 
 
+def render_mirofish_placeholder_html(status: dict[str, Any]) -> bytes:
+    summary = str(status.get("summary") or "MiroFish 正在准备中")
+    missing = status.get("missingEnvKeys") or []
+    missing_text = (
+        f"缺少环境变量：{', '.join(missing)}"
+        if missing
+        else ("依赖未安装，请先在当前项目里完成初始化。" if status.get("setupRequired") else "前端资源尚未构建完成。")
+    )
+    html = f"""<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>MiroFish 集成准备中</title>
+    <style>
+      body {{
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        background: #0b0f14;
+        color: #e9eef5;
+        font-family: "Avenir Next", "SF Pro Display", "Helvetica Neue", sans-serif;
+      }}
+      .shell {{
+        width: min(720px, calc(100vw - 48px));
+        padding: 32px;
+        border: 1px solid rgba(255,255,255,0.08);
+        background: rgba(17, 24, 33, 0.92);
+      }}
+      .eyebrow {{
+        text-transform: uppercase;
+        letter-spacing: 0.18em;
+        font-size: 12px;
+        color: #45d6c4;
+        margin-bottom: 12px;
+      }}
+      h1 {{
+        margin: 0 0 16px;
+        font-size: 48px;
+        line-height: 0.95;
+        font-family: Georgia, serif;
+      }}
+      p {{
+        margin: 0 0 12px;
+        color: rgba(233,238,245,0.78);
+        line-height: 1.6;
+      }}
+      code {{
+        color: #69f0ae;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      }}
+    </style>
+  </head>
+  <body>
+    <section class="shell">
+      <div class="eyebrow">Integrated MiroFish</div>
+      <h1>等待 MiroFish 就绪</h1>
+      <p>{summary}</p>
+      <p>{missing_text}</p>
+      <p>在当前 OKX Local App 的「仿真推演」工作区里点击 <code>初始化</code> / <code>启动</code> 即可，不需要再单独开一个项目。</p>
+    </section>
+  </body>
+</html>"""
+    return html.encode("utf-8")
+
+
+def serve_mirofish_frontend(handler: BaseHTTPRequestHandler, path: str) -> bool:
+    if not path.startswith(MIROFISH_APP_BASE.rstrip("/")):
+        return False
+    if path.startswith(MIROFISH_API_BASE):
+        return False
+    if path in {MIROFISH_APP_BASE.rstrip("/"), MIROFISH_APP_BASE.rstrip("/") + "/"}:
+        relative_path = "index.html"
+    else:
+        relative_path = path[len(MIROFISH_APP_BASE):].lstrip("/") or "index.html"
+    status = MIROFISH_RUNTIME.snapshot()
+    index_path = MIROFISH_FRONTEND_DIST_DIR / "index.html"
+    if not index_path.exists():
+        write_http_response(
+            handler,
+            status=200,
+            content_type="text/html; charset=utf-8",
+            raw=render_mirofish_placeholder_html(status),
+        )
+        return True
+    candidate = (MIROFISH_FRONTEND_DIST_DIR / relative_path).resolve()
+    dist_root = MIROFISH_FRONTEND_DIST_DIR.resolve()
+    if not str(candidate).startswith(str(dist_root)) or not candidate.exists() or candidate.is_dir():
+        candidate = index_path
+    content_type = mimetypes.guess_type(str(candidate))[0] or "application/octet-stream"
+    if content_type.startswith("text/") or content_type in {"application/javascript", "application/json"}:
+        content_type = f"{content_type}; charset=utf-8"
+    write_http_response(
+        handler,
+        status=200,
+        content_type=content_type,
+        raw=candidate.read_bytes(),
+    )
+    return True
+
+
+def proxy_mirofish_backend(
+    handler: BaseHTTPRequestHandler,
+    *,
+    method: str,
+    path: str,
+    query: str,
+    body: bytes | None = None,
+) -> bool:
+    if not path.startswith(MIROFISH_API_BASE):
+        return False
+    try:
+        if not MIROFISH_RUNTIME.snapshot().get("backendHealthy"):
+            MIROFISH_RUNTIME.ensure_started()
+    except Exception as exc:
+        error_response(handler, f"MiroFish 尚未就绪: {exc}", status=502)
+        return True
+    backend_path = path[len(MIROFISH_API_BASE):] or "/"
+    target = f"http://127.0.0.1:{MIROFISH_BACKEND_PORT}{backend_path}"
+    if query:
+        target = f"{target}?{query}"
+    headers: dict[str, str] = {}
+    content_type = str(handler.headers.get("Content-Type") or "").strip()
+    if content_type:
+        headers["Content-Type"] = content_type
+    accept = str(handler.headers.get("Accept") or "").strip()
+    if accept:
+        headers["Accept"] = accept
+    try:
+        response = requests.request(
+            method.upper(),
+            target,
+            data=body if body else None,
+            headers=headers,
+            timeout=300,
+        )
+        relay_requests_response(handler, response)
+    except Exception as exc:
+        error_response(handler, f"MiroFish 后端请求失败: {exc}", status=502)
+    return True
+
+
 class AppHandler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: Any) -> None:
         return
@@ -14182,6 +14659,18 @@ class AppHandler(BaseHTTPRequestHandler):
         path = parsed.path
         query = urllib.parse.parse_qs(parsed.query)
         if not enforce_gateway_auth(self, path):
+            return
+        if path == "/api/mirofish/status":
+            json_response(self, {"ok": True, "status": MIROFISH_RUNTIME.snapshot()})
+            return
+        if proxy_mirofish_backend(
+            self,
+            method="GET",
+            path=path,
+            query=parsed.query,
+        ):
+            return
+        if serve_mirofish_frontend(self, path):
             return
         if path.startswith("/api/miner/"):
             error_response(self, "矿机功能已移除", status=410)
@@ -14367,6 +14856,33 @@ class AppHandler(BaseHTTPRequestHandler):
         path = parsed.path
         if not enforce_gateway_auth(self, path):
             return
+        if path == "/api/mirofish/setup":
+            try:
+                json_response(self, {"ok": True, "status": MIROFISH_RUNTIME.setup()})
+            except Exception as exc:
+                error_response(self, f"MiroFish 初始化失败: {exc}", status=502)
+            return
+        if path == "/api/mirofish/start":
+            try:
+                json_response(self, {"ok": True, "status": MIROFISH_RUNTIME.ensure_started()})
+            except Exception as exc:
+                error_response(self, f"MiroFish 启动失败: {exc}", status=502)
+            return
+        if path == "/api/mirofish/stop":
+            try:
+                json_response(self, {"ok": True, "status": MIROFISH_RUNTIME.stop()})
+            except Exception as exc:
+                error_response(self, f"MiroFish 停止失败: {exc}", status=502)
+            return
+        raw_body = read_raw_request(self)
+        if proxy_mirofish_backend(
+            self,
+            method="POST",
+            path=path,
+            query=parsed.query,
+            body=raw_body,
+        ):
+            return
         if path.startswith("/api/miner/"):
             error_response(self, "矿机功能已移除", status=410)
             return
@@ -14401,7 +14917,7 @@ class AppHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/config":
-            payload = read_json_request(self)
+            payload = json.loads(raw_body.decode("utf-8")) if raw_body else {}
             persist = bool(payload.pop("persist", False))
             target_mode = str(payload.get("executionMode") or config.get("executionMode") or "local").strip()
             previous_effective = CONFIG.current()
@@ -14475,7 +14991,7 @@ class AppHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/config/test":
-            payload = read_json_request(self)
+            payload = json.loads(raw_body.decode("utf-8")) if raw_body else {}
             config = CONFIG.merged_with_existing_secrets(payload or CONFIG.current())
             valid, message = validate_config(config)
             if not valid:
@@ -14509,7 +15025,7 @@ class AppHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/automation/config":
-            payload = read_json_request(self)
+            payload = json.loads(raw_body.decode("utf-8")) if raw_body else {}
             ok, message, normalized = validate_automation_config(payload)
             if not ok:
                 error_response(self, message, status=400)
@@ -14528,7 +15044,7 @@ class AppHandler(BaseHTTPRequestHandler):
 
         if path == "/api/automation/analyze":
             try:
-                payload = read_json_request(self) or {}
+                payload = json.loads(raw_body.decode("utf-8")) if raw_body else {}
                 automation_payload = payload.get("automation") or AUTOMATION_CONFIG.current()
                 public_config = deep_merge(CONFIG.current(), payload.get("publicConfig") or {})
                 ok, message, normalized = validate_automation_config(automation_payload)
@@ -14555,7 +15071,7 @@ class AppHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/automation/research/backtest":
-            payload = read_json_request(self)
+            payload = json.loads(raw_body.decode("utf-8")) if raw_body else {}
             config_payload, options = normalize_research_options(payload)
             ok, message, normalized = validate_automation_config(config_payload)
             if not ok:
@@ -14570,7 +15086,7 @@ class AppHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/automation/research/optimize":
-            payload = read_json_request(self)
+            payload = json.loads(raw_body.decode("utf-8")) if raw_body else {}
             config_payload, options = normalize_research_options(payload)
             ok, message, normalized = validate_automation_config(config_payload)
             if not ok:
@@ -14585,7 +15101,7 @@ class AppHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/automation/research/export":
-            payload = read_json_request(self)
+            payload = json.loads(raw_body.decode("utf-8")) if raw_body else {}
             export_index = payload.get("index")
             try:
                 index = int(export_index) if export_index not in (None, "") else None
@@ -14625,7 +15141,7 @@ class AppHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/order/place":
-            payload = read_json_request(self)
+            payload = json.loads(raw_body.decode("utf-8")) if raw_body else {}
             valid, message = validate_config(config)
             if not valid:
                 error_response(self, message, status=400)

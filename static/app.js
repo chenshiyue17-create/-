@@ -131,6 +131,11 @@ const WORKSPACE_VIEWS = {
     chip: "Research",
     description: "集中看参数、回测、自动优化和策略日志。",
   },
+  mirofish: {
+    label: "仿真推演",
+    chip: "Simulation",
+    description: "在当前 OKX Local App 内直接使用 MiroFish，不再额外新开一个项目。",
+  },
   trade: {
     label: "交易配置",
     chip: "Trade",
@@ -215,6 +220,7 @@ const dashboardState = {
   equityCurveCache: [],
   bootCachePayload: null,
   runtimeSnapshot: null,
+  mirofish: null,
 };
 
 let lastBootCacheSerialized = "";
@@ -1632,7 +1638,149 @@ function setWorkspaceView(view, { persist = true, scroll = true } = {}) {
   if (key === "orders") {
     refreshOrders().catch(() => {});
   }
+  if (key === "mirofish") {
+    refreshMirofishStatus().catch(() => {});
+  }
   syncOrderPolling();
+}
+
+function mirofishBaseWithReload(base, forceReload = false) {
+  const normalized = String(base || "/mirofish/").trim() || "/mirofish/";
+  if (!forceReload) return normalized;
+  const separator = normalized.includes("?") ? "&" : "?";
+  return `${normalized}${separator}embedTs=${Date.now()}`;
+}
+
+function updateMirofishFrame(status = {}, { forceReload = false } = {}) {
+  const frame = $("mirofish-frame");
+  if (!frame) return;
+  const base = String(status.appBase || "/mirofish/").trim() || "/mirofish/";
+  const currentBase = frame.dataset.base || "";
+  if (forceReload || currentBase !== base || !frame.getAttribute("src")) {
+    frame.dataset.base = base;
+    frame.setAttribute("src", mirofishBaseWithReload(base, forceReload || currentBase === base));
+  }
+}
+
+function renderMirofishStatus(status = {}, options = {}) {
+  if (!$("mirofish-status-main")) return;
+  const snapshot = status && typeof status === "object" ? status : {};
+  dashboardState.mirofish = snapshot;
+
+  const ready = Boolean(snapshot.ready);
+  const launchable = Boolean(snapshot.launchable);
+  const setupRequired = Boolean(snapshot.setupRequired);
+  const backendHealthy = Boolean(snapshot.backendHealthy);
+  const backendRunning = Boolean(snapshot.backendRunning);
+  const frontendBuilt = Boolean(snapshot.frontendBuilt);
+  const frontendStale = Boolean(snapshot.frontendStale);
+  const missingEnv = Array.isArray(snapshot.missingEnvKeys) ? snapshot.missingEnvKeys : [];
+
+  $("mirofish-status-main").textContent = ready
+    ? "MiroFish 已在当前桌面可用"
+    : (setupRequired ? "MiroFish 还未初始化完成" : (launchable ? "MiroFish 已接入，等待启动" : "MiroFish 需要补全环境"));
+  $("mirofish-status-sub").textContent = snapshot.summary
+    || (ready
+      ? "下方 iframe 就是当前桌面内嵌的 MiroFish 工作区。"
+      : "先完成依赖、环境变量和后端启动，下方会在同页直接打开。");
+  $("mirofish-status-pill").textContent = ready
+    ? "已接入"
+    : (setupRequired ? "待初始化" : (launchable ? "可启动" : "待补环境"));
+
+  $("mirofish-runtime-ready").textContent = ready ? "已就绪" : (launchable ? "待启动" : "未就绪");
+  $("mirofish-runtime-summary").textContent = `前端 ${frontendBuilt ? (frontendStale ? "待重建" : "已构建") : "未构建"} · 后端 ${backendHealthy ? "健康" : (backendRunning ? "启动中" : "未启动")}`;
+
+  $("mirofish-frontend-state").textContent = frontendBuilt
+    ? (frontendStale ? "需重建" : "已构建")
+    : "未构建";
+  $("mirofish-frontend-sub").textContent = `依赖 ${snapshot.frontendDepsReady ? "已安装" : "未安装"} · 源码${frontendStale ? "有变更" : "已同步"}`;
+
+  $("mirofish-backend-state").textContent = backendHealthy
+    ? `健康 · ${snapshot.backendPort || "-"}`
+    : (backendRunning ? `启动中 · ${snapshot.backendPid || "-"}` : "未启动");
+  $("mirofish-backend-sub").textContent = backendHealthy
+    ? "后端健康检查已通过，内嵌工作区会直接走同服务代理。"
+    : "启动后会自动通过 /mirofish-api 代理当前页请求。";
+
+  $("mirofish-env-state").textContent = missingEnv.length
+    ? `缺少 ${missingEnv.length} 项`
+    : (snapshot.envExists ? "已齐备" : "未配置");
+  $("mirofish-env-sub").textContent = missingEnv.length
+    ? `待补: ${missingEnv.join(" / ")}`
+    : (snapshot.envExists ? "关键环境变量已存在。" : "还没有检测到 .env。");
+
+  $("mirofish-frame-meta").textContent = `当前入口 ${snapshot.appBase || "/mirofish/"} · API ${snapshot.apiBase || "/mirofish-api"}`;
+  $("mirofish-frame-pill").textContent = ready
+    ? "内嵌可用"
+    : (launchable ? "可启动" : (setupRequired ? "需初始化" : "待补环境"));
+  $("mirofish-log-tail").textContent = Array.isArray(snapshot.logTail) && snapshot.logTail.length
+    ? snapshot.logTail.join("\n")
+    : "暂时没有日志输出";
+
+  if (!options.preserveMessage) {
+    if (ready) {
+      setMirofishMessage("MiroFish 已接入当前桌面，下方就是内嵌工作区。", "ok");
+    } else if (missingEnv.length) {
+      setMirofishMessage(`还需要补齐环境变量：${missingEnv.join("、")}`, "err");
+    } else if (setupRequired) {
+      setMirofishMessage("先点“初始化”，把前后端依赖和运行环境准备好。", "");
+    } else if (launchable) {
+      setMirofishMessage("依赖已经就绪，点“启动”即可在当前桌面打开 MiroFish。", "");
+    } else {
+      setMirofishMessage("MiroFish 已接入项目，但当前还没进入可用状态。", "");
+    }
+  }
+
+  updateMirofishFrame(snapshot, { forceReload: options.forceReload === true });
+}
+
+async function refreshMirofishStatus(options = {}) {
+  return runSingleFlight("mirofishStatus", async () => {
+    const data = await request("/api/mirofish/status", {
+      timeoutMs: options.timeoutMs || 15000,
+    });
+    renderMirofishStatus(data.status || {}, {
+      preserveMessage: options.preserveMessage,
+      forceReload: options.forceReload,
+    });
+    return data.status || {};
+  });
+}
+
+async function setupMirofishRuntime() {
+  setMirofishMessage("正在初始化 MiroFish 运行环境，这一步会准备依赖和构建前端，请稍等。", "");
+  const data = await request("/api/mirofish/setup", {
+    method: "POST",
+    body: JSON.stringify({}),
+    timeoutMs: 20 * 60 * 1000,
+  });
+  renderMirofishStatus(data.status || {}, { forceReload: true });
+  setMirofishMessage("MiroFish 初始化完成，下一步可以直接启动。", "ok");
+  return data.status || {};
+}
+
+async function startMirofishRuntime() {
+  setMirofishMessage("正在启动 MiroFish 后端并准备当前页内嵌工作区。", "");
+  const data = await request("/api/mirofish/start", {
+    method: "POST",
+    body: JSON.stringify({}),
+    timeoutMs: 180000,
+  });
+  renderMirofishStatus(data.status || {}, { forceReload: true });
+  setMirofishMessage("MiroFish 已启动，下方 iframe 已切到当前工作区。", "ok");
+  return data.status || {};
+}
+
+async function stopMirofishRuntime() {
+  setMirofishMessage("正在停止 MiroFish 后端。", "");
+  const data = await request("/api/mirofish/stop", {
+    method: "POST",
+    body: JSON.stringify({}),
+    timeoutMs: 30000,
+  });
+  renderMirofishStatus(data.status || {}, { preserveMessage: true, forceReload: true });
+  setMirofishMessage("MiroFish 已停止，当前页保留内嵌入口。", "ok");
+  return data.status || {};
 }
 
 function runSingleFlight(key, task) {
@@ -1681,6 +1829,13 @@ function setMessage(text, kind = "") {
 
 function setAutomationMessage(text, kind = "") {
   const el = $("automation-message");
+  el.textContent = text;
+  el.className = `notice ${kind}`;
+}
+
+function setMirofishMessage(text, kind = "") {
+  const el = $("mirofish-message");
+  if (!el) return;
   el.textContent = text;
   el.className = `notice ${kind}`;
 }
@@ -6777,6 +6932,7 @@ async function boot() {
     refreshDeskState(),
     refreshAutomationState(),
     refreshMarket(),
+    refreshMirofishStatus({ preserveMessage: true }),
   ];
 
   $("envPreset").addEventListener("change", () => {
@@ -7131,6 +7287,41 @@ async function boot() {
       setAutomationMessage("已执行一键停机。", "ok");
     } catch (err) {
       setAutomationMessage(err.message, "err");
+    }
+  });
+
+  $("mirofish-refresh")?.addEventListener("click", async () => {
+    try {
+      await refreshMirofishStatus({ forceReload: true });
+    } catch (err) {
+      setMirofishMessage(err.message, "err");
+    }
+  });
+
+  $("mirofish-setup")?.addEventListener("click", async () => {
+    try {
+      await setupMirofishRuntime();
+    } catch (err) {
+      setMirofishMessage(err.message, "err");
+      await refreshMirofishStatus({ preserveMessage: true }).catch(() => {});
+    }
+  });
+
+  $("mirofish-start")?.addEventListener("click", async () => {
+    try {
+      await startMirofishRuntime();
+    } catch (err) {
+      setMirofishMessage(err.message, "err");
+      await refreshMirofishStatus({ preserveMessage: true }).catch(() => {});
+    }
+  });
+
+  $("mirofish-stop")?.addEventListener("click", async () => {
+    try {
+      await stopMirofishRuntime();
+    } catch (err) {
+      setMirofishMessage(err.message, "err");
+      await refreshMirofishStatus({ preserveMessage: true }).catch(() => {});
     }
   });
 
