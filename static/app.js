@@ -530,6 +530,10 @@ function normalizeRuntimeSnapshotPayload(payload = {}) {
 
 function applyRuntimeSnapshot(payload = {}) {
   const snapshot = setRuntimeSnapshot(payload);
+  if (snapshot.automationState && Object.keys(snapshot.automationState).length) {
+    syncMarketTickersFromAutomationState(snapshot.automationState);
+    renderMainstreamBoard();
+  }
   if (snapshot.account) {
     applyAccountSummary(snapshot.account, { syncSnapshot: false });
   }
@@ -2900,10 +2904,80 @@ function normalizeCandleRow(row) {
   };
 }
 
+function buildSyntheticTickerFromMarketEntry(entry = {}) {
+  if (!entry || typeof entry !== "object") return null;
+  const instId = String(entry.instId || "").trim();
+  const rawLast = [
+    entry.last,
+    entry.price,
+    entry.lastPrice,
+    entry.markPx,
+    entry.idxPx,
+  ].find((value) => Number.isFinite(Number(value)) && Number(value) > 0);
+  const last = Number(rawLast);
+  if (!instId || !Number.isFinite(last) || last <= 0) return null;
+  const ticker = { instId, last: String(last) };
+  const changePct = Number(entry.changePct);
+  if (Number.isFinite(changePct) && Math.abs(1 + changePct) > 1e-9) {
+    ticker.open24h = String(last / (1 + changePct));
+  }
+  return ticker;
+}
+
+function findMarketEntryByInstId(markets = {}, instId = "") {
+  if (!markets || typeof markets !== "object" || !instId) return null;
+  const directKeys = [instId, `spot:${instId}`, `swap:${instId}`];
+  for (const key of directKeys) {
+    const value = markets[key];
+    if (value && typeof value === "object" && value.instId === instId) return value;
+  }
+  return Object.values(markets).find((value) => value && typeof value === "object" && value.instId === instId) || null;
+}
+
+function resolveMainstreamTicker(instId = "") {
+  const directTicker = liveMarketState.tickers?.[instId];
+  if (directTicker && Number.isFinite(Number(directTicker.last))) return directTicker;
+
+  const automationState = getCurrentAutomationState() || {};
+  const markets = automationState.markets || {};
+  const symbol = String(instId || "").split("-")[0];
+  const candidates = [
+    findMarketEntryByInstId(markets, instId),
+    findMarketEntryByInstId(markets, `${symbol}-USDT-SWAP`),
+    findMarketEntryByInstId(markets, `${symbol}-USDT`),
+    markets[`spot:${instId}`],
+    markets[`swap:${symbol}-USDT-SWAP`],
+    markets[`spot:${symbol}-USDT`],
+  ];
+  for (const candidate of candidates) {
+    const ticker = buildSyntheticTickerFromMarketEntry(candidate);
+    if (ticker) return ticker;
+  }
+
+  const symbolTicker = Object.values(liveMarketState.tickers || {}).find((ticker) => {
+    const currentInstId = String(ticker?.instId || "");
+    return currentInstId.startsWith(`${symbol}-`) && Number.isFinite(Number(ticker?.last));
+  });
+  return symbolTicker || null;
+}
+
+function syncMarketTickersFromAutomationState(state = {}) {
+  const markets = state?.markets || {};
+  Object.values(markets).forEach((entry) => {
+    const ticker = buildSyntheticTickerFromMarketEntry(entry);
+    if (!ticker?.instId) return;
+    const existing = liveMarketState.tickers[ticker.instId] || {};
+    liveMarketState.tickers[ticker.instId] = {
+      ...existing,
+      ...ticker,
+    };
+  });
+}
+
 function renderMainstreamBoard() {
   const target = $("mainstream-board");
   const markup = MAINSTREAM_MARKETS.map((instId) => {
-    const ticker = liveMarketState.tickers[instId];
+    const ticker = resolveMainstreamTicker(instId);
     if (!ticker) {
       return `
         <div class="board-card">
@@ -2931,7 +3005,7 @@ function renderMainstreamBoard() {
   const dockTarget = $("dock-mainstream-board");
   if (dockTarget) {
     dockTarget.innerHTML = MAINSTREAM_MARKETS.map((instId) => {
-      const ticker = liveMarketState.tickers[instId];
+      const ticker = resolveMainstreamTicker(instId);
       const shortLabel = instId.split("-")[0] || instId;
       if (!ticker) {
         return `
