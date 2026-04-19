@@ -12,6 +12,7 @@
 
 import json
 import math
+import re
 from typing import Dict, Any, List, Optional, Callable
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
@@ -235,6 +236,113 @@ class SimulationConfigGenerator:
             base_url=self.base_url,
             model=self.model_name,
         )
+
+    def _prefer_local_generation(self) -> bool:
+        return bool(getattr(self.llm_client, "use_codex", False))
+
+    def _extract_hot_topics_local(
+        self,
+        simulation_requirement: str,
+        entities: List[EntityNode],
+    ) -> List[str]:
+        text = " ".join(
+            [
+                str(simulation_requirement or ""),
+                " ".join(str(entity.name or "") for entity in entities[:18]),
+                " ".join(str(entity.get_entity_type() or "") for entity in entities[:18]),
+            ]
+        )
+        tokens = re.findall(r"[\u4e00-\u9fff]{2,8}|[A-Za-z][A-Za-z0-9_-]{2,20}", text)
+        stop_words = {
+            "simulation",
+            "requirement",
+            "entity",
+            "social",
+            "media",
+            "agent",
+            "json",
+            "reddit",
+            "twitter",
+            "supportive",
+            "opposing",
+            "neutral",
+            "observer",
+            "模拟",
+            "需求",
+            "实体",
+            "配置",
+            "平台",
+            "用户",
+            "舆论",
+            "推演",
+        }
+        ranked: list[str] = []
+        seen: set[str] = set()
+        for token in tokens:
+            normalized = token.strip()
+            if (
+                len(normalized) < 2
+                or normalized.lower() in stop_words
+                or normalized in seen
+            ):
+                continue
+            seen.add(normalized)
+            ranked.append(normalized)
+        defaults = [str(entity.name or "") for entity in entities[:3] if str(entity.name or "").strip()]
+        combined = ranked[:6] + [item for item in defaults if item not in ranked]
+        return combined[:6] or ["市场波动", "执行策略", "风险控制"]
+
+    def _poster_type_for_topic(
+        self,
+        topic: str,
+        available_types: List[str],
+    ) -> str:
+        lowered = str(topic or "").lower()
+        preferred_groups = []
+        if any(keyword in lowered for keyword in ("公告", "监管", "官方", "policy", "regulation", "announcement")):
+            preferred_groups.append(("Official", "University", "GovernmentAgency", "Organization"))
+        if any(keyword in lowered for keyword in ("新闻", "媒体", "爆料", "news", "media")):
+            preferred_groups.append(("MediaOutlet", "SocialMediaPlatform"))
+        if any(keyword in lowered for keyword in ("社区", "学生", "用户", "community", "student", "user")):
+            preferred_groups.append(("Student", "Person", "Alumni"))
+        preferred_groups.append(tuple(available_types))
+        for group in preferred_groups:
+            for preferred in group:
+                if preferred in available_types:
+                    return preferred
+        return available_types[0] if available_types else "Person"
+
+    def _generate_local_event_config(
+        self,
+        simulation_requirement: str,
+        entities: List[EntityNode],
+    ) -> Dict[str, Any]:
+        available_types = []
+        for entity in entities:
+            entity_type = str(entity.get_entity_type() or "Unknown").strip()
+            if entity_type and entity_type not in available_types:
+                available_types.append(entity_type)
+        hot_topics = self._extract_hot_topics_local(simulation_requirement, entities)
+        narrative_direction = (
+            f"围绕 {' / '.join(hot_topics[:3])} 展开多轮讨论，比较顺势追击、反向交易、"
+            "风险收缩与做市执行对最终收益和回撤的影响。"
+        )
+        initial_posts: list[dict[str, Any]] = []
+        for topic in hot_topics[:4]:
+            poster_type = self._poster_type_for_topic(topic, available_types)
+            if poster_type in {"Official", "University", "GovernmentAgency", "Organization"}:
+                content = f"围绕 {topic} 发布正式说明，市场开始重新评估风险和执行节奏。"
+            elif poster_type in {"MediaOutlet", "SocialMediaPlatform"}:
+                content = f"媒体放大 {topic} 相关讨论，推动价格与情绪快速扩散。"
+            else:
+                content = f"社区围绕 {topic} 快速发酵，交易者开始讨论是否该调整仓位和执行方式。"
+            initial_posts.append({"content": content, "poster_type": poster_type})
+        return {
+            "hot_topics": hot_topics,
+            "narrative_direction": narrative_direction,
+            "initial_posts": initial_posts,
+            "reasoning": "Codex/local 模式：已根据需求、实体与话题本地生成事件配置。",
+        }
     
     def generate_config(
         self,
@@ -506,6 +614,8 @@ class SimulationConfigGenerator:
     
     def _generate_time_config(self, context: str, num_entities: int) -> Dict[str, Any]:
         """生成时间配置"""
+        if self._prefer_local_generation():
+            return self._get_default_time_config(num_entities)
         # 使用配置的上下文截断长度
         context_truncated = context[:self.TIME_CONFIG_CONTEXT_LENGTH]
         
@@ -622,6 +732,8 @@ class SimulationConfigGenerator:
         entities: List[EntityNode]
     ) -> Dict[str, Any]:
         """生成事件配置"""
+        if self._prefer_local_generation():
+            return self._generate_local_event_config(simulation_requirement, entities)
         
         # 获取可用的实体类型列表，供 LLM 参考
         entity_types_available = list(set(
@@ -790,6 +902,10 @@ class SimulationConfigGenerator:
         simulation_requirement: str
     ) -> List[AgentActivityConfig]:
         """分批生成Agent配置"""
+        if self._prefer_local_generation():
+            llm_configs = {}
+        else:
+            llm_configs = None
         
         # 构建实体信息（使用配置的摘要长度）
         entity_list = []
@@ -841,12 +957,13 @@ class SimulationConfigGenerator:
         system_prompt = "你是社交媒体行为分析专家。返回纯JSON，配置需符合模拟场景中目标用户群体的作息习惯。"
         system_prompt = f"{system_prompt}\n\n{get_language_instruction()}\nIMPORTANT: The 'stance' field value MUST be one of the English strings: 'supportive', 'opposing', 'neutral', 'observer'. All JSON field names and numeric values must remain unchanged. Only natural language text fields should use the specified language."
 
-        try:
-            result = self._call_llm_with_retry(prompt, system_prompt)
-            llm_configs = {cfg["agent_id"]: cfg for cfg in result.get("agent_configs", [])}
-        except Exception as e:
-            logger.warning(f"Agent配置批次LLM生成失败: {e}, 使用规则生成")
-            llm_configs = {}
+        if llm_configs is None:
+            try:
+                result = self._call_llm_with_retry(prompt, system_prompt)
+                llm_configs = {cfg["agent_id"]: cfg for cfg in result.get("agent_configs", [])}
+            except Exception as e:
+                logger.warning(f"Agent配置批次LLM生成失败: {e}, 使用规则生成")
+                llm_configs = {}
         
         # 构建AgentActivityConfig对象
         configs = []

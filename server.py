@@ -1365,6 +1365,25 @@ def default_automation_state() -> dict[str, Any]:
             "notes": [],
             "equityCurve": [],
         },
+        "strategyOptimization": {
+            "running": False,
+            "phase": "idle",
+            "message": "等待自动推演完成后再执行策略优化。",
+            "startedAt": "",
+            "updatedAt": "",
+            "completedAt": "",
+            "error": "",
+            "optimizationId": "",
+            "sourceSimulationId": "",
+            "focusSymbol": "",
+            "ordersCount": 0,
+            "applied": False,
+            "appliedAt": "",
+            "bestConfig": {},
+            "researchSummary": {},
+            "notes": [],
+            "metrics": {},
+        },
     }
 
 
@@ -7724,6 +7743,32 @@ def runtime_research_options(automation: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+STRATEGY_OPTIMIZATION_PRESERVE_KEYS = (
+    "watchlistSymbols",
+    "watchlistOverrides",
+    "pollSeconds",
+    "cooldownSeconds",
+    "maxOrdersPerDay",
+    "autostart",
+    "allowLiveManualOrders",
+    "allowLiveTrading",
+    "allowLiveAutostart",
+    "enforceNetMode",
+    "targetBalanceMultiple",
+)
+
+
+def merge_optimized_automation_config(
+    current_config: dict[str, Any],
+    optimized_config: dict[str, Any],
+) -> dict[str, Any]:
+    merged = deep_merge(current_config, optimized_config)
+    for key in STRATEGY_OPTIMIZATION_PRESERVE_KEYS:
+        if key in current_config:
+            merged[key] = copy.deepcopy(current_config[key])
+    return merged
+
+
 def extract_first_row(response: dict[str, Any]) -> dict[str, Any]:
     rows = response.get("data") or []
     return rows[0] if rows else {}
@@ -10357,12 +10402,49 @@ class MiroFishRuntimeManager:
 
     def _command_paths(self) -> dict[str, str]:
         return {
-            "node": self._discover_command_path("node"),
-            "npm": self._discover_command_path("npm"),
+            "node": self._discover_node_command(),
+            "npm": self._discover_npm_command(),
             "npm_cli": self._discover_npm_cli(),
             "uv": self._discover_command_path("uv"),
-            "codex": self._discover_command_path("codex"),
+            "codex": self._discover_codex_command(),
         }
+
+    def _discover_node_command(self) -> str:
+        candidates = [
+            Path("/opt/homebrew/bin/node"),
+            Path("/usr/local/bin/node"),
+            Path("/opt/local/bin/node"),
+        ]
+        for candidate in candidates:
+            try:
+                if candidate.exists() and os.access(candidate, os.X_OK):
+                    return str(candidate.resolve())
+            except OSError:
+                continue
+        return self._discover_command_path("node")
+
+    def _discover_npm_command(self) -> str:
+        candidates = [
+            Path("/opt/homebrew/bin/npm"),
+            Path("/usr/local/bin/npm"),
+            Path("/opt/local/bin/npm"),
+        ]
+        for candidate in candidates:
+            try:
+                if candidate.exists() and os.access(candidate, os.X_OK):
+                    return str(candidate.resolve())
+            except OSError:
+                continue
+        return self._discover_command_path("npm")
+
+    def _discover_codex_command(self) -> str:
+        preferred = Path("/Applications/Codex.app/Contents/Resources/codex")
+        try:
+            if preferred.exists() and os.access(preferred, os.X_OK):
+                return str(preferred)
+        except OSError:
+            pass
+        return self._discover_command_path("codex")
 
     def _discover_npm_cli(self) -> str:
         candidates = [
@@ -10475,7 +10557,17 @@ class MiroFishRuntimeManager:
         values.setdefault("MIROFISH_GRAPH_BACKEND", graph_backend)
         if llm_backend == "codex":
             configured_codex = str(values.get("MIROFISH_CODEX_COMMAND") or "").strip()
-            values["MIROFISH_CODEX_COMMAND"] = configured_codex or str(commands.get("codex") or "codex")
+            configured_path = Path(configured_codex).expanduser() if configured_codex else None
+            configured_available = bool(
+                configured_codex
+                and (
+                    (configured_path and configured_path.is_absolute() and configured_path.exists())
+                    or shutil.which(configured_codex)
+                )
+            )
+            values["MIROFISH_CODEX_COMMAND"] = (
+                configured_codex if configured_available else str(commands.get("codex") or configured_codex or "codex")
+            )
             values.setdefault("MIROFISH_CODEX_TIMEOUT_SECONDS", "240")
         return values
 
@@ -10715,6 +10807,671 @@ class MiroFishRuntimeManager:
 
 
 MIROFISH_RUNTIME = MiroFishRuntimeManager()
+
+
+class MiroFishAutoSimulationManager:
+    def __init__(self) -> None:
+        self.lock = threading.RLock()
+        self.state: dict[str, Any] = self._blank_state()
+
+    def _blank_state(self) -> dict[str, Any]:
+        return {
+            "running": False,
+            "taskId": "",
+            "mode": "",
+            "modeLabel": "",
+            "phase": "idle",
+            "progress": 0,
+            "message": "可根据当前订单或策略一键发起自动推演。",
+            "startedAt": "",
+            "updatedAt": "",
+            "completedAt": "",
+            "error": "",
+            "projectId": "",
+            "graphId": "",
+            "graphTaskId": "",
+            "prepareTaskId": "",
+            "simulationId": "",
+            "simulationPath": "",
+            "simulationUrl": "",
+            "seedPath": "",
+            "projectName": "",
+            "ordersCount": 0,
+            "focusSymbol": "",
+            "result": {},
+        }
+
+    def snapshot(self) -> dict[str, Any]:
+        with self.lock:
+            return copy.deepcopy(self.state)
+
+    def _update(self, **patch: Any) -> dict[str, Any]:
+        with self.lock:
+            next_state = copy.deepcopy(self.state)
+            next_state.update({k: v for k, v in patch.items() if v is not None})
+            next_state["updatedAt"] = now_local_iso()
+            self.state = next_state
+            return copy.deepcopy(self.state)
+
+    def _set_running(self, mode: str) -> dict[str, Any]:
+        mode_label = "订单推演" if mode == "orders" else "策略推演"
+        task_id = f"mirofish-auto-{secrets.token_hex(4)}"
+        with self.lock:
+            if self.state.get("running"):
+                raise RuntimeError("已有自动推演任务在运行，请等待当前任务完成。")
+            self.state = self._blank_state()
+            self.state.update(
+                {
+                    "running": True,
+                    "taskId": task_id,
+                    "mode": mode,
+                    "modeLabel": mode_label,
+                    "phase": "queued",
+                    "progress": 1,
+                    "message": f"{mode_label}任务已排队，正在准备运行态和推演材料。",
+                    "startedAt": now_local_iso(),
+                    "updatedAt": now_local_iso(),
+                }
+            )
+            state = copy.deepcopy(self.state)
+        try:
+            STRATEGY_AUTO_OPTIMIZATION.reset_for_simulation(
+                simulation_id="",
+                focus_symbol="",
+                orders_count=0,
+            )
+        except Exception:
+            pass
+        return state
+
+    def _backend_url(self, path: str) -> str:
+        suffix = path if path.startswith("/") else f"/{path}"
+        return f"http://127.0.0.1:{MIROFISH_BACKEND_PORT}{suffix}"
+
+    def _backend_request(
+        self,
+        method: str,
+        path: str,
+        *,
+        json_body: dict[str, Any] | None = None,
+        data: dict[str, Any] | None = None,
+        files: dict[str, Any] | None = None,
+        timeout: float = 120.0,
+    ) -> dict[str, Any]:
+        response = requests.request(
+            method.upper(),
+            self._backend_url(path),
+            json=json_body,
+            data=data,
+            files=files,
+            timeout=timeout,
+        )
+        try:
+            payload = response.json()
+        except Exception as exc:
+            raise RuntimeError(f"MiroFish 接口返回无效响应: {exc}") from exc
+        if not response.ok or payload.get("success") is False:
+            raise RuntimeError(str(payload.get("error") or payload.get("message") or f"{method} {path} 失败"))
+        return payload
+
+    def _format_order_time(self, order: dict[str, Any]) -> str:
+        for field_name in ("fillTime", "cTime", "uTime"):
+            raw = str(order.get(field_name) or "").strip()
+            if not raw:
+                continue
+            try:
+                ts = int(raw)
+                if ts > 10_000_000_000:
+                    ts = ts / 1000.0
+                return datetime.fromtimestamp(ts, tz=timezone.utc).astimezone().strftime("%m-%d %H:%M:%S")
+            except Exception:
+                continue
+        return ""
+
+    def _decimal_text(self, value: Any, digits: int = 2) -> str:
+        try:
+            quant = Decimal(1).scaleb(-digits)
+            return str(Decimal(str(value)).quantize(quant))
+        except Exception:
+            return str(value or "0")
+
+    def _top_symbol_rows(self, orders: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        rows: dict[str, dict[str, Any]] = {}
+        for order in orders:
+            symbol = str(order.get("instId") or "").strip()
+            if not symbol:
+                continue
+            bucket = rows.setdefault(
+                symbol,
+                {"instId": symbol, "count": 0, "notional": Decimal("0"), "fees": Decimal("0"), "pnl": Decimal("0")},
+            )
+            bucket["count"] += 1
+            for field_name, key in (("fillNotionalUsd", "notional"), ("fillFee", "fees"), ("fillPnl", "pnl")):
+                try:
+                    bucket[key] += Decimal(str(order.get(field_name) or "0"))
+                except Exception:
+                    continue
+        return sorted(rows.values(), key=lambda item: (abs(item["pnl"]), item["count"]), reverse=True)[:6]
+
+    def _build_seed_material(self, mode: str) -> dict[str, Any]:
+        snapshot = build_runtime_snapshot(CONFIG.current(), include_account=True)
+        automation_state = snapshot.automation_state or {}
+        orders_payload = snapshot.orders_payload(limit=24)
+        orders = list(orders_payload.get("orders") or [])
+        analysis = automation_state.get("analysis") or {}
+        summary = orders_payload.get("journal") or {}
+        account_summary = (snapshot.account_payload or {}).get("summary") or {}
+        focus_symbol = str(
+            analysis.get("selectedWatchlistSymbol")
+            or automation_state.get("focusSymbol")
+            or ((automation_state.get("markets") or {}).get("swap") or {}).get("instId")
+            or "BTC-USDT-SWAP"
+        )
+        predicted_net = self._decimal_text(analysis.get("predictedNetPct") or "0", 2)
+        exec_cost = self._decimal_text(summary.get("executionCostFloorPct") or analysis.get("executionCostFloorPct") or "0", 4)
+        total_fees = self._decimal_text(summary.get("totalFees") or "0", 2)
+        net_pnl = self._decimal_text(summary.get("netPnl") or "0", 2)
+        realized_pnl = self._decimal_text(summary.get("realizedPnl") or "0", 2)
+        equity = self._decimal_text(account_summary.get("totalEq") or automation_state.get("currentEq") or "0", 2)
+        recent_symbols = [row["instId"] for row in self._top_symbol_rows(orders)]
+        symbol_rows = self._top_symbol_rows(orders)
+        order_lines: list[str] = []
+        for order in orders[:12]:
+            order_lines.append(
+                "| {time} | {inst} | {side} | {fill_px} | {fill_sz} | {pnl} | {fee} |".format(
+                    time=self._format_order_time(order) or "-",
+                    inst=order.get("instId") or "-",
+                    side=order.get("side") or "-",
+                    fill_px=order.get("fillPx") or order.get("avgPx") or "-",
+                    fill_sz=order.get("fillSz") or order.get("sz") or "-",
+                    pnl=self._decimal_text(order.get("fillPnl") or order.get("pnl") or "0", 2),
+                    fee=self._decimal_text(order.get("fillFee") or order.get("fee") or "0", 2),
+                )
+            )
+        symbol_lines: list[str] = []
+        for row in symbol_rows:
+            symbol_lines.append(
+                f"- {row['instId']}: {row['count']} 笔, 订单金额约 {self._decimal_text(row['notional'], 2)}U, 已实现 {self._decimal_text(row['pnl'], 2)}U, 手续费 {self._decimal_text(row['fees'], 2)}U"
+            )
+
+        role_lines = [
+            "- TrendCaptain（趋势交易员）: 追逐延续信号，偏好顺势加仓。",
+            "- MeanReverter（反转交易员）: 专门捕捉过热后的回归和止盈压力。",
+            "- DepthKeeper（做市商）: 关注盘口深度、滑点和 taker 冲击。",
+            "- RiskSentinel（风控官）: 控制回撤、杠杆与资金占用。",
+            "- FundingWatcher（资金费观察者）: 追踪资金费率和持仓拥挤度。",
+            "- NewsPulse（情绪观察者）: 根据新闻、社群情绪与价格波动调整预期。",
+        ]
+
+        mode_title = "根据最近订单复盘并反推更优执行" if mode == "orders" else "根据当前策略和运行态推演未来演化"
+        simulation_requirement = (
+            f"请围绕 {focus_symbol} 搭建一组小规模市场参与者仿真，"
+            f"重点推演 {mode_title}。要求保留手续费、滑点、maker/taker、方向切换、仓位与风控约束。"
+            "请让不同角色在 6 到 8 轮互动内给出各自决策、彼此影响、以及最终对策略表现的反馈。"
+            "输出应强调哪些行为导致亏损、哪些执行切换可能改善结果，以及是否应继续当前策略。"
+        )
+
+        title = f"OKX 自动推演 · {'订单视角' if mode == 'orders' else '策略视角'} · {focus_symbol}"
+        markdown = "\n".join(
+            [
+                f"# {title}",
+                "",
+                f"- 生成时间: {now_local_iso()}",
+                f"- 模式: {'订单推演' if mode == 'orders' else '策略推演'}",
+                f"- 当前策略: {analysis.get('selectedStrategyName') or automation_state.get('modeText') or '利润循环'}",
+                f"- 当前决策: {analysis.get('decisionLabel') or automation_state.get('statusText') or '运行中'}",
+                f"- 当前方向: {analysis.get('plannedSideLabel') or '未明确'}",
+                f"- 焦点标的: {focus_symbol}",
+                "",
+                "## 账户与执行摘要",
+                f"- 总权益: {equity} USDT",
+                f"- 近场净结果: {net_pnl} USDT",
+                f"- 已实现: {realized_pnl} USDT",
+                f"- 手续费: {total_fees} USDT",
+                f"- 预期净优势: {predicted_net}%",
+                f"- 真实执行成本地板: {exec_cost}%",
+                f"- 最近订单数: {len(orders)}",
+                "",
+                "## 当前策略与运行态",
+                f"- 模式文本: {automation_state.get('modeText') or '-'}",
+                f"- 摘要: {analysis.get('summary') or '-'}",
+                f"- 详细策略: {analysis.get('selectedStrategyDetail') or '-'}",
+                f"- 最后动作: {((automation_state.get('markets') or {}).get('swap') or {}).get('lastAction') or '-'}",
+                f"- 最后说明: {((automation_state.get('markets') or {}).get('swap') or {}).get('lastMessage') or '-'}",
+                "",
+                "## 主要订单分布",
+                *(symbol_lines or ["- 暂无有效订单分布。"]),
+                "",
+                "## 最近订单样本",
+                "| 时间 | 标的 | 方向 | 成交价 | 数量 | 盈亏 | 手续费 |",
+                "| --- | --- | --- | --- | --- | --- | --- |",
+                *(order_lines or ["| - | - | - | - | - | - | - |"]),
+                "",
+                "## 仿真核心角色",
+                *role_lines,
+                "",
+                "## 仿真目标",
+                simulation_requirement,
+            ]
+        )
+        return {
+            "snapshot": snapshot,
+            "orders": orders,
+            "focusSymbol": focus_symbol,
+            "projectName": f"{'订单' if mode == 'orders' else '策略'}推演-{focus_symbol}-{datetime.now().strftime('%m%d-%H%M')}",
+            "simulationRequirement": simulation_requirement,
+            "markdown": markdown,
+            "recentSymbols": recent_symbols,
+        }
+
+    def _wait_for_graph_task(self, task_id: str, deadline: float) -> dict[str, Any]:
+        while time.time() < deadline:
+            payload = self._backend_request("GET", f"/api/graph/task/{task_id}", timeout=20.0)
+            data = payload.get("data") or {}
+            status = str(data.get("status") or "")
+            progress = int(data.get("progress") or 0)
+            message = str(data.get("message") or "正在构建图谱")
+            self._update(phase="building-graph", progress=min(55, 20 + progress // 2), message=message)
+            if status == "completed":
+                return data
+            if status == "failed":
+                raise RuntimeError(str(data.get("error") or message or "图谱构建失败"))
+            time.sleep(2.0)
+        raise RuntimeError("等待图谱构建超时")
+
+    def _wait_for_prepare(self, simulation_id: str, task_id: str | None, deadline: float) -> dict[str, Any]:
+        while time.time() < deadline:
+            payload = self._backend_request(
+                "POST",
+                "/api/simulation/prepare/status",
+                json_body={k: v for k, v in {"simulation_id": simulation_id, "task_id": task_id}.items() if v},
+                timeout=20.0,
+            )
+            data = payload.get("data") or {}
+            status = str(data.get("status") or "")
+            progress = int((data.get("task") or {}).get("progress") or 0)
+            task_message = str((data.get("task") or {}).get("message") or data.get("message") or "正在准备模拟")
+            self._update(phase="preparing-simulation", progress=min(85, 55 + progress // 3), message=task_message)
+            if status == "ready" or data.get("already_prepared"):
+                return data
+            if status == "failed":
+                task = data.get("task") or {}
+                raise RuntimeError(str(task.get("error") or task_message or "模拟准备失败"))
+            time.sleep(2.5)
+        raise RuntimeError("等待模拟准备超时")
+
+    def _wait_for_run_completion(self, simulation_id: str, deadline: float) -> dict[str, Any]:
+        last_status = "idle"
+        while time.time() < deadline:
+            payload = self._backend_request(
+                "GET",
+                f"/api/simulation/{simulation_id}/run-status",
+                timeout=20.0,
+            )
+            data = payload.get("data") or {}
+            runner_status = str(data.get("runner_status") or "idle")
+            progress_percent = int(data.get("progress_percent") or 0)
+            current_round = int(data.get("current_round") or 0)
+            total_rounds = int(data.get("total_rounds") or 0)
+            total_actions = int(data.get("total_actions_count") or 0)
+            status_message = (
+                f"模拟运行中：第 {current_round}/{max(total_rounds, 1)} 轮，"
+                f"动作 {total_actions}，进度 {progress_percent}%"
+                if runner_status == "running"
+                else (
+                    f"模拟已完成：共 {max(current_round, total_rounds)} 轮，动作 {total_actions}"
+                    if runner_status == "completed"
+                    else f"正在等待模拟启动（状态 {runner_status}）"
+                )
+            )
+            self._update(
+                phase="running-simulation" if runner_status != "completed" else "simulation-completed",
+                progress=min(96, max(91, 90 + progress_percent // 10)),
+                message=status_message,
+                result={
+                    **(self.snapshot().get("result") or {}),
+                    "runStatus": data,
+                },
+            )
+            if runner_status == "completed":
+                return data
+            if runner_status in {"failed", "stopped"}:
+                raise RuntimeError(str(data.get("error") or f"模拟运行失败: {runner_status}"))
+            last_status = runner_status
+            time.sleep(3.0)
+        raise RuntimeError(f"等待模拟运行完成超时，最后状态 {last_status}")
+
+    def _run(self, task_id: str, mode: str) -> None:
+        try:
+            self._update(phase="starting-runtime", progress=5, message="正在确认 MiroFish 运行环境。")
+            MIROFISH_RUNTIME.ensure_started()
+            seed = self._build_seed_material(mode)
+            seed_dir = MIROFISH_RUNTIME_DIR / "auto-sim-seeds"
+            seed_dir.mkdir(parents=True, exist_ok=True)
+            seed_path = seed_dir / f"{task_id}.md"
+            seed_path.write_text(seed["markdown"], encoding="utf-8")
+            self._update(
+                phase="generating-project",
+                progress=12,
+                message=f"已生成推演材料，正在创建 MiroFish 项目。",
+                seedPath=str(seed_path),
+                focusSymbol=seed["focusSymbol"],
+                projectName=seed["projectName"],
+                ordersCount=len(seed["orders"]),
+            )
+
+            with seed_path.open("rb") as handle:
+                payload = self._backend_request(
+                    "POST",
+                    "/api/graph/ontology/generate",
+                    data={
+                        "simulation_requirement": seed["simulationRequirement"],
+                        "project_name": seed["projectName"],
+                        "additional_context": "该材料来自 OKX Local App 的实时订单和策略快照，请重点服务于自动交易复盘与未来路径推演。",
+                    },
+                    files={"files": (seed_path.name, handle, "text/markdown")},
+                    timeout=360.0,
+                )
+            project_data = payload.get("data") or {}
+            project_id = str(project_data.get("project_id") or "")
+            if not project_id:
+                raise RuntimeError("MiroFish 未返回 project_id")
+            self._update(
+                phase="building-graph",
+                progress=20,
+                message="项目已创建，正在构建图谱。",
+                projectId=project_id,
+            )
+
+            build_payload = self._backend_request(
+                "POST",
+                "/api/graph/build",
+                json_body={"project_id": project_id, "graph_name": seed["projectName"], "force": True},
+                timeout=60.0,
+            )
+            build_data = build_payload.get("data") or {}
+            graph_task_id = str(build_data.get("task_id") or "")
+            if not graph_task_id:
+                raise RuntimeError("图谱构建任务未返回 task_id")
+            self._update(graphTaskId=graph_task_id)
+            graph_task = self._wait_for_graph_task(graph_task_id, time.time() + 10 * 60)
+            graph_result = graph_task.get("result") or {}
+            graph_id = str(graph_result.get("graph_id") or "")
+            if not graph_id:
+                raise RuntimeError("图谱构建完成后未返回 graph_id")
+            self._update(phase="creating-simulation", progress=58, message="图谱已就绪，正在创建模拟。", graphId=graph_id)
+
+            simulation_payload = self._backend_request(
+                "POST",
+                "/api/simulation/create",
+                json_body={"project_id": project_id, "graph_id": graph_id, "enable_twitter": True, "enable_reddit": True},
+                timeout=60.0,
+            )
+            simulation_data = simulation_payload.get("data") or {}
+            simulation_id = str(simulation_data.get("simulation_id") or "")
+            if not simulation_id:
+                raise RuntimeError("MiroFish 未返回 simulation_id")
+            simulation_path = f"{MIROFISH_APP_BASE.rstrip('/')}/simulation/{simulation_id}/start"
+            self._update(
+                phase="preparing-simulation",
+                progress=64,
+                message="模拟已创建，正在准备参与者与场景。",
+                simulationId=simulation_id,
+                simulationPath=simulation_path,
+                simulationUrl=simulation_path,
+            )
+            STRATEGY_AUTO_OPTIMIZATION.reset_for_simulation(
+                simulation_id=simulation_id,
+                focus_symbol=seed["focusSymbol"],
+                orders_count=len(seed["orders"]),
+            )
+
+            prepare_payload = self._backend_request(
+                "POST",
+                "/api/simulation/prepare",
+                json_body={
+                    "simulation_id": simulation_id,
+                    "use_llm_for_profiles": True,
+                    "parallel_profile_count": 3,
+                    "force_regenerate": True,
+                },
+                timeout=90.0,
+            )
+            prepare_data = prepare_payload.get("data") or {}
+            prepare_task_id = str(prepare_data.get("task_id") or "")
+            self._update(prepareTaskId=prepare_task_id)
+            self._wait_for_prepare(simulation_id, prepare_task_id or None, time.time() + 15 * 60)
+
+            self._update(phase="starting-simulation", progress=90, message="准备完成，正在启动推演。")
+            start_payload = self._backend_request(
+                "POST",
+                "/api/simulation/start",
+                json_body={
+                    "simulation_id": simulation_id,
+                    "platform": "parallel",
+                    "max_rounds": 6 if mode == "orders" else 8,
+                    "force": True,
+                },
+                timeout=60.0,
+            )
+            start_data = start_payload.get("data") or {}
+            self._update(
+                phase="running-simulation",
+                progress=91,
+                message="推演已启动，正在等待模拟完成。",
+                result={"start": start_data},
+            )
+            run_result = self._wait_for_run_completion(simulation_id, time.time() + 20 * 60)
+            optimization_result = STRATEGY_AUTO_OPTIMIZATION.run(
+                mode=mode,
+                simulation_id=simulation_id,
+                focus_symbol=seed["focusSymbol"],
+                orders_count=len(seed["orders"]),
+                simulation_result=run_result,
+            )
+            self._update(
+                running=False,
+                phase="completed",
+                progress=100,
+                message="自动推演与策略优化已完成，最新配置已自动回写。",
+                completedAt=now_local_iso(),
+                result={
+                    "start": start_data,
+                    "runStatus": run_result,
+                    "strategyOptimization": optimization_result,
+                },
+            )
+        except Exception as exc:
+            self._update(
+                running=False,
+                phase="failed",
+                progress=100,
+                message=f"自动推演失败: {exc}",
+                completedAt=now_local_iso(),
+                error=str(exc),
+            )
+
+    def start(self, mode: str) -> dict[str, Any]:
+        if mode not in {"orders", "strategy"}:
+            raise RuntimeError("自动推演模式不支持")
+        state = self._set_running(mode)
+        thread = threading.Thread(target=self._run, args=(state["taskId"], mode), name=f"mirofish-auto-{mode}", daemon=True)
+        thread.start()
+        return state
+
+
+class StrategyAutoOptimizationManager:
+    def __init__(self) -> None:
+        self.lock = threading.RLock()
+        self.state = self._blank_state()
+
+    def _blank_state(self) -> dict[str, Any]:
+        return {
+            "running": False,
+            "phase": "idle",
+            "message": "等待自动推演完成后再执行策略优化。",
+            "startedAt": "",
+            "updatedAt": "",
+            "completedAt": "",
+            "error": "",
+            "optimizationId": "",
+            "sourceSimulationId": "",
+            "focusSymbol": "",
+            "ordersCount": 0,
+            "applied": False,
+            "appliedAt": "",
+            "bestConfig": {},
+            "researchSummary": {},
+            "notes": [],
+            "metrics": {},
+        }
+
+    def snapshot(self) -> dict[str, Any]:
+        with self.lock:
+            return copy.deepcopy(self.state)
+
+    def _sync_automation_state(self) -> None:
+        try:
+            state_snapshot = self.snapshot()
+            AUTOMATION_STATE.update(lambda current: current.update({"strategyOptimization": state_snapshot}))
+        except Exception:
+            return
+
+    def _update(self, **patch: Any) -> dict[str, Any]:
+        with self.lock:
+            next_state = copy.deepcopy(self.state)
+            next_state.update({k: v for k, v in patch.items() if v is not None})
+            next_state["updatedAt"] = now_local_iso()
+            self.state = next_state
+        self._sync_automation_state()
+        return self.snapshot()
+
+    def _set_running(
+        self,
+        *,
+        simulation_id: str,
+        focus_symbol: str,
+        orders_count: int,
+    ) -> dict[str, Any]:
+        with self.lock:
+            if self.state.get("running"):
+                raise RuntimeError("已有策略优化任务在运行。")
+            self.state = self._blank_state()
+            self.state.update(
+                {
+                    "running": True,
+                    "phase": "preparing",
+                    "message": "正在根据最新推演结果和订单快照生成优化方案。",
+                    "startedAt": now_local_iso(),
+                    "updatedAt": now_local_iso(),
+                    "optimizationId": f"opt_{secrets.token_hex(5)}",
+                    "sourceSimulationId": simulation_id,
+                    "focusSymbol": focus_symbol,
+                    "ordersCount": orders_count,
+                }
+            )
+        self._sync_automation_state()
+        return self.snapshot()
+
+    def reset_for_simulation(self, *, simulation_id: str, focus_symbol: str, orders_count: int) -> dict[str, Any]:
+        with self.lock:
+            self.state = self._blank_state()
+            self.state.update(
+                {
+                    "phase": "pending-simulation",
+                    "message": "推演已启动，等待模拟完成后自动优化策略。",
+                    "sourceSimulationId": simulation_id,
+                    "focusSymbol": focus_symbol,
+                    "ordersCount": orders_count,
+                    "updatedAt": now_local_iso(),
+                }
+            )
+        self._sync_automation_state()
+        return self.snapshot()
+
+    def run(
+        self,
+        *,
+        mode: str,
+        simulation_id: str,
+        focus_symbol: str,
+        orders_count: int,
+        simulation_result: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        self._set_running(
+            simulation_id=simulation_id,
+            focus_symbol=focus_symbol,
+            orders_count=orders_count,
+        )
+        try:
+            current_config = AUTOMATION_CONFIG.current()
+            self._update(phase="optimizing", message="正在回测并搜索更优参数。")
+            research = research_optimize(
+                current_config,
+                runtime_research_options(current_config),
+                build_public_client(CONFIG.current()),
+            )
+            best_config = deep_merge({}, research.get("bestConfig") or current_config)
+            candidate = merge_optimized_automation_config(current_config, best_config)
+            ok, message, normalized = validate_automation_config(candidate)
+            if not ok:
+                raise RuntimeError(f"优化结果校验失败: {message}")
+            changed = json.dumps(normalized, sort_keys=True, ensure_ascii=False) != json.dumps(
+                validate_automation_config(current_config)[2],
+                sort_keys=True,
+                ensure_ascii=False,
+            )
+            AUTOMATION_CONFIG.replace(normalized)
+            applied_at = now_local_iso()
+            applied_strategy = {
+                "stage": "strategy-optimization",
+                "title": "自动推演已回写策略",
+                "detail": (
+                    f"来源模拟 {simulation_id} · 焦点 {focus_symbol or '未指定'} · "
+                    f"EMA {normalized.get('fastEma')}/{normalized.get('slowEma')} · "
+                    f"{normalized.get('swapStrategyMode')} · 杠杆 {normalized.get('swapLeverage')}x"
+                ),
+                "appliedAt": applied_at,
+            }
+            final_state = self._update(
+                running=False,
+                phase="completed",
+                message="策略优化完成，最佳配置已自动回写。",
+                completedAt=applied_at,
+                applied=changed,
+                appliedAt=applied_at,
+                bestConfig=normalized,
+                researchSummary=copy.deepcopy(research.get("summary") or {}),
+                notes=list(research.get("notes") or []),
+                metrics={
+                    "sampleCount": int(research.get("sampleCount") or 0),
+                    "focusSymbol": focus_symbol,
+                    "ordersCount": orders_count,
+                    "simulationResult": simulation_result or {},
+                },
+            )
+            AUTOMATION_STATE.update(
+                lambda current: current.update(
+                    {
+                        "research": research,
+                        "lastAppliedStrategy": applied_strategy,
+                        "strategyOptimization": final_state,
+                    }
+                )
+            )
+            return final_state
+        except Exception as exc:
+            return self._update(
+                running=False,
+                phase="failed",
+                message=f"策略优化失败: {exc}",
+                completedAt=now_local_iso(),
+                error=str(exc),
+            )
+
+
+MIROFISH_AUTO_SIMULATION = MiroFishAutoSimulationManager()
+STRATEGY_AUTO_OPTIMIZATION = StrategyAutoOptimizationManager()
 
 
 class MacLottoManager:
@@ -14757,7 +15514,10 @@ class AppHandler(BaseHTTPRequestHandler):
         if not enforce_gateway_auth(self, path):
             return
         if path == "/api/mirofish/status":
-            json_response(self, {"ok": True, "status": MIROFISH_RUNTIME.snapshot()})
+            status = MIROFISH_RUNTIME.snapshot()
+            status["autoSimulation"] = MIROFISH_AUTO_SIMULATION.snapshot()
+            status["strategyOptimization"] = STRATEGY_AUTO_OPTIMIZATION.snapshot()
+            json_response(self, {"ok": True, "status": status})
             return
         if proxy_mirofish_backend(
             self,
@@ -14954,21 +15714,45 @@ class AppHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/mirofish/setup":
             try:
-                json_response(self, {"ok": True, "status": MIROFISH_RUNTIME.setup()})
+                status = MIROFISH_RUNTIME.setup()
+                status["autoSimulation"] = MIROFISH_AUTO_SIMULATION.snapshot()
+                json_response(self, {"ok": True, "status": status})
             except Exception as exc:
                 error_response(self, f"MiroFish 初始化失败: {exc}", status=502)
             return
         if path == "/api/mirofish/start":
             try:
-                json_response(self, {"ok": True, "status": MIROFISH_RUNTIME.ensure_started()})
+                status = MIROFISH_RUNTIME.ensure_started()
+                status["autoSimulation"] = MIROFISH_AUTO_SIMULATION.snapshot()
+                json_response(self, {"ok": True, "status": status})
             except Exception as exc:
                 error_response(self, f"MiroFish 启动失败: {exc}", status=502)
             return
         if path == "/api/mirofish/stop":
             try:
-                json_response(self, {"ok": True, "status": MIROFISH_RUNTIME.stop()})
+                status = MIROFISH_RUNTIME.stop()
+                status["autoSimulation"] = MIROFISH_AUTO_SIMULATION.snapshot()
+                json_response(self, {"ok": True, "status": status})
             except Exception as exc:
                 error_response(self, f"MiroFish 停止失败: {exc}", status=502)
+            return
+        if path == "/api/mirofish/simulate-from-orders":
+            try:
+                task = MIROFISH_AUTO_SIMULATION.start("orders")
+                status = MIROFISH_RUNTIME.snapshot()
+                status["autoSimulation"] = task
+                json_response(self, {"ok": True, "task": task, "status": status})
+            except Exception as exc:
+                error_response(self, f"订单自动推演启动失败: {exc}", status=409)
+            return
+        if path == "/api/mirofish/simulate-from-strategy":
+            try:
+                task = MIROFISH_AUTO_SIMULATION.start("strategy")
+                status = MIROFISH_RUNTIME.snapshot()
+                status["autoSimulation"] = task
+                json_response(self, {"ok": True, "task": task, "status": status})
+            except Exception as exc:
+                error_response(self, f"策略自动推演启动失败: {exc}", status=409)
             return
         raw_body = read_raw_request(self)
         if proxy_mirofish_backend(

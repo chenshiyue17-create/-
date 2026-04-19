@@ -511,6 +511,12 @@ class OasisProfileGenerator:
         """
         
         is_individual = self._is_individual_entity(entity_type)
+
+        if getattr(self.llm_client, "use_codex", False):
+            logger.info(f"Codex/local 模式启用，直接使用规则生成 {entity_name} 的画像")
+            return self._generate_profile_rule_based(
+                entity_name, entity_type, entity_summary, entity_attributes
+            )
         
         if is_individual:
             prompt = self._build_individual_persona_prompt(

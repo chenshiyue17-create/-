@@ -12,6 +12,8 @@ import threading
 import subprocess
 import signal
 import atexit
+import random
+import re
 from typing import Dict, Any, List, Optional, Union
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -223,6 +225,7 @@ class SimulationRunner:
     _monitor_threads: Dict[str, threading.Thread] = {}
     _stdout_files: Dict[str, Any] = {}  # 存储 stdout 文件句柄
     _stderr_files: Dict[str, Any] = {}  # 存储 stderr 文件句柄
+    _local_stop_events: Dict[str, threading.Event] = {}
     
     # 图谱记忆更新配置
     _graph_memory_enabled: Dict[str, bool] = {}  # simulation_id -> enabled
@@ -368,6 +371,14 @@ class SimulationRunner:
         )
         
         cls._save_run_state(state)
+
+        if cls._should_use_local_runner():
+            return cls._start_local_simulation(
+                simulation_id=simulation_id,
+                platform=platform,
+                config=config,
+                state=state,
+            )
         
         # 如果启用图谱记忆更新，创建更新器
         if enable_graph_memory_update:
@@ -476,6 +487,276 @@ class SimulationRunner:
             cls._save_run_state(state)
             raise
         
+        return state
+
+    @classmethod
+    def _should_use_local_runner(cls) -> bool:
+        """在 codex/local 模式下使用本地规则模拟，避免 OASIS 对外部 LLM API 的硬依赖。"""
+        return Config.use_codex_llm() and not Config.LLM_API_KEY
+
+    @classmethod
+    def _extract_focus_symbols(cls, config: Dict[str, Any]) -> List[str]:
+        text_parts = [
+            str(config.get("simulation_requirement") or ""),
+            str(config.get("graph_id") or ""),
+            str(config.get("project_id") or ""),
+        ]
+        for agent in config.get("agent_configs") or []:
+            text_parts.append(str(agent.get("entity_name") or ""))
+        text = "\n".join(text_parts)
+        symbols = []
+        for token in re.findall(r"\b[A-Z]{2,10}\b", text):
+            if token in {"BTC", "ETH", "SOL", "ARB", "DOGE", "XRP", "OKX"}:
+                if token not in symbols:
+                    symbols.append(token)
+        return symbols[:3] or ["BTC"]
+
+    @classmethod
+    def _reset_simulation_outputs(cls, sim_dir: str):
+        """重置规则模拟会写入的日志与动作文件，避免旧结果污染新运行。"""
+        for relative in [
+            "simulation.log",
+            "twitter/actions.jsonl",
+            "reddit/actions.jsonl",
+            "actions.jsonl",
+        ]:
+            path = os.path.join(sim_dir, relative)
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+        os.makedirs(os.path.join(sim_dir, "twitter"), exist_ok=True)
+        os.makedirs(os.path.join(sim_dir, "reddit"), exist_ok=True)
+
+    @classmethod
+    def _append_action_record(cls, path: str, payload: Dict[str, Any]):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+    @classmethod
+    def _append_simulation_log(cls, sim_dir: str, message: str):
+        log_path = os.path.join(sim_dir, "simulation.log")
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(log_path, "a", encoding="utf-8") as handle:
+            handle.write(f"{timestamp} - INFO - {message}\n")
+
+    @classmethod
+    def _build_local_round_actions(
+        cls,
+        *,
+        config: Dict[str, Any],
+        platform: str,
+        round_num: int,
+        focus_symbols: List[str],
+    ) -> List[Dict[str, Any]]:
+        agent_configs = list(config.get("agent_configs") or [])
+        if not agent_configs:
+            return []
+        rng = random.Random(f"{config.get('simulation_id','sim')}:{platform}:{round_num}")
+        count = min(max(2, len(agent_configs) // 2), len(agent_configs))
+        sampled = rng.sample(agent_configs, count)
+        symbol = focus_symbols[(round_num - 1) % len(focus_symbols)]
+        mood = "改善" if round_num % 2 == 0 else "恶化"
+        action_types = (
+            ["CREATE_POST", "LIKE_POST", "QUOTE_POST", "FOLLOW"]
+            if platform == "twitter"
+            else ["CREATE_POST", "CREATE_COMMENT", "TREND", "SEARCH_POSTS"]
+        )
+        actions: List[Dict[str, Any]] = []
+        for index, agent in enumerate(sampled, start=1):
+            action_type = action_types[(round_num + index) % len(action_types)]
+            agent_name = str(agent.get("entity_name") or f"Agent-{agent.get('agent_id', index)}")
+            stance = "支持降频、降低 taker 占比" if mood == "改善" else "指出手续费与反手切换导致持续亏损"
+            actions.append(
+                {
+                    "round": round_num,
+                    "timestamp": datetime.now().isoformat(),
+                    "platform": platform,
+                    "agent_id": int(agent.get("agent_id") or index),
+                    "agent_name": agent_name,
+                    "action_type": action_type,
+                    "action_args": {
+                        "symbol": symbol,
+                        "focus": f"{symbol} 执行质量",
+                        "mood": mood,
+                    },
+                    "result": f"{agent_name} 在第 {round_num} 轮认为 {symbol} 的手续费/滑点结构{mood}，建议{'保留厚利润单' if mood == '改善' else '减少 taker 与方向切换'}。",
+                    "success": True,
+                }
+            )
+        return actions
+
+    @classmethod
+    def _run_local_simulation(
+        cls,
+        *,
+        simulation_id: str,
+        sim_dir: str,
+        config: Dict[str, Any],
+        state: SimulationRunState,
+        stop_event: threading.Event,
+    ):
+        try:
+            focus_symbols = cls._extract_focus_symbols(config)
+            requirement = str(config.get("simulation_requirement") or "").strip()
+            cls._append_simulation_log(sim_dir, f"Codex/local 规则推演启动: focus={','.join(focus_symbols)}")
+            cls._append_simulation_log(sim_dir, f"需求摘要: {requirement[:180]}")
+
+            platform_logs = {
+                "twitter": os.path.join(sim_dir, "twitter", "actions.jsonl"),
+                "reddit": os.path.join(sim_dir, "reddit", "actions.jsonl"),
+            }
+            enabled_platforms = [
+                name for name, enabled in {
+                    "twitter": state.twitter_running,
+                    "reddit": state.reddit_running,
+                }.items() if enabled
+            ] or ["twitter", "reddit"]
+
+            for platform in enabled_platforms:
+                cls._append_action_record(
+                    platform_logs[platform],
+                    {
+                        "event_type": "simulation_start",
+                        "timestamp": datetime.now().isoformat(),
+                        "platform": platform,
+                        "total_rounds": state.total_rounds,
+                    },
+                )
+
+            for round_num in range(1, max(state.total_rounds, 1) + 1):
+                if stop_event.is_set():
+                    state.runner_status = RunnerStatus.STOPPED
+                    state.completed_at = datetime.now().isoformat()
+                    state.error = "本地规则推演已停止"
+                    state.twitter_running = False
+                    state.reddit_running = False
+                    cls._save_run_state(state)
+                    return
+
+                for platform in enabled_platforms:
+                    actions = cls._build_local_round_actions(
+                        config=config,
+                        platform=platform,
+                        round_num=round_num,
+                        focus_symbols=focus_symbols,
+                    )
+                    for item in actions:
+                        cls._append_action_record(platform_logs[platform], item)
+                        state.add_action(
+                            AgentAction(
+                                round_num=item["round"],
+                                timestamp=item["timestamp"],
+                                platform=item["platform"],
+                                agent_id=item["agent_id"],
+                                agent_name=item["agent_name"],
+                                action_type=item["action_type"],
+                                action_args=item["action_args"],
+                                result=item["result"],
+                                success=item["success"],
+                            )
+                        )
+                    cls._append_action_record(
+                        platform_logs[platform],
+                        {
+                            "event_type": "round_end",
+                            "timestamp": datetime.now().isoformat(),
+                            "platform": platform,
+                            "round": round_num,
+                            "simulated_hours": round_num,
+                        },
+                    )
+                    if platform == "twitter":
+                        state.twitter_current_round = round_num
+                        state.twitter_simulated_hours = round_num
+                    else:
+                        state.reddit_current_round = round_num
+                        state.reddit_simulated_hours = round_num
+
+                state.current_round = round_num
+                state.simulated_hours = round_num
+                cls._append_simulation_log(sim_dir, f"规则推演完成第 {round_num}/{state.total_rounds} 轮")
+                cls._save_run_state(state)
+                time.sleep(0.15)
+
+            for platform in enabled_platforms:
+                cls._append_action_record(
+                    platform_logs[platform],
+                    {
+                        "event_type": "simulation_end",
+                        "timestamp": datetime.now().isoformat(),
+                        "platform": platform,
+                        "total_rounds": state.total_rounds,
+                        "total_actions": state.twitter_actions_count if platform == "twitter" else state.reddit_actions_count,
+                    },
+                )
+                if platform == "twitter":
+                    state.twitter_completed = True
+                    state.twitter_running = False
+                else:
+                    state.reddit_completed = True
+                    state.reddit_running = False
+
+            state.runner_status = RunnerStatus.COMPLETED
+            state.completed_at = datetime.now().isoformat()
+            cls._append_simulation_log(sim_dir, "Codex/local 规则推演完成")
+            cls._save_run_state(state)
+        except Exception as exc:
+            logger.error(f"本地规则推演失败: {simulation_id}, error={exc}")
+            state.runner_status = RunnerStatus.FAILED
+            state.error = str(exc)
+            state.completed_at = datetime.now().isoformat()
+            state.twitter_running = False
+            state.reddit_running = False
+            cls._append_simulation_log(sim_dir, f"Codex/local 规则推演失败: {exc}")
+            cls._save_run_state(state)
+        finally:
+            cls._local_stop_events.pop(simulation_id, None)
+
+    @classmethod
+    def _start_local_simulation(
+        cls,
+        *,
+        simulation_id: str,
+        platform: str,
+        config: Dict[str, Any],
+        state: SimulationRunState,
+    ) -> SimulationRunState:
+        sim_dir = os.path.join(cls.RUN_STATE_DIR, simulation_id)
+        cls._reset_simulation_outputs(sim_dir)
+        stop_event = threading.Event()
+        cls._local_stop_events[simulation_id] = stop_event
+
+        if platform == "twitter":
+            state.twitter_running = True
+            state.reddit_running = False
+        elif platform == "reddit":
+            state.twitter_running = False
+            state.reddit_running = True
+        else:
+            state.twitter_running = True
+            state.reddit_running = True
+        state.runner_status = RunnerStatus.RUNNING
+        state.process_pid = None
+        cls._save_run_state(state)
+
+        worker = threading.Thread(
+            target=cls._run_local_simulation,
+            kwargs={
+                "simulation_id": simulation_id,
+                "sim_dir": sim_dir,
+                "config": config,
+                "state": state,
+                "stop_event": stop_event,
+            },
+            name=f"mirofish-local-sim-{simulation_id[:8]}",
+            daemon=True,
+        )
+        worker.start()
+        cls._monitor_threads[simulation_id] = worker
+        logger.info(f"已启动 Codex/local 规则推演: {simulation_id}, platform={platform}")
         return state
     
     @classmethod
@@ -802,7 +1083,14 @@ class SimulationRunner:
                     process.wait(timeout=5)
                 except Exception:
                     process.kill()
-        
+
+        stop_event = cls._local_stop_events.get(simulation_id)
+        if stop_event:
+            stop_event.set()
+            monitor_thread = cls._monitor_threads.get(simulation_id)
+            if monitor_thread and monitor_thread.is_alive():
+                monitor_thread.join(timeout=3)
+
         state.runner_status = RunnerStatus.STOPPED
         state.twitter_running = False
         state.reddit_running = False
@@ -1765,4 +2053,3 @@ class SimulationRunner:
             results = results[:limit]
         
         return results
-
