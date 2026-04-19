@@ -27,7 +27,7 @@ import urllib.request
 import ssl
 import errno
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_UP
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -53,6 +53,7 @@ AUTOMATION_STATE_PATH = DATA_DIR / "automation-state.json"
 LOCAL_ORDER_STATE_PATH = DATA_DIR / "local-order-state.json"
 MINER_CONFIG_PATH = DATA_DIR / "miner-config.json"
 MINER_STATE_PATH = DATA_DIR / "miner-state.json"
+MIROFISH_AUTOPILOT_CONFIG_PATH = DATA_DIR / "mirofish-autopilot-config.json"
 MAC_LOTTO_STATUS_PATH = DATA_DIR / "mac-lotto-status.json"
 MAC_LOTTO_LOG_PATH = DATA_DIR / "mac-lotto.log"
 HOST = os.environ.get("OKX_LOCAL_APP_HOST", "127.0.0.1")
@@ -1385,6 +1386,48 @@ def default_automation_state() -> dict[str, Any]:
             "notes": [],
             "metrics": {},
         },
+        "mirofishAutopilot": {
+            "enabled": True,
+            "status": "idle",
+            "message": "等待自动驾驶监督线程启动。",
+            "startedAt": "",
+            "updatedAt": "",
+            "lastEvaluatedAt": "",
+            "lastTriggeredAt": "",
+            "lastCompletedAt": "",
+            "nextRunAt": "",
+            "lastMode": "",
+            "lastOrdersCount": 0,
+            "lastError": "",
+            "taskId": "",
+            "config": default_mirofish_autopilot_config(),
+        },
+    }
+
+
+def default_mirofish_autopilot_config() -> dict[str, Any]:
+    return {
+        "enabled": True,
+        "intervalMinutes": 60,
+        "mode": "orders_first",
+        "minOrdersCount": 12,
+        "autoStartRuntime": True,
+        "autoResumeAutomation": True,
+    }
+
+
+def normalize_mirofish_autopilot_config(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    raw = deep_merge(default_mirofish_autopilot_config(), payload or {})
+    mode = str(raw.get("mode") or "orders_first").strip().lower()
+    if mode not in {"orders_first", "orders_only", "strategy_only"}:
+        mode = "orders_first"
+    return {
+        "enabled": flag_true(raw.get("enabled", True)),
+        "intervalMinutes": clamp_int(raw.get("intervalMinutes", 60), 15, 24 * 60),
+        "mode": mode,
+        "minOrdersCount": clamp_int(raw.get("minOrdersCount", 12), 1, 200),
+        "autoStartRuntime": flag_true(raw.get("autoStartRuntime", True)),
+        "autoResumeAutomation": flag_true(raw.get("autoResumeAutomation", True)),
     }
 
 
@@ -11870,6 +11913,69 @@ class MiroFishAutoSimulationManager:
         return state
 
 
+def attempt_resume_automation_after_optimization() -> dict[str, Any]:
+    config = CONFIG.current()
+    result = {
+        "attempted": False,
+        "started": False,
+        "alreadyRunning": False,
+        "remote": is_remote_execution_enabled(config),
+        "stateSource": "",
+        "detail": "",
+    }
+    if not normalize_mirofish_autopilot_config(MIROFISH_AUTOPILOT_CONFIG.current()).get("autoResumeAutomation", True):
+        result["detail"] = "自动恢复量化运行已关闭。"
+        return result
+    if result["remote"]:
+        result["attempted"] = True
+        try:
+            state_response = remote_gateway_request(
+                config,
+                "GET",
+                "/api/automation/state",
+                timeout=6.0,
+            )
+            state_payload = state_response.json() if state_response.content else {}
+            state = state_payload.get("state") or {}
+            result["stateSource"] = str(state_payload.get("remoteStateSource") or state.get("stateSource") or "")
+            if bool(state.get("running")):
+                result["started"] = True
+                result["alreadyRunning"] = True
+                result["detail"] = "远端量化引擎已在运行，无需重复启动。"
+                return result
+            start_response = remote_gateway_request(
+                config,
+                "POST",
+                "/api/automation/start",
+                body=b"{}",
+                content_type="application/json; charset=utf-8",
+                timeout=10.0,
+            )
+            start_payload = start_response.json() if start_response.content else {}
+            if not start_response.ok or start_payload.get("ok") is False:
+                raise RuntimeError(str(start_payload.get("error") or f"远端返回 {start_response.status_code}"))
+            result["started"] = True
+            result["detail"] = "已自动恢复远端量化运行。"
+            return result
+        except Exception as exc:
+            result["detail"] = f"自动恢复远端量化运行失败: {exc}"
+            return result
+    result["attempted"] = True
+    if AUTOMATION_ENGINE.snapshot().get("running"):
+        result["started"] = True
+        result["alreadyRunning"] = True
+        result["detail"] = "本地量化引擎已在运行，无需重复启动。"
+        return result
+    try:
+        AUTOMATION_ENGINE.start(autostart=False)
+    except Exception as exc:
+        result["detail"] = f"自动恢复本地量化运行失败: {exc}"
+        return result
+    result["started"] = True
+    result["detail"] = "已自动恢复本地量化运行。"
+    return result
+
+
 class StrategyAutoOptimizationManager:
     def __init__(self) -> None:
         self.lock = threading.RLock()
@@ -12009,6 +12115,10 @@ class StrategyAutoOptimizationManager:
             else:
                 AUTOMATION_CONFIG.replace(normalized)
             applied_at = now_local_iso()
+            resume_result = {}
+            if normalize_mirofish_autopilot_config(MIROFISH_AUTOPILOT_CONFIG.current()).get("autoResumeAutomation", True):
+                self._update(phase="resuming-automation", message="最佳参数已写回，正在恢复量化运行。")
+                resume_result = attempt_resume_automation_after_optimization()
             applied_strategy = {
                 "stage": "strategy-optimization",
                 "title": "自动推演已回写策略",
@@ -12022,7 +12132,15 @@ class StrategyAutoOptimizationManager:
             final_state = self._update(
                 running=False,
                 phase="completed",
-                message="策略优化完成，最佳配置已自动回写。",
+                message=(
+                    "策略优化完成，最佳配置已自动回写并恢复量化运行。"
+                    if resume_result.get("started")
+                    else (
+                        f"策略优化完成，最佳配置已自动回写；{resume_result.get('detail')}"
+                        if resume_result.get("detail")
+                        else "策略优化完成，最佳配置已自动回写。"
+                    )
+                ),
                 completedAt=applied_at,
                 applied=changed,
                 appliedAt=applied_at,
@@ -12034,6 +12152,7 @@ class StrategyAutoOptimizationManager:
                     "focusSymbol": focus_symbol,
                     "ordersCount": orders_count,
                     "simulationResult": simulation_result or {},
+                    "resumeResult": resume_result,
                 },
             )
             AUTOMATION_STATE.update(
@@ -12056,8 +12175,229 @@ class StrategyAutoOptimizationManager:
             )
 
 
-MIROFISH_AUTO_SIMULATION = MiroFishAutoSimulationManager()
-STRATEGY_AUTO_OPTIMIZATION = StrategyAutoOptimizationManager()
+class MiroFishAutopilotManager:
+    def __init__(self, config_store: JsonStore) -> None:
+        self.config_store = config_store
+        self.lock = threading.RLock()
+        self.supervisor_lock = threading.RLock()
+        self.supervisor_thread: threading.Thread | None = None
+        self.state = self._blank_state()
+
+    def _blank_state(self) -> dict[str, Any]:
+        return {
+            "enabled": True,
+            "status": "idle",
+            "message": "等待自动驾驶监督线程启动。",
+            "startedAt": "",
+            "updatedAt": "",
+            "lastEvaluatedAt": "",
+            "lastTriggeredAt": "",
+            "lastCompletedAt": "",
+            "nextRunAt": "",
+            "lastMode": "",
+            "lastOrdersCount": 0,
+            "lastError": "",
+            "taskId": "",
+            "config": normalize_mirofish_autopilot_config(self.config_store.current()),
+        }
+
+    def _config(self) -> dict[str, Any]:
+        return normalize_mirofish_autopilot_config(self.config_store.current())
+
+    def snapshot(self) -> dict[str, Any]:
+        with self.lock:
+            payload = copy.deepcopy(self.state)
+        payload["config"] = self._config()
+        payload["enabled"] = bool(payload["config"].get("enabled"))
+        return payload
+
+    def _sync_automation_state(self) -> None:
+        try:
+            snapshot = self.snapshot()
+            AUTOMATION_STATE.update(lambda current: current.update({"mirofishAutopilot": snapshot}))
+        except Exception:
+            return
+
+    def _update(self, **patch: Any) -> dict[str, Any]:
+        with self.lock:
+            next_state = copy.deepcopy(self.state)
+            next_state.update({key: value for key, value in patch.items() if value is not None})
+            next_state["updatedAt"] = now_local_iso()
+            next_state["config"] = self._config()
+            next_state["enabled"] = bool(next_state["config"].get("enabled"))
+            self.state = next_state
+        self._sync_automation_state()
+        return self.snapshot()
+
+    def configure(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        normalized = normalize_mirofish_autopilot_config(
+            deep_merge(self.config_store.current(), payload or {})
+        )
+        self.config_store.replace(normalized)
+        now_iso = now_local_iso()
+        return self._update(
+            enabled=bool(normalized.get("enabled")),
+            status="waiting" if normalized.get("enabled") else "disabled",
+            message="自动驾驶配置已更新。" if normalized.get("enabled") else "自动驾驶已关闭。",
+            nextRunAt="" if not normalized.get("enabled") else self.snapshot().get("nextRunAt") or now_iso,
+        )
+
+    def ensure_supervisor(self) -> None:
+        with self.supervisor_lock:
+            if self.supervisor_thread and self.supervisor_thread.is_alive():
+                return
+            self.supervisor_thread = threading.Thread(
+                target=self._supervisor_loop,
+                name="mirofish-autopilot",
+                daemon=True,
+            )
+            self.supervisor_thread.start()
+
+    def _compute_due_at(self, last_triggered_at: str, interval_minutes: int) -> datetime:
+        last_triggered = parse_iso(str(last_triggered_at or ""))
+        if last_triggered is None:
+            return datetime.now() - timedelta(minutes=max(15, interval_minutes))
+        return last_triggered + timedelta(minutes=max(15, interval_minutes))
+
+    def _recent_orders_count(self) -> int:
+        try:
+            snapshot = build_runtime_snapshot(include_account=False, remote_timeout=2.5)
+            return len(((snapshot.execution_journal or {}).get("orders") or []))
+        except Exception:
+            return 0
+
+    def _select_mode(self, config: dict[str, Any], orders_count: int) -> tuple[str | None, str]:
+        mode = str(config.get("mode") or "orders_first")
+        min_orders = int(config.get("minOrdersCount") or 0)
+        if mode == "strategy_only":
+            return "strategy", "当前配置固定按策略推演。"
+        if mode == "orders_only":
+            if orders_count >= min_orders:
+                return "orders", "订单数量满足门槛，按订单推演。"
+            return None, f"最近订单 {orders_count} 笔，低于门槛 {min_orders} 笔。"
+        if orders_count >= min_orders:
+            return "orders", f"最近订单 {orders_count} 笔，优先按订单推演。"
+        return "strategy", f"最近订单仅 {orders_count} 笔，回退按策略推演。"
+
+    def _supervisor_loop(self) -> None:
+        self._update(
+            status="waiting",
+            message="自动驾驶监督线程已启动，等待下一轮评估。",
+            startedAt=now_local_iso(),
+        )
+        while True:
+            try:
+                config = self._config()
+                sim_state = MIROFISH_AUTO_SIMULATION.snapshot()
+                opt_state = STRATEGY_AUTO_OPTIMIZATION.snapshot()
+                now_dt = datetime.now()
+                last_completed_at = str(
+                    sim_state.get("completedAt")
+                    or opt_state.get("completedAt")
+                    or self.snapshot().get("lastCompletedAt")
+                    or ""
+                )
+                if not bool(config.get("enabled")):
+                    self._update(
+                        enabled=False,
+                        status="disabled",
+                        message="自动驾驶已关闭。",
+                        lastEvaluatedAt=now_local_iso(),
+                        nextRunAt="",
+                        lastCompletedAt=last_completed_at,
+                    )
+                    time.sleep(15.0)
+                    continue
+
+                if sim_state.get("running") or opt_state.get("running"):
+                    busy_message = str(
+                        opt_state.get("message")
+                        or sim_state.get("message")
+                        or "自动推演或策略优化仍在运行。"
+                    )
+                    self._update(
+                        enabled=True,
+                        status="busy",
+                        message=busy_message,
+                        lastEvaluatedAt=now_local_iso(),
+                        lastCompletedAt=last_completed_at,
+                        taskId=str(sim_state.get("taskId") or self.snapshot().get("taskId") or ""),
+                        nextRunAt=self.snapshot().get("nextRunAt") or "",
+                    )
+                    time.sleep(15.0)
+                    continue
+
+                orders_count = self._recent_orders_count()
+                due_at = self._compute_due_at(
+                    str(self.snapshot().get("lastTriggeredAt") or ""),
+                    int(config.get("intervalMinutes") or 60),
+                )
+                next_run_at = due_at.isoformat(timespec="seconds")
+                chosen_mode, reason = self._select_mode(config, orders_count)
+                if due_at > now_dt:
+                    self._update(
+                        enabled=True,
+                        status="waiting",
+                        message=reason,
+                        lastEvaluatedAt=now_local_iso(),
+                        lastOrdersCount=orders_count,
+                        lastCompletedAt=last_completed_at,
+                        nextRunAt=next_run_at,
+                    )
+                    time.sleep(15.0)
+                    continue
+
+                if not chosen_mode:
+                    self._update(
+                        enabled=True,
+                        status="waiting",
+                        message=reason,
+                        lastEvaluatedAt=now_local_iso(),
+                        lastOrdersCount=orders_count,
+                        lastCompletedAt=last_completed_at,
+                        nextRunAt=(now_dt + timedelta(minutes=5)).isoformat(timespec="seconds"),
+                    )
+                    time.sleep(15.0)
+                    continue
+
+                if config.get("autoStartRuntime", True):
+                    MIROFISH_RUNTIME.ensure_started()
+                else:
+                    runtime_state = MIROFISH_RUNTIME.snapshot()
+                    if not bool(runtime_state.get("ready")):
+                        self._update(
+                            enabled=True,
+                            status="waiting",
+                            message="自动驾驶等待 MiroFish 运行时手动启动。",
+                            lastEvaluatedAt=now_local_iso(),
+                            lastOrdersCount=orders_count,
+                            nextRunAt=(now_dt + timedelta(minutes=5)).isoformat(timespec="seconds"),
+                        )
+                        time.sleep(15.0)
+                        continue
+
+                task = MIROFISH_AUTO_SIMULATION.start(chosen_mode)
+                self._update(
+                    enabled=True,
+                    status="triggered",
+                    message=f"已触发{reason}",
+                    lastEvaluatedAt=now_local_iso(),
+                    lastTriggeredAt=now_local_iso(),
+                    lastMode=chosen_mode,
+                    lastOrdersCount=orders_count,
+                    taskId=str(task.get("taskId") or ""),
+                    lastError="",
+                    nextRunAt=(now_dt + timedelta(minutes=int(config.get('intervalMinutes') or 60))).isoformat(timespec="seconds"),
+                )
+            except Exception as exc:
+                self._update(
+                    enabled=bool(self._config().get("enabled")),
+                    status="error",
+                    message=f"自动驾驶异常: {exc}",
+                    lastEvaluatedAt=now_local_iso(),
+                    lastError=str(exc),
+                )
+            time.sleep(15.0)
 
 
 class MacLottoManager:
@@ -15706,6 +16046,7 @@ class AutomationEngine:
 CONFIG = ConfigStore(CONFIG_PATH)
 AUTOMATION_CONFIG = JsonStore(AUTOMATION_CONFIG_PATH, default_automation_config)
 AUTOMATION_STATE = JsonStore(AUTOMATION_STATE_PATH, default_automation_state)
+MIROFISH_AUTOPILOT_CONFIG = JsonStore(MIROFISH_AUTOPILOT_CONFIG_PATH, default_mirofish_autopilot_config)
 LOCAL_ORDER_STORE = JsonStore(LOCAL_ORDER_STATE_PATH, default_local_order_state)
 reconcile_automation_state_from_markets()
 MINER_CONFIG = JsonStore(MINER_CONFIG_PATH, default_miner_config)
@@ -15713,6 +16054,9 @@ MINER_STATE = JsonStore(MINER_STATE_PATH, default_miner_state)
 MAC_LOTTO = MacLottoManager()
 AUTOMATION_ENGINE = AutomationEngine(CONFIG, AUTOMATION_CONFIG, AUTOMATION_STATE)
 PRIVATE_ORDER_STREAM = OkxPrivateOrderStream()
+MIROFISH_AUTO_SIMULATION = MiroFishAutoSimulationManager()
+STRATEGY_AUTO_OPTIMIZATION = StrategyAutoOptimizationManager()
+MIROFISH_AUTOPILOT = MiroFishAutopilotManager(MIROFISH_AUTOPILOT_CONFIG)
 
 
 def is_disconnect_error(exc: BaseException | None) -> bool:
@@ -16103,6 +16447,7 @@ class AppHandler(BaseHTTPRequestHandler):
             status = MIROFISH_RUNTIME.snapshot()
             status["autoSimulation"] = MIROFISH_AUTO_SIMULATION.snapshot()
             status["strategyOptimization"] = STRATEGY_AUTO_OPTIMIZATION.snapshot()
+            status["autopilot"] = MIROFISH_AUTOPILOT.snapshot()
             json_response(self, {"ok": True, "status": status})
             return
         if proxy_mirofish_backend(
@@ -16302,6 +16647,8 @@ class AppHandler(BaseHTTPRequestHandler):
             try:
                 status = MIROFISH_RUNTIME.setup()
                 status["autoSimulation"] = MIROFISH_AUTO_SIMULATION.snapshot()
+                status["strategyOptimization"] = STRATEGY_AUTO_OPTIMIZATION.snapshot()
+                status["autopilot"] = MIROFISH_AUTOPILOT.snapshot()
                 json_response(self, {"ok": True, "status": status})
             except Exception as exc:
                 error_response(self, f"MiroFish 初始化失败: {exc}", status=502)
@@ -16310,6 +16657,8 @@ class AppHandler(BaseHTTPRequestHandler):
             try:
                 status = MIROFISH_RUNTIME.ensure_started()
                 status["autoSimulation"] = MIROFISH_AUTO_SIMULATION.snapshot()
+                status["strategyOptimization"] = STRATEGY_AUTO_OPTIMIZATION.snapshot()
+                status["autopilot"] = MIROFISH_AUTOPILOT.snapshot()
                 json_response(self, {"ok": True, "status": status})
             except Exception as exc:
                 error_response(self, f"MiroFish 启动失败: {exc}", status=502)
@@ -16318,15 +16667,31 @@ class AppHandler(BaseHTTPRequestHandler):
             try:
                 status = MIROFISH_RUNTIME.stop()
                 status["autoSimulation"] = MIROFISH_AUTO_SIMULATION.snapshot()
+                status["strategyOptimization"] = STRATEGY_AUTO_OPTIMIZATION.snapshot()
+                status["autopilot"] = MIROFISH_AUTOPILOT.snapshot()
                 json_response(self, {"ok": True, "status": status})
             except Exception as exc:
                 error_response(self, f"MiroFish 停止失败: {exc}", status=502)
+            return
+        if path == "/api/mirofish/autopilot/config":
+            try:
+                payload = read_json_request(self)
+                autopilot = MIROFISH_AUTOPILOT.configure(payload)
+                status = MIROFISH_RUNTIME.snapshot()
+                status["autoSimulation"] = MIROFISH_AUTO_SIMULATION.snapshot()
+                status["strategyOptimization"] = STRATEGY_AUTO_OPTIMIZATION.snapshot()
+                status["autopilot"] = autopilot
+                json_response(self, {"ok": True, "config": autopilot.get("config") or {}, "status": status, "autopilot": autopilot})
+            except Exception as exc:
+                error_response(self, f"自动驾驶配置保存失败: {exc}", status=400)
             return
         if path == "/api/mirofish/simulate-from-orders":
             try:
                 task = MIROFISH_AUTO_SIMULATION.start("orders")
                 status = MIROFISH_RUNTIME.snapshot()
                 status["autoSimulation"] = task
+                status["strategyOptimization"] = STRATEGY_AUTO_OPTIMIZATION.snapshot()
+                status["autopilot"] = MIROFISH_AUTOPILOT.snapshot()
                 json_response(self, {"ok": True, "task": task, "status": status})
             except Exception as exc:
                 error_response(self, f"订单自动推演启动失败: {exc}", status=409)
@@ -16336,6 +16701,8 @@ class AppHandler(BaseHTTPRequestHandler):
                 task = MIROFISH_AUTO_SIMULATION.start("strategy")
                 status = MIROFISH_RUNTIME.snapshot()
                 status["autoSimulation"] = task
+                status["strategyOptimization"] = STRATEGY_AUTO_OPTIMIZATION.snapshot()
+                status["autopilot"] = MIROFISH_AUTOPILOT.snapshot()
                 json_response(self, {"ok": True, "task": task, "status": status})
             except Exception as exc:
                 error_response(self, f"策略自动推演启动失败: {exc}", status=409)
@@ -16709,6 +17076,7 @@ def main() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     ensure_private_permissions(DATA_DIR, is_dir=True)
     maybe_autostart()
+    MIROFISH_AUTOPILOT.ensure_supervisor()
     startup_config = CONFIG.current()
     if should_run_local_okx_background_tasks(startup_config):
         ensure_focus_warmer()

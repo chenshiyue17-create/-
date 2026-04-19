@@ -157,6 +157,7 @@ let automationPollTimer = null;
 let liveFeedRestartTimer = null;
 let snapshotPollTimer = null;
 let orderPollTimer = null;
+let mirofishPollTimer = null;
 let autoAnalysisDebounceTimer = null;
 let autoAnalysisInFlight = false;
 let autoAnalysisLastAttemptAt = 0;
@@ -168,6 +169,7 @@ const AUTO_ANALYSIS_DEBOUNCE_MS = 1200;
 const LOCAL_REQUEST_TIMEOUT_MS = 12000;
 const BOOT_CACHE_KEY = "okx-desk-boot-cache-v4";
 const BOOT_CACHE_MAX_AGE_MS = 12 * 60 * 60 * 1000;
+const DOCK_COLLAPSE_KEY = "okx-dock-collapsed-v1";
 
 const MAINSTREAM_MARKETS = [
   "BTC-USDT",
@@ -221,6 +223,7 @@ const dashboardState = {
   bootCachePayload: null,
   runtimeSnapshot: null,
   mirofish: null,
+  dockCollapsed: false,
 };
 
 let lastBootCacheSerialized = "";
@@ -426,6 +429,68 @@ function buildCurrentOrderFeed() {
     );
   }
   return null;
+}
+
+function updateDockCollapseSummary() {
+  const title = $("dock-collapse-title");
+  const summary = $("dock-collapse-summary");
+  if (!title || !summary) return;
+
+  const statusMain = String($("dock-status-main")?.textContent || "").trim();
+  const statusSub = String($("dock-status-sub")?.textContent || "").trim();
+  const equityTitle = String($("dock-equity-title")?.textContent || "").trim();
+  const pnlMain = String($("dock-pnl-main")?.textContent || "").trim();
+  const netMain = String($("dock-net-main")?.textContent || "").trim();
+  const equityMeta = String($("dock-equity-meta")?.textContent || "").trim();
+  const firstMarket = Array.from(document.querySelectorAll("#dock-mainstream-board .board-card"))
+    .map((card) => {
+      const symbol = String(card.querySelector("span")?.textContent || "").trim();
+      const price = String(card.querySelector("strong")?.textContent || "").trim();
+      return symbol && price && price !== "--" ? `${symbol} ${price}` : "";
+    })
+    .find(Boolean);
+
+  title.textContent = statusMain || equityTitle || "悬浮总览已收起";
+
+  const bits = [];
+  if (pnlMain && pnlMain !== "--") bits.push(`当前收益 ${pnlMain}`);
+  if (netMain && netMain !== "--") bits.push(`净结果 ${netMain}`);
+  if (firstMarket) bits.push(firstMarket);
+  if (equityMeta && !bits.length) bits.push(equityMeta);
+  if (statusSub && bits.length < 3) bits.push(statusSub);
+  summary.textContent = bits.join(" · ") || "展开后查看收益曲线、实时决策和主流币价格。";
+}
+
+function setDockCollapsed(collapsed, { persist = true } = {}) {
+  const dock = $("floating-dock");
+  const bar = $("dock-collapse-bar");
+  const toggle = $("dock-toggle");
+  const toggleIcon = $("dock-toggle-icon");
+  const toggleLabel = $("dock-toggle-label");
+  const next = Boolean(collapsed);
+  dashboardState.dockCollapsed = next;
+  if (dock) dock.classList.toggle("is-collapsed", next);
+  if (bar) bar.hidden = !next;
+  if (toggle) {
+    toggle.setAttribute("aria-expanded", String(!next));
+    toggle.setAttribute("aria-label", next ? "展开悬浮面板" : "收起悬浮面板");
+  }
+  if (toggleIcon) toggleIcon.textContent = next ? "+" : "−";
+  if (toggleLabel) toggleLabel.textContent = next ? "展开面板" : "收起面板";
+  updateDockCollapseSummary();
+  if (persist) {
+    try {
+      window.localStorage.setItem(DOCK_COLLAPSE_KEY, next ? "1" : "0");
+    } catch (_) {}
+  }
+}
+
+function restoreDockCollapsePreference() {
+  let collapsed = false;
+  try {
+    collapsed = window.localStorage.getItem(DOCK_COLLAPSE_KEY) === "1";
+  } catch (_) {}
+  setDockCollapsed(collapsed, { persist: false });
 }
 
 function hydrateOrdersFromCurrentSnapshot() {
@@ -1662,10 +1727,167 @@ function updateMirofishFrame(status = {}, { forceReload = false } = {}) {
   }
 }
 
+function formatMirofishIso(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "-";
+  const date = new Date(raw);
+  if (Number.isNaN(date.getTime())) return raw;
+  return date.toLocaleString("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  });
+}
+
+function syncMirofishSimulationFrame(autoSimulation = {}, options = {}) {
+  const frame = $("mirofish-frame");
+  if (!frame) return;
+  const simulationPath = String(autoSimulation.simulationPath || autoSimulation.simulationUrl || "").trim();
+  if (!simulationPath) return;
+  const currentSimulation = frame.dataset.simulationPath || "";
+  if (options.forceReload || currentSimulation !== simulationPath) {
+    frame.dataset.simulationPath = simulationPath;
+    frame.setAttribute("src", mirofishBaseWithReload(simulationPath, true));
+  }
+}
+
+function renderMirofishAutoSimulation(status = {}, options = {}) {
+  if (!$("mirofish-auto-main")) return;
+  const snapshot = status && typeof status === "object" ? status : {};
+  const running = Boolean(snapshot.running);
+  const failed = String(snapshot.phase || "") === "failed";
+  const completed = String(snapshot.phase || "") === "completed";
+  const modeLabel = String(snapshot.modeLabel || snapshot.mode || "").trim() || "自动推演";
+  const progress = Number(snapshot.progress || 0);
+  const focusSymbol = String(snapshot.focusSymbol || "").trim();
+  const phaseLabelMap = {
+    idle: "空闲",
+    queued: "排队中",
+    "starting-runtime": "启动运行时",
+    "generating-project": "生成项目",
+    "building-graph": "构建图谱",
+    "creating-simulation": "创建模拟",
+    "preparing-simulation": "准备模拟",
+    "starting-simulation": "启动推演",
+    completed: "已完成",
+    failed: "失败",
+  };
+  const phaseLabel = phaseLabelMap[String(snapshot.phase || "idle")] || String(snapshot.phase || "空闲");
+
+  $("mirofish-auto-main").textContent = running
+    ? `${modeLabel}进行中`
+    : (completed ? `${modeLabel}已启动` : (failed ? `${modeLabel}失败` : "待命"));
+  $("mirofish-auto-sub").textContent = String(snapshot.message || "可根据当前订单或策略一键发起自动推演。").trim()
+    || "可根据当前订单或策略一键发起自动推演。";
+  $("mirofish-auto-stage").textContent = progress > 0 ? `${phaseLabel} · ${Math.min(100, Math.max(0, progress))}%` : phaseLabel;
+
+  const metaParts = [];
+  if (focusSymbol) metaParts.push(`焦点 ${focusSymbol}`);
+  if (snapshot.ordersCount) metaParts.push(`订单 ${snapshot.ordersCount} 笔`);
+  if (snapshot.startedAt) metaParts.push(`开始 ${formatMirofishIso(snapshot.startedAt)}`);
+  if (!metaParts.length && snapshot.updatedAt) metaParts.push(`更新 ${formatMirofishIso(snapshot.updatedAt)}`);
+  $("mirofish-auto-meta").textContent = metaParts.join(" · ") || "项目、图谱、模拟和启动状态会在这里连续更新。";
+
+  const idParts = [];
+  if (snapshot.projectId) idParts.push(`项目 ${snapshot.projectId}`);
+  if (snapshot.graphId) idParts.push(`图谱 ${snapshot.graphId}`);
+  if (snapshot.simulationId) idParts.push(`模拟 ${snapshot.simulationId}`);
+  $("mirofish-auto-ids").textContent = idParts.join(" / ") || "-";
+
+  let linkText = "完成后会自动切到对应模拟运行页。";
+  if (snapshot.error) {
+    linkText = `错误：${snapshot.error}`;
+  } else if (snapshot.simulationPath) {
+    linkText = `运行页 ${snapshot.simulationPath}`;
+  }
+  $("mirofish-auto-link").textContent = linkText;
+
+  if (!options.preserveMessage) {
+    if (running) {
+      setMirofishMessage(`${modeLabel}正在进行：${snapshot.message || phaseLabel}`, "");
+    } else if (completed) {
+      setMirofishMessage(`${modeLabel}已启动，下面会直接切到模拟页面。`, "ok");
+    } else if (failed) {
+      setMirofishMessage(snapshot.error || snapshot.message || `${modeLabel}失败。`, "err");
+    }
+  }
+
+  if ((running || completed) && snapshot.simulationPath) {
+    syncMirofishSimulationFrame(snapshot, { forceReload: options.forceReload || completed });
+  }
+}
+
+function syncMirofishAutopilotInputs(config = {}) {
+  const enabled = $("mirofish-autopilot-enabled");
+  const interval = $("mirofish-autopilot-interval");
+  const mode = $("mirofish-autopilot-mode");
+  const minOrders = $("mirofish-autopilot-min-orders");
+  const autoStartRuntime = $("mirofish-autopilot-auto-start-runtime");
+  const autoResume = $("mirofish-autopilot-auto-resume");
+  if (enabled) enabled.checked = Boolean(config.enabled);
+  if (autoStartRuntime) autoStartRuntime.checked = Boolean(config.autoStartRuntime);
+  if (autoResume) autoResume.checked = Boolean(config.autoResumeAutomation);
+  if (interval && document.activeElement !== interval) interval.value = String(config.intervalMinutes || 60);
+  if (mode && document.activeElement !== mode) mode.value = String(config.mode || "orders_first");
+  if (minOrders && document.activeElement !== minOrders) minOrders.value = String(config.minOrdersCount || 12);
+}
+
+function renderMirofishAutopilot(status = {}) {
+  if (!$("mirofish-autopilot-main")) return;
+  const snapshot = status && typeof status === "object" ? status : {};
+  const config = snapshot.config && typeof snapshot.config === "object" ? snapshot.config : {};
+  const enabled = Boolean(config.enabled ?? snapshot.enabled);
+  const statusKey = String(snapshot.status || (enabled ? "waiting" : "disabled"));
+  const statusLabelMap = {
+    idle: "待启动",
+    waiting: "待命中",
+    busy: "运行中",
+    triggered: "已触发",
+    disabled: "已关闭",
+    error: "异常",
+  };
+  $("mirofish-autopilot-main").textContent = statusLabelMap[statusKey] || statusKey || "待同步";
+  $("mirofish-autopilot-sub").textContent = String(snapshot.message || "等待获取自动驾驶运行态。").trim()
+    || "等待获取自动驾驶运行态。";
+  $("mirofish-autopilot-pill").textContent = enabled ? (statusLabelMap[statusKey] || "运行中") : "已关闭";
+
+  $("mirofish-autopilot-next").textContent = snapshot.nextRunAt ? formatMirofishIso(snapshot.nextRunAt) : "-";
+  const metaParts = [];
+  if (snapshot.lastEvaluatedAt) metaParts.push(`最近评估 ${formatMirofishIso(snapshot.lastEvaluatedAt)}`);
+  if (snapshot.lastOrdersCount) metaParts.push(`订单 ${snapshot.lastOrdersCount} 笔`);
+  if (snapshot.lastError) metaParts.push(`错误待处理`);
+  $("mirofish-autopilot-meta").textContent = metaParts.join(" · ") || "尚未计算下一次推演时间。";
+
+  const lastParts = [];
+  if (snapshot.lastMode) lastParts.push(`模式 ${snapshot.lastMode === "orders" ? "订单" : "策略"}`);
+  if (snapshot.lastTriggeredAt) lastParts.push(`触发 ${formatMirofishIso(snapshot.lastTriggeredAt)}`);
+  if (snapshot.taskId) lastParts.push(`任务 ${snapshot.taskId}`);
+  $("mirofish-autopilot-last").textContent = lastParts.join(" · ") || "-";
+  const lastSubParts = [];
+  if (snapshot.lastCompletedAt) lastSubParts.push(`完成 ${formatMirofishIso(snapshot.lastCompletedAt)}`);
+  if (snapshot.lastOrdersCount) lastSubParts.push(`最近订单 ${snapshot.lastOrdersCount} 笔`);
+  $("mirofish-autopilot-last-sub").textContent = lastSubParts.join(" · ")
+    || "最近推演模式、订单数量和任务编号会显示在这里。";
+
+  syncMirofishAutopilotInputs({
+    enabled,
+    intervalMinutes: config.intervalMinutes,
+    mode: config.mode,
+    minOrdersCount: config.minOrdersCount,
+    autoStartRuntime: config.autoStartRuntime,
+    autoResumeAutomation: config.autoResumeAutomation,
+  });
+}
+
 function renderMirofishStatus(status = {}, options = {}) {
   if (!$("mirofish-status-main")) return;
   const snapshot = status && typeof status === "object" ? status : {};
   dashboardState.mirofish = snapshot;
+  renderMirofishAutoSimulation(snapshot.autoSimulation || {}, options);
+  renderMirofishAutopilot(snapshot.autopilot || {});
 
   const ready = Boolean(snapshot.ready);
   const launchable = Boolean(snapshot.launchable);
@@ -1747,6 +1969,30 @@ async function refreshMirofishStatus(options = {}) {
   });
 }
 
+function collectMirofishAutopilotConfig() {
+  return {
+    enabled: Boolean($("mirofish-autopilot-enabled")?.checked),
+    intervalMinutes: Number($("mirofish-autopilot-interval")?.value || 60),
+    mode: String($("mirofish-autopilot-mode")?.value || "orders_first"),
+    minOrdersCount: Number($("mirofish-autopilot-min-orders")?.value || 12),
+    autoStartRuntime: Boolean($("mirofish-autopilot-auto-start-runtime")?.checked),
+    autoResumeAutomation: Boolean($("mirofish-autopilot-auto-resume")?.checked),
+  };
+}
+
+async function saveMirofishAutopilotConfig() {
+  setMirofishMessage("正在保存自动驾驶配置。", "");
+  const payload = collectMirofishAutopilotConfig();
+  const data = await request("/api/mirofish/autopilot/config", {
+    method: "POST",
+    body: JSON.stringify(payload),
+    timeoutMs: 15000,
+  });
+  renderMirofishStatus(data.status || {}, { preserveMessage: true });
+  setMirofishMessage("自动驾驶配置已保存。", "ok");
+  return data;
+}
+
 async function setupMirofishRuntime() {
   setMirofishMessage("正在初始化 MiroFish 运行环境，这一步会准备依赖和构建前端，请稍等。", "");
   const data = await request("/api/mirofish/setup", {
@@ -1780,6 +2026,21 @@ async function stopMirofishRuntime() {
   });
   renderMirofishStatus(data.status || {}, { preserveMessage: true, forceReload: true });
   setMirofishMessage("MiroFish 已停止，当前页保留内嵌入口。", "ok");
+  return data.status || {};
+}
+
+async function triggerMirofishAutoSimulation(mode) {
+  const isOrders = mode === "orders";
+  const endpoint = isOrders ? "/api/mirofish/simulate-from-orders" : "/api/mirofish/simulate-from-strategy";
+  const label = isOrders ? "订单推演" : "策略推演";
+  setMirofishMessage(`正在发起${label}，会自动生成项目、图谱并启动模拟。`, "");
+  const data = await request(endpoint, {
+    method: "POST",
+    body: JSON.stringify({}),
+    timeoutMs: 30000,
+  });
+  renderMirofishStatus(data.status || {}, { preserveMessage: true, forceReload: true });
+  setMirofishMessage(`${label}任务已提交，正在后台准备。`, "ok");
   return data.status || {};
 }
 
@@ -2069,6 +2330,7 @@ function renderEquityCurve(curve) {
         <div class="dock-stat"><span>变化</span><strong>--</strong></div>
       `;
     }
+    updateDockCollapseSummary();
     return;
   }
 
@@ -2187,6 +2449,7 @@ function renderEquityCurve(curve) {
       <circle cx="${dockLatestPoint[0]}" cy="${dockLatestPoint[1]}" r="2.6" fill="${up ? "#69f0ae" : "#ff6b6b"}"></circle>
     `;
   }
+  updateDockCollapseSummary();
 }
 
 function renderDeskGuards() {
@@ -6887,6 +7150,18 @@ function syncOrderPolling() {
   }, 3000);
 }
 
+function startMirofishPolling() {
+  if (mirofishPollTimer) {
+    clearInterval(mirofishPollTimer);
+  }
+  mirofishPollTimer = setInterval(() => {
+    const autoSimulation = (dashboardState.mirofish && dashboardState.mirofish.autoSimulation) || {};
+    if (dashboardState.currentView === "mirofish" || autoSimulation.running) {
+      refreshMirofishStatus({ preserveMessage: true }).catch(() => {});
+    }
+  }, 5000);
+}
+
 async function boot() {
   let initialView = "focus";
   try {
@@ -7325,6 +7600,36 @@ async function boot() {
     }
   });
 
+  $("mirofish-sim-orders")?.addEventListener("click", async () => {
+    try {
+      await triggerMirofishAutoSimulation("orders");
+      await refreshMirofishStatus({ preserveMessage: true, forceReload: true }).catch(() => {});
+    } catch (err) {
+      setMirofishMessage(err.message, "err");
+      await refreshMirofishStatus({ preserveMessage: true }).catch(() => {});
+    }
+  });
+
+  $("mirofish-sim-strategy")?.addEventListener("click", async () => {
+    try {
+      await triggerMirofishAutoSimulation("strategy");
+      await refreshMirofishStatus({ preserveMessage: true, forceReload: true }).catch(() => {});
+    } catch (err) {
+      setMirofishMessage(err.message, "err");
+      await refreshMirofishStatus({ preserveMessage: true }).catch(() => {});
+    }
+  });
+
+  $("mirofish-autopilot-save")?.addEventListener("click", async () => {
+    try {
+      await saveMirofishAutopilotConfig();
+      await refreshMirofishStatus({ preserveMessage: true }).catch(() => {});
+    } catch (err) {
+      setMirofishMessage(err.message, "err");
+      await refreshMirofishStatus({ preserveMessage: true }).catch(() => {});
+    }
+  });
+
   $("spot-order-form").addEventListener("submit", async (event) => {
     try {
       await submitOrder(event);
@@ -7343,6 +7648,7 @@ async function boot() {
 
   startAutomationPolling();
   startSnapshotPolling();
+  startMirofishPolling();
   syncOrderPolling();
   updateQuickState();
   renderDeskOverview();
@@ -7374,6 +7680,7 @@ async function boot() {
     if (automationPollTimer) clearInterval(automationPollTimer);
     if (snapshotPollTimer) clearInterval(snapshotPollTimer);
     if (orderPollTimer) clearInterval(orderPollTimer);
+    if (mirofishPollTimer) clearInterval(mirofishPollTimer);
     if (autoAnalysisDebounceTimer) clearTimeout(autoAnalysisDebounceTimer);
     clearLiveFeedTimers();
     closeSocket(liveMarketState.tickerSocket);

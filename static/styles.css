@@ -329,6 +329,116 @@ body {
   box-shadow: 0 18px 44px rgba(0, 0, 0, 0.28);
   min-width: 0;
   overflow: hidden;
+  transition:
+    padding 180ms ease,
+    gap 180ms ease,
+    border-color 180ms ease,
+    background 180ms ease,
+    box-shadow 180ms ease;
+}
+
+.dock-shell-head,
+.dock-collapse-bar {
+  grid-column: 1 / -1;
+}
+
+.dock-shell-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+
+.dock-shell-head strong {
+  display: block;
+  margin-top: 2px;
+  font-size: 15px;
+  line-height: 1.1;
+}
+
+.dock-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 34px;
+  padding: 0 12px;
+  border: 1px solid rgba(69, 214, 196, 0.18);
+  background: rgba(69, 214, 196, 0.06);
+  color: var(--accent-2);
+  font: inherit;
+  font-size: 12px;
+  line-height: 1;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition:
+    background 160ms ease,
+    border-color 160ms ease,
+    color 160ms ease,
+    transform 160ms ease;
+}
+
+.dock-toggle:hover {
+  background: rgba(69, 214, 196, 0.12);
+  border-color: rgba(69, 214, 196, 0.28);
+}
+
+.dock-toggle:active {
+  transform: translateY(1px);
+}
+
+.dock-toggle-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border: 1px solid rgba(69, 214, 196, 0.22);
+  border-radius: 999px;
+  font-size: 14px;
+  line-height: 1;
+}
+
+.dock-collapse-bar {
+  display: none;
+  align-items: center;
+  gap: 16px;
+  min-width: 0;
+  padding: 12px 14px;
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.dock-collapse-copy {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.dock-collapse-copy strong {
+  font-size: 15px;
+  line-height: 1.1;
+}
+
+.dock-collapse-copy small {
+  color: var(--muted);
+  line-height: 1.45;
+}
+
+.floating-dock.is-collapsed {
+  grid-template-columns: minmax(0, 1fr);
+  gap: 8px;
+  padding-bottom: 12px;
+}
+
+.floating-dock.is-collapsed .dock-curve-card,
+.floating-dock.is-collapsed .dock-side-column {
+  display: none;
+}
+
+.floating-dock.is-collapsed .dock-collapse-bar {
+  display: flex;
 }
 
 .workspace-scroll {
@@ -1069,6 +1179,22 @@ body {
   padding: 16px;
   border: 1px solid rgba(255, 255, 255, 0.07);
   background: rgba(255, 255, 255, 0.03);
+}
+
+.mirofish-autopilot-shell {
+  margin-top: 18px;
+}
+
+.mirofish-autopilot-stats {
+  margin-top: 14px;
+}
+
+.mirofish-config-grid {
+  margin-top: 14px;
+}
+
+.mirofish-autopilot-actions {
+  margin-top: 14px;
 }
 
 #mirofish-frame {
@@ -2762,6 +2888,14 @@ body[data-view="focus"] #automation .focus-inline-note {
   .market-live-bar {
     flex-direction: column;
     align-items: stretch;
+  }
+
+  .dock-shell-head {
+    align-items: stretch;
+  }
+
+  .dock-toggle {
+    justify-content: center;
   }
 
   .bitaxe-actions {

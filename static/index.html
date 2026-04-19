@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>10U战神</title>
-    <link rel="stylesheet" href="/styles.css?v=20260418-runtime-snapshot11" />
+    <link rel="stylesheet" href="/styles.css?v=20260419-runtime-snapshot12" />
   </head>
   <body data-view="focus">
     <canvas id="tunnel-bg" aria-hidden="true"></canvas>
@@ -66,6 +66,23 @@
 
       <main class="workspace">
         <section class="floating-dock" id="floating-dock">
+          <div class="dock-shell-head">
+            <div>
+              <div class="eyebrow">Floating Dock</div>
+              <strong>悬浮总览</strong>
+            </div>
+            <button class="dock-toggle" id="dock-toggle" type="button" aria-expanded="true">
+              <span class="dock-toggle-icon" id="dock-toggle-icon">−</span>
+              <span class="dock-toggle-label" id="dock-toggle-label">收起面板</span>
+            </button>
+          </div>
+          <div class="dock-collapse-bar" id="dock-collapse-bar" hidden>
+            <div class="dock-collapse-copy">
+              <div class="eyebrow">Floating Dock</div>
+              <strong id="dock-collapse-title">悬浮总览已收起</strong>
+              <small id="dock-collapse-summary">展开后查看收益曲线、实时决策和主流币价格。</small>
+            </div>
+          </div>
           <div class="dock-curve-card">
             <div class="dock-head">
               <div>
@@ -677,6 +694,8 @@
               <button id="mirofish-setup" class="btn btn-secondary" type="button">初始化</button>
               <button id="mirofish-start" class="btn btn-primary" type="button">启动</button>
               <button id="mirofish-stop" class="btn btn-ghost" type="button">停止</button>
+              <button id="mirofish-sim-orders" class="btn btn-secondary" type="button">按订单推演</button>
+              <button id="mirofish-sim-strategy" class="btn btn-secondary" type="button">按策略推演</button>
             </div>
           </div>
           <div class="mirofish-hero">
@@ -709,6 +728,85 @@
               <span>环境变量</span>
               <strong id="mirofish-env-state">待检查</strong>
               <small id="mirofish-env-sub">LLM / ZEP 等关键项</small>
+            </div>
+          </div>
+          <div class="mirofish-grid">
+            <div class="mirofish-card">
+              <span>自动推演</span>
+              <strong id="mirofish-auto-main">待命</strong>
+              <small id="mirofish-auto-sub">可根据当前订单或策略一键生成并启动推演。</small>
+            </div>
+            <div class="mirofish-card">
+              <span>当前阶段</span>
+              <strong id="mirofish-auto-stage">空闲</strong>
+              <small id="mirofish-auto-meta">项目、图谱、模拟和启动状态会在这里连续更新。</small>
+            </div>
+            <div class="mirofish-card">
+              <span>项目 / 模拟</span>
+              <strong id="mirofish-auto-ids">-</strong>
+              <small id="mirofish-auto-link">完成后会自动切到对应模拟运行页。</small>
+            </div>
+          </div>
+          <div class="mirofish-embed-shell mirofish-autopilot-shell">
+            <div class="block-head">
+              <div>
+                <h3>自动驾驶</h3>
+                <small class="subtle">按固定周期自动推演、自动回写策略，并尝试恢复量化运行。</small>
+              </div>
+              <span class="pill" id="mirofish-autopilot-pill">待同步</span>
+            </div>
+            <div class="mirofish-grid mirofish-autopilot-stats">
+              <div class="mirofish-card">
+                <span>监督状态</span>
+                <strong id="mirofish-autopilot-main">待同步</strong>
+                <small id="mirofish-autopilot-sub">等待获取自动驾驶运行态。</small>
+              </div>
+              <div class="mirofish-card">
+                <span>下一轮计划</span>
+                <strong id="mirofish-autopilot-next">-</strong>
+                <small id="mirofish-autopilot-meta">尚未计算下一次推演时间。</small>
+              </div>
+              <div class="mirofish-card">
+                <span>最近执行</span>
+                <strong id="mirofish-autopilot-last">-</strong>
+                <small id="mirofish-autopilot-last-sub">最近推演模式、订单数量和任务编号会显示在这里。</small>
+              </div>
+            </div>
+            <div class="config-grid mirofish-config-grid">
+              <label class="checkbox-row">
+                <span>开启自动驾驶</span>
+                <input id="mirofish-autopilot-enabled" type="checkbox" />
+              </label>
+              <label>
+                <span>每轮间隔（分钟）</span>
+                <input id="mirofish-autopilot-interval" type="number" min="15" max="1440" step="5" value="60" />
+                <small class="field-hint">监督线程每 15 秒评估一次，到点后自动触发推演。</small>
+              </label>
+              <label>
+                <span>触发模式</span>
+                <select id="mirofish-autopilot-mode">
+                  <option value="orders_first">优先按订单，不够再按策略</option>
+                  <option value="orders_only">只按订单</option>
+                  <option value="strategy_only">只按策略</option>
+                </select>
+                <small class="field-hint">订单优先模式会根据最近订单笔数自动切换。</small>
+              </label>
+              <label>
+                <span>订单门槛（笔）</span>
+                <input id="mirofish-autopilot-min-orders" type="number" min="1" max="200" step="1" value="12" />
+                <small class="field-hint">低于门槛时，订单优先模式会回退到策略推演。</small>
+              </label>
+              <label class="checkbox-row">
+                <span>到点时自动拉起 MiroFish 运行时</span>
+                <input id="mirofish-autopilot-auto-start-runtime" type="checkbox" checked />
+              </label>
+              <label class="checkbox-row">
+                <span>优化完成后自动恢复量化运行</span>
+                <input id="mirofish-autopilot-auto-resume" type="checkbox" checked />
+              </label>
+            </div>
+            <div class="actions mirofish-autopilot-actions">
+              <button id="mirofish-autopilot-save" class="btn btn-primary" type="button">保存自动驾驶</button>
             </div>
           </div>
           <div class="notice" id="mirofish-message">MiroFish 已接入本项目。先点“初始化”，再点“启动”，下方会直接内嵌工作区。</div>
@@ -996,6 +1094,6 @@
     </div>
 
     <!-- BOOTSTRAP_DATA -->
-    <script src="/app.js?v=20260418-runtime-snapshot12"></script>
+    <script src="/app.js?v=20260420-mirofish-autopilot1"></script>
   </body>
 </html>
