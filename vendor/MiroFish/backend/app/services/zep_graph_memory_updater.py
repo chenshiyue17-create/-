@@ -12,13 +12,26 @@ from dataclasses import dataclass
 from datetime import datetime
 from queue import Queue, Empty
 
-from zep_cloud.client import Zep
+try:
+    from zep_cloud.client import Zep as _ZepClient
+    _ZEP_IMPORT_ERROR: Optional[Exception] = None
+except Exception as exc:  # pragma: no cover - environment dependent
+    _ZepClient = None
+    _ZEP_IMPORT_ERROR = exc
 
 from ..config import Config
 from ..utils.logger import get_logger
 from ..utils.locale import get_locale, set_locale
 
 logger = get_logger('mirofish.zep_graph_memory_updater')
+
+
+def _require_zep_client():
+    """Lazily require zep_cloud only when graph memory is actually enabled."""
+    if _ZepClient is None:
+        detail = str(_ZEP_IMPORT_ERROR) if _ZEP_IMPORT_ERROR else "zep_cloud not available"
+        raise RuntimeError(f"Zep client unavailable: {detail}")
+    return _ZepClient
 
 
 @dataclass
@@ -242,8 +255,9 @@ class ZepGraphMemoryUpdater:
         
         if not self.api_key:
             raise ValueError("ZEP_API_KEY未配置")
-        
-        self.client = Zep(api_key=self.api_key)
+
+        zep_client_cls = _require_zep_client()
+        self.client = zep_client_cls(api_key=self.api_key)
         
         # 活动队列
         self._activity_queue: Queue = Queue()

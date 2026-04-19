@@ -69,6 +69,7 @@ KEYCHAIN_ACCOUNT = "default"
 FALLBACK_SECRET_FILE = DATA_DIR / ".local-file-key"
 MIROFISH_RUNTIME_DIR = DATA_DIR / "mirofish-runtime"
 MIROFISH_LOG_PATH = MIROFISH_RUNTIME_DIR / "backend.log"
+MIROFISH_BACKEND_STAMP_PATH = MIROFISH_RUNTIME_DIR / "backend-stamp.json"
 VENDOR_ROOT = APP_DIR.parent / "btc-lotto-miner-app" / "vendor"
 HASHRATE_BENCHMARK_CACHE: dict[str, Any] = {"ts": 0.0, "hashrate": 0.0, "duration": 0.0}
 MINER_OPTIONS_CACHE: dict[str, Any] = {"ts": 0.0, "items": []}
@@ -10375,6 +10376,102 @@ class MiroFishRuntimeManager:
         self.backend_log_handle: Any = None
         self.started_at = ""
 
+    def _current_backend_stamp(self) -> str:
+        return "|".join(
+            (
+                RUNTIME_SYNC_STAMP or "no-runtime-stamp",
+                str(MIROFISH_BACKEND_DIR),
+                str(MIROFISH_ENV_PATH),
+            )
+        )
+
+    def _load_backend_stamp(self) -> dict[str, Any]:
+        try:
+            payload = json.loads(MIROFISH_BACKEND_STAMP_PATH.read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                return payload
+        except Exception:
+            pass
+        return {}
+
+    def _save_backend_stamp(self, stamp: str, pid: int) -> None:
+        payload = {
+            "stamp": stamp,
+            "pid": int(pid or 0),
+            "runtimeSource": RUNTIME_SOURCE_LABEL,
+            "updatedAt": now_local_iso(),
+        }
+        try:
+            MIROFISH_BACKEND_STAMP_PATH.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
+    def _backend_stamp_mismatch(self, current_stamp: str | None = None) -> bool:
+        desired = str(current_stamp or self._current_backend_stamp()).strip()
+        current = str((self._load_backend_stamp() or {}).get("stamp") or "").strip()
+        if not desired:
+            return False
+        return current != desired
+
+    def _port_listener_pids(self, port: int) -> list[int]:
+        try:
+            result = subprocess.run(
+                ["lsof", "-t", f"-iTCP:{int(port)}", "-sTCP:LISTEN", "-n", "-P"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except Exception:
+            return []
+        pids: list[int] = []
+        for raw in (result.stdout or "").splitlines():
+            value = str(raw or "").strip()
+            if not value:
+                continue
+            try:
+                pid = int(value)
+            except ValueError:
+                continue
+            if pid > 0 and pid not in pids:
+                pids.append(pid)
+        return pids
+
+    def _terminate_pid(self, pid: int) -> None:
+        if pid <= 0 or pid == os.getpid():
+            return
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except Exception:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except Exception:
+                return
+        deadline = time.time() + 6.0
+        while time.time() < deadline:
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                return
+            time.sleep(0.2)
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except Exception:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except Exception:
+                pass
+
+    def _stop_port_backend_locked(self) -> None:
+        managed_pid = self.backend_process.pid if self.backend_process and self.backend_process.poll() is None else 0
+        for pid in self._port_listener_pids(MIROFISH_BACKEND_PORT):
+            if pid == managed_pid:
+                continue
+            self._terminate_pid(pid)
+        self._stop_backend_locked()
+
     def _frontend_dist_index(self) -> Path:
         return MIROFISH_FRONTEND_DIST_DIR / "index.html"
 
@@ -10646,7 +10743,7 @@ class MiroFishRuntimeManager:
 
     def stop(self) -> dict[str, Any]:
         with self.lock:
-            self._stop_backend_locked()
+            self._stop_port_backend_locked()
             return self.snapshot()
 
     def _ensure_runtime_dir(self) -> None:
@@ -10697,7 +10794,8 @@ class MiroFishRuntimeManager:
             )
 
     def _start_backend_locked(self) -> None:
-        if self._backend_healthy():
+        current_stamp = self._current_backend_stamp()
+        if self._backend_healthy() and not self._backend_stamp_mismatch(current_stamp):
             self._cleanup_dead_backend()
             return
         commands = self._command_paths()
@@ -10711,7 +10809,7 @@ class MiroFishRuntimeManager:
         if missing_env:
             raise RuntimeError(f"MiroFish 缺少必要环境变量: {', '.join(missing_env)}")
         self._ensure_runtime_dir()
-        self._stop_backend_locked()
+        self._stop_port_backend_locked()
         log_handle = open(MIROFISH_LOG_PATH, "a", encoding="utf-8")
         env = self._runtime_env(commands)
         env["FLASK_HOST"] = "127.0.0.1"
@@ -10734,11 +10832,12 @@ class MiroFishRuntimeManager:
         deadline = time.time() + 20.0
         while time.time() < deadline:
             if self._backend_healthy(timeout=1.2):
+                self._save_backend_stamp(current_stamp, process.pid)
                 return
             if process.poll() is not None:
                 break
             time.sleep(0.5)
-        self._stop_backend_locked()
+        self._stop_port_backend_locked()
         raise RuntimeError("MiroFish 后端启动失败，请检查日志")
 
     def ensure_started(self) -> dict[str, Any]:
@@ -11080,6 +11179,7 @@ class MiroFishAutoSimulationManager:
         raise RuntimeError("等待图谱构建超时")
 
     def _wait_for_prepare(self, simulation_id: str, task_id: str | None, deadline: float) -> dict[str, Any]:
+        state_path = self._simulation_dir(simulation_id) / "state.json"
         while time.time() < deadline:
             payload = self._backend_request(
                 "POST",
@@ -11094,11 +11194,434 @@ class MiroFishAutoSimulationManager:
             self._update(phase="preparing-simulation", progress=min(85, 55 + progress // 3), message=task_message)
             if status == "ready" or data.get("already_prepared"):
                 return data
+            if state_path.exists():
+                try:
+                    state_payload = json.loads(state_path.read_text(encoding="utf-8"))
+                except Exception:
+                    state_payload = {}
+                state_status = str(state_payload.get("status") or "")
+                if state_status == "failed":
+                    raise RuntimeError(str(state_payload.get("error") or task_message or "模拟准备失败"))
+            if status == "completed" and not self._simulation_artifacts_ready(simulation_id):
+                raise RuntimeError(task_message or "准备任务已结束，但没有生成可运行配置")
             if status == "failed":
                 task = data.get("task") or {}
                 raise RuntimeError(str(task.get("error") or task_message or "模拟准备失败"))
             time.sleep(2.5)
         raise RuntimeError("等待模拟准备超时")
+
+    def _simulation_dir(self, simulation_id: str) -> Path:
+        return MIROFISH_BACKEND_DIR / "uploads" / "simulations" / simulation_id
+
+    def _project_meta_path(self, project_id: str) -> Path:
+        return MIROFISH_BACKEND_DIR / "uploads" / "projects" / project_id / "project.json"
+
+    def _local_graph_path(self, graph_id: str) -> Path:
+        return MIROFISH_BACKEND_DIR / "uploads" / "local_graphs" / f"{graph_id}.json"
+
+    def _use_fast_local_graph(self) -> bool:
+        try:
+            status = MIROFISH_RUNTIME.snapshot()
+        except Exception:
+            status = {}
+        return str(status.get("graphBackend") or "").strip().lower() == "local"
+
+    def _build_fast_local_graph_payload(
+        self,
+        *,
+        graph_id: str,
+        graph_name: str,
+        ontology: dict[str, Any],
+        seed: dict[str, Any],
+        mode: str,
+    ) -> dict[str, Any]:
+        created_at = now_local_iso()
+        episode_uuid = secrets.token_hex(16)
+        focus_symbol = str(seed.get("focusSymbol") or "BTC")
+        snapshot_obj = seed.get("snapshot")
+        if isinstance(snapshot_obj, RuntimeSnapshot):
+            snapshot = snapshot_obj.automation_state or {}
+            snapshot_account = (snapshot_obj.account_payload or {}).get("summary") or {}
+        elif isinstance(snapshot_obj, dict):
+            snapshot = snapshot_obj
+            snapshot_account = ((snapshot_obj.get("account") or {}).get("summary") or {})
+        else:
+            snapshot = {}
+            snapshot_account = {}
+        summary = snapshot.get("summary") or {}
+        analysis = snapshot.get("analysis") or {}
+        current_decision = str((analysis.get("decisionLabel") or summary.get("decisionLabel") or "观察")).strip()
+        current_direction = str((analysis.get("decisionSideLabel") or summary.get("decisionSideLabel") or "中性")).strip()
+        total_eq = summary.get("totalEq") or snapshot_account.get("totalEq")
+        expected_net_advantage = analysis.get("predictedNetPct")
+        execution_cost_floor = analysis.get("executionCostFloorPct")
+        last_action = str((snapshot.get("lastAppliedStrategy") or {}).get("title") or "").strip()
+        last_note = str((analysis.get("lastMessage") or summary.get("lastMessage") or "")).strip()
+        roles: list[tuple[str, str, str, dict[str, Any], str]] = [
+            (
+                "OKX",
+                "Organization",
+                f"当前{mode == 'orders' and '订单' or '策略'}推演依附的交易与执行平台。",
+                {"context": "OKX 自动推演", "report_focus": f"{focus_symbol} {'订单' if mode == 'orders' else '策略'}视角"},
+                "platform",
+            ),
+            (
+                f"{focus_symbol} 利润循环",
+                "StrategyEngine",
+                "当前策略；空仓直开，持仓同向继续循环，单笔净赚 1U+ 就平。",
+                {
+                    "mode": "订单推演" if mode == "orders" else "策略推演",
+                    "current_decision": current_decision,
+                    "current_direction": current_direction,
+                    "focus_symbol": focus_symbol,
+                    "profit_take_threshold": "1U+",
+                    "expected_net_advantage": f"{expected_net_advantage}%",
+                    "real_execution_cost_floor": f"{execution_cost_floor}%",
+                    "last_action": last_action,
+                    "last_note": last_note,
+                },
+                "strategy",
+            ),
+            (
+                f"{focus_symbol} 执行桌",
+                "ExecutionDesk",
+                "负责当前币种下单、撤单与成交跟踪的执行席位。",
+                {
+                    "execution_style": current_decision,
+                    "focus_symbol": focus_symbol,
+                    "recent_orders": len(seed.get("orders") or []),
+                },
+                "desk",
+            ),
+            (
+                "风险观察员",
+                "RiskSentinel",
+                "关注回撤、杠杆、滑点与资金占用约束。",
+                {
+                    "risk_mode": "自动风控",
+                    "account_equity": total_eq,
+                    "limit_note": str((summary.get("riskReason") or analysis.get("riskReason") or "观察手续费和回撤")).strip(),
+                },
+                "risk",
+            ),
+            (
+                f"{focus_symbol} 做市商",
+                "MarketMaker",
+                "对执行桌提供被动流动性并影响成交质量。",
+                {"quote_style": "maker-first", "symbol_scope": focus_symbol},
+                "maker",
+            ),
+            (
+                "趋势推动者",
+                "TrendTrader",
+                "放大顺势信号、推动趋势延续。",
+                {"preferred_side": current_direction, "trigger_note": current_decision},
+                "trend",
+            ),
+            (
+                "反转承接者",
+                "ContrarianTrader",
+                "在价格过热时提供反向流动性和止盈承接。",
+                {"reversion_anchor": "短线扩张后的回归", "tolerance": "中等"},
+                "contra",
+            ),
+            (
+                "资金费观察者",
+                "FundingWatcher",
+                "观察资金费、基差与拥挤度变化。",
+                {"funding_bias": "跟踪资金费和基差", "crowding_signal": "关注多空拥挤"},
+                "funding",
+            ),
+        ]
+        nodes: list[dict[str, Any]] = []
+        node_ids: dict[str, str] = {}
+        for name, node_type, node_summary, attributes, key in roles:
+            uuid_value = secrets.token_hex(16)
+            node_ids[key] = uuid_value
+            nodes.append(
+                {
+                    "uuid": uuid_value,
+                    "name": name,
+                    "labels": ["Entity", node_type],
+                    "summary": node_summary,
+                    "attributes": attributes,
+                    "created_at": created_at,
+                }
+            )
+        edges = [
+            {
+                "uuid": secrets.token_hex(16),
+                "name": "IMPLEMENTS_STRATEGY_FOR",
+                "fact": f"{focus_symbol} 执行桌执行当前利润循环策略。",
+                "fact_type": "IMPLEMENTS_STRATEGY_FOR",
+                "source_node_uuid": node_ids["desk"],
+                "target_node_uuid": node_ids["strategy"],
+                "attributes": {"context": "自动推演快路径"},
+                "created_at": created_at,
+                "valid_at": None,
+                "invalid_at": None,
+                "expired_at": None,
+                "episodes": [episode_uuid],
+            },
+            {
+                "uuid": secrets.token_hex(16),
+                "name": "SUPERVISES_RISK_FOR",
+                "fact": "风险观察员持续监督执行席位的回撤和仓位约束。",
+                "fact_type": "SUPERVISES_RISK_FOR",
+                "source_node_uuid": node_ids["risk"],
+                "target_node_uuid": node_ids["desk"],
+                "attributes": {"context": "自动推演快路径"},
+                "created_at": created_at,
+                "valid_at": None,
+                "invalid_at": None,
+                "expired_at": None,
+                "episodes": [episode_uuid],
+            },
+            {
+                "uuid": secrets.token_hex(16),
+                "name": "QUOTES_LIQUIDITY_TO",
+                "fact": f"{focus_symbol} 做市商为执行桌提供盘口流动性。",
+                "fact_type": "QUOTES_LIQUIDITY_TO",
+                "source_node_uuid": node_ids["maker"],
+                "target_node_uuid": node_ids["desk"],
+                "attributes": {"context": "自动推演快路径"},
+                "created_at": created_at,
+                "valid_at": None,
+                "invalid_at": None,
+                "expired_at": None,
+                "episodes": [episode_uuid],
+            },
+            {
+                "uuid": secrets.token_hex(16),
+                "name": "COMPETES_WITH",
+                "fact": "趋势推动者与反转承接者围绕短线方向竞争。",
+                "fact_type": "COMPETES_WITH",
+                "source_node_uuid": node_ids["trend"],
+                "target_node_uuid": node_ids["contra"],
+                "attributes": {"context": "自动推演快路径"},
+                "created_at": created_at,
+                "valid_at": None,
+                "invalid_at": None,
+                "expired_at": None,
+                "episodes": [episode_uuid],
+            },
+        ]
+        return {
+            "graph_id": graph_id,
+            "name": graph_name,
+            "description": f"{focus_symbol} {'订单' if mode == 'orders' else '策略'}自动推演本地图谱",
+            "created_at": created_at,
+            "ontology": ontology or {},
+            "nodes": nodes,
+            "edges": edges,
+            "episodes": [
+                {
+                    "uuid": episode_uuid,
+                    "chunk_count": 1,
+                    "processed": True,
+                    "created_at": created_at,
+                }
+            ],
+        }
+
+    def _create_fast_local_graph(
+        self,
+        *,
+        project_id: str,
+        graph_name: str,
+        ontology: dict[str, Any],
+        seed: dict[str, Any],
+        mode: str,
+    ) -> dict[str, str]:
+        graph_id = f"mirofish_local_{secrets.token_hex(8)}"
+        graph_payload = self._build_fast_local_graph_payload(
+            graph_id=graph_id,
+            graph_name=graph_name,
+            ontology=ontology,
+            seed=seed,
+            mode=mode,
+        )
+        graph_path = self._local_graph_path(graph_id)
+        graph_path.parent.mkdir(parents=True, exist_ok=True)
+        graph_path.write_text(json.dumps(graph_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        task_id = f"local-fast-{secrets.token_hex(6)}"
+        project_meta_path = self._project_meta_path(project_id)
+        if project_meta_path.exists():
+            try:
+                project_payload = json.loads(project_meta_path.read_text(encoding="utf-8"))
+            except Exception:
+                project_payload = {}
+            project_payload.update(
+                {
+                    "graph_id": graph_id,
+                    "graph_build_task_id": task_id,
+                    "status": "graph_completed",
+                    "updated_at": now_local_iso(),
+                    "error": None,
+                }
+            )
+            project_meta_path.write_text(json.dumps(project_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return {"graph_id": graph_id, "task_id": task_id}
+
+    def _simulation_artifacts_ready(self, simulation_id: str) -> bool:
+        sim_dir = self._simulation_dir(simulation_id)
+        required = [
+            sim_dir / "state.json",
+            sim_dir / "simulation_config.json",
+            sim_dir / "reddit_profiles.json",
+            sim_dir / "twitter_profiles.csv",
+        ]
+        return all(path.exists() for path in required)
+
+    def _build_local_simulation_config(
+        self,
+        *,
+        simulation_id: str,
+        project_id: str,
+        graph_id: str,
+        seed: dict[str, Any],
+        mode: str,
+    ) -> dict[str, Any]:
+        focus_symbol = str(seed.get("focusSymbol") or "BTC-USDT-SWAP")
+        recent_symbols = [str(item or "").strip() for item in (seed.get("recentSymbols") or []) if str(item or "").strip()]
+        hot_topics = list(dict.fromkeys(([focus_symbol] + recent_symbols)[:6]))
+        roles = [
+            ("TrendCaptain", "趋势交易员，偏好追随延续信号。"),
+            ("MeanReverter", "反转交易员，专门捕捉过热回归。"),
+            ("DepthKeeper", "做市观察者，关注盘口深度和滑点。"),
+            ("RiskSentinel", "风控官，控制杠杆、回撤和仓位。"),
+            ("FundingWatcher", "资金费观察者，评估拥挤交易。"),
+            ("NewsPulse", "情绪观察者，结合舆情与波动反应。"),
+        ]
+        agent_configs: list[dict[str, Any]] = []
+        for index, (name, description) in enumerate(roles, start=1):
+            agent_configs.append(
+                {
+                    "agent_id": index,
+                    "agent_name": name,
+                    "bio": description,
+                    "focus_symbols": hot_topics[:3] or [focus_symbol],
+                    "platform_preference": "twitter" if index % 2 else "reddit",
+                    "activity_level": round(0.55 + index * 0.05, 2),
+                    "influence_weight": round(1.0 + index * 0.18, 2),
+                }
+            )
+        total_rounds = 6 if mode == "orders" else 8
+        total_hours = 72 if mode == "orders" else 96
+        minutes_per_round = max(30, int(total_hours * 60 / max(total_rounds, 1)))
+        return {
+            "simulation_id": simulation_id,
+            "project_id": project_id,
+            "graph_id": graph_id,
+            "simulation_requirement": str(seed.get("simulationRequirement") or "").strip(),
+            "generated_at": now_local_iso(),
+            "llm_model": "codex-local",
+            "time_config": {
+                "total_simulation_hours": total_hours,
+                "minutes_per_round": minutes_per_round,
+            },
+            "agent_configs": agent_configs,
+            "event_config": {
+                "initial_posts": [
+                    {
+                        "platform": "twitter",
+                        "content": f"{focus_symbol} 近期订单表现与执行成本值得重点复盘。",
+                        "poster_agent_id": 1,
+                    },
+                    {
+                        "platform": "reddit",
+                        "content": f"围绕 {focus_symbol} 的策略推演已经启动，重点观察手续费、滑点与方向切换。",
+                        "poster_agent_id": 2,
+                    },
+                ],
+                "hot_topics": hot_topics,
+            },
+            "twitter_config": {"enabled": True},
+            "reddit_config": {"enabled": True},
+        }
+
+    def _write_local_profiles(self, sim_dir: Path, agent_configs: list[dict[str, Any]]) -> None:
+        reddit_profiles = []
+        for agent in agent_configs:
+            reddit_profiles.append(
+                {
+                    "agent_id": agent["agent_id"],
+                    "username": f"{agent['agent_name'].lower()}_{agent['agent_id']}",
+                    "profile": agent.get("bio") or "",
+                    "persona": agent.get("bio") or "",
+                    "focus_symbols": agent.get("focus_symbols") or [],
+                }
+            )
+        (sim_dir / "reddit_profiles.json").write_text(
+            json.dumps(reddit_profiles, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        with (sim_dir / "twitter_profiles.csv").open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=["agent_id", "username", "display_name", "bio", "focus_symbols"],
+            )
+            writer.writeheader()
+            for agent in agent_configs:
+                writer.writerow(
+                    {
+                        "agent_id": agent["agent_id"],
+                        "username": f"{agent['agent_name'].lower()}_{agent['agent_id']}",
+                        "display_name": agent["agent_name"],
+                        "bio": agent.get("bio") or "",
+                        "focus_symbols": ",".join(agent.get("focus_symbols") or []),
+                    }
+                )
+
+    def _ensure_local_simulation_artifacts(
+        self,
+        *,
+        simulation_id: str,
+        project_id: str,
+        graph_id: str,
+        seed: dict[str, Any],
+        mode: str,
+    ) -> dict[str, Any]:
+        sim_dir = self._simulation_dir(simulation_id)
+        sim_dir.mkdir(parents=True, exist_ok=True)
+        config = self._build_local_simulation_config(
+            simulation_id=simulation_id,
+            project_id=project_id,
+            graph_id=graph_id,
+            seed=seed,
+            mode=mode,
+        )
+        (sim_dir / "simulation_config.json").write_text(
+            json.dumps(config, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        self._write_local_profiles(sim_dir, list(config.get("agent_configs") or []))
+        state_path = sim_dir / "state.json"
+        state_payload: dict[str, Any] = {}
+        if state_path.exists():
+            try:
+                state_payload = json.loads(state_path.read_text(encoding="utf-8"))
+            except Exception:
+                state_payload = {}
+        state_payload.update(
+            {
+                "simulation_id": simulation_id,
+                "project_id": project_id,
+                "graph_id": graph_id,
+                "enable_twitter": True,
+                "enable_reddit": True,
+                "status": "ready",
+                "entities_count": len(config.get("agent_configs") or []),
+                "profiles_count": len(config.get("agent_configs") or []),
+                "entity_types": ["SyntheticTrader"],
+                "config_generated": True,
+                "config_reasoning": "本地图谱没有可用实体，已回退到基于订单与策略快照的最小可运行仿真配置。",
+                "updated_at": now_local_iso(),
+                "error": "",
+            }
+        )
+        state_path.write_text(json.dumps(state_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return config
 
     def _wait_for_run_completion(self, simulation_id: str, deadline: float) -> dict[str, Any]:
         last_status = "idle"
@@ -11176,29 +11699,53 @@ class MiroFishAutoSimulationManager:
             project_id = str(project_data.get("project_id") or "")
             if not project_id:
                 raise RuntimeError("MiroFish 未返回 project_id")
-            self._update(
-                phase="building-graph",
-                progress=20,
-                message="项目已创建，正在构建图谱。",
-                projectId=project_id,
-            )
+            graph_id = ""
+            graph_task_id = ""
+            if self._use_fast_local_graph():
+                fast_graph = self._create_fast_local_graph(
+                    project_id=project_id,
+                    graph_name=seed["projectName"],
+                    ontology={
+                        "entity_types": list((project_data.get("ontology") or {}).get("entity_types") or []),
+                        "edge_types": list((project_data.get("ontology") or {}).get("edge_types") or []),
+                    },
+                    seed=seed,
+                    mode=mode,
+                )
+                graph_id = str(fast_graph.get("graph_id") or "")
+                graph_task_id = str(fast_graph.get("task_id") or "")
+                self._update(
+                    phase="building-graph",
+                    progress=55,
+                    message="已生成本地图谱快照，正在创建模拟。",
+                    projectId=project_id,
+                    graphId=graph_id,
+                    graphTaskId=graph_task_id,
+                )
+            else:
+                self._update(
+                    phase="building-graph",
+                    progress=20,
+                    message="项目已创建，正在构建图谱。",
+                    projectId=project_id,
+                )
 
-            build_payload = self._backend_request(
-                "POST",
-                "/api/graph/build",
-                json_body={"project_id": project_id, "graph_name": seed["projectName"], "force": True},
-                timeout=60.0,
-            )
-            build_data = build_payload.get("data") or {}
-            graph_task_id = str(build_data.get("task_id") or "")
-            if not graph_task_id:
-                raise RuntimeError("图谱构建任务未返回 task_id")
-            self._update(graphTaskId=graph_task_id)
-            graph_task = self._wait_for_graph_task(graph_task_id, time.time() + 10 * 60)
-            graph_result = graph_task.get("result") or {}
-            graph_id = str(graph_result.get("graph_id") or "")
-            if not graph_id:
-                raise RuntimeError("图谱构建完成后未返回 graph_id")
+                build_payload = self._backend_request(
+                    "POST",
+                    "/api/graph/build",
+                    json_body={"project_id": project_id, "graph_name": seed["projectName"], "force": True},
+                    timeout=60.0,
+                )
+                build_data = build_payload.get("data") or {}
+                graph_task_id = str(build_data.get("task_id") or "")
+                if not graph_task_id:
+                    raise RuntimeError("图谱构建任务未返回 task_id")
+                self._update(graphTaskId=graph_task_id)
+                graph_task = self._wait_for_graph_task(graph_task_id, time.time() + 10 * 60)
+                graph_result = graph_task.get("result") or {}
+                graph_id = str(graph_result.get("graph_id") or "")
+                if not graph_id:
+                    raise RuntimeError("图谱构建完成后未返回 graph_id")
             self._update(phase="creating-simulation", progress=58, message="图谱已就绪，正在创建模拟。", graphId=graph_id)
 
             simulation_payload = self._backend_request(
@@ -11226,21 +11773,44 @@ class MiroFishAutoSimulationManager:
                 orders_count=len(seed["orders"]),
             )
 
-            prepare_payload = self._backend_request(
-                "POST",
-                "/api/simulation/prepare",
-                json_body={
-                    "simulation_id": simulation_id,
-                    "use_llm_for_profiles": True,
-                    "parallel_profile_count": 3,
-                    "force_regenerate": True,
-                },
-                timeout=90.0,
-            )
-            prepare_data = prepare_payload.get("data") or {}
-            prepare_task_id = str(prepare_data.get("task_id") or "")
-            self._update(prepareTaskId=prepare_task_id)
-            self._wait_for_prepare(simulation_id, prepare_task_id or None, time.time() + 15 * 60)
+            prepare_error = ""
+            prepare_data: dict[str, Any] = {}
+            prepare_task_id = ""
+            try:
+                prepare_payload = self._backend_request(
+                    "POST",
+                    "/api/simulation/prepare",
+                    json_body={
+                        "simulation_id": simulation_id,
+                        "use_llm_for_profiles": True,
+                        "parallel_profile_count": 3,
+                        "force_regenerate": True,
+                    },
+                    timeout=90.0,
+                )
+                prepare_data = prepare_payload.get("data") or {}
+                prepare_task_id = str(prepare_data.get("task_id") or "")
+                self._update(prepareTaskId=prepare_task_id)
+                self._wait_for_prepare(simulation_id, prepare_task_id or None, time.time() + 15 * 60)
+            except Exception as exc:
+                prepare_error = str(exc)
+            if not self._simulation_artifacts_ready(simulation_id):
+                self._ensure_local_simulation_artifacts(
+                    simulation_id=simulation_id,
+                    project_id=project_id,
+                    graph_id=graph_id,
+                    seed=seed,
+                    mode=mode,
+                )
+                fallback_message = "图谱未生成可用实体，已自动回退到基于订单与策略快照的本地仿真配置。"
+                if prepare_error:
+                    fallback_message = f"{fallback_message} 原准备阶段提示：{prepare_error}"
+                self._update(
+                    phase="preparing-simulation",
+                    progress=85,
+                    message=fallback_message,
+                    prepareTaskId=prepare_task_id,
+                )
 
             self._update(phase="starting-simulation", progress=90, message="准备完成，正在启动推演。")
             start_payload = self._backend_request(
@@ -11421,7 +11991,23 @@ class StrategyAutoOptimizationManager:
                 sort_keys=True,
                 ensure_ascii=False,
             )
-            AUTOMATION_CONFIG.replace(normalized)
+            if is_remote_execution_enabled(CONFIG.current()):
+                remote_response = remote_gateway_request(
+                    CONFIG.current(),
+                    "POST",
+                    "/api/automation/config",
+                    body=json.dumps(normalized, ensure_ascii=False).encode("utf-8"),
+                    content_type="application/json; charset=utf-8",
+                    timeout=20.0,
+                )
+                remote_payload = remote_response.json() if remote_response.content else {}
+                if not remote_response.ok or remote_payload.get("ok") is False:
+                    remote_error = remote_payload.get("error") or f"远端返回 {remote_response.status_code}"
+                    raise RuntimeError(f"远端策略配置回写失败: {remote_error}")
+                mirrored = normalize_remote_automation_config_payload(remote_payload, normalized)
+                AUTOMATION_CONFIG.replace(mirrored)
+            else:
+                AUTOMATION_CONFIG.replace(normalized)
             applied_at = now_local_iso()
             applied_strategy = {
                 "stage": "strategy-optimization",

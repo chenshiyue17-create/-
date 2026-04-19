@@ -13,7 +13,12 @@ import json
 from typing import Dict, Any, List, Optional
 from dataclasses import dataclass, field
 
-from zep_cloud.client import Zep
+try:
+    from zep_cloud.client import Zep as _ZepClient
+    _ZEP_IMPORT_ERROR: Optional[Exception] = None
+except Exception as exc:  # pragma: no cover - environment dependent
+    _ZepClient = None
+    _ZEP_IMPORT_ERROR = exc
 
 from ..config import Config
 from ..utils.logger import get_logger
@@ -22,6 +27,13 @@ from ..utils.locale import get_locale, t
 from ..utils.zep_paging import fetch_all_nodes, fetch_all_edges
 
 logger = get_logger('mirofish.zep_tools')
+
+
+def _require_zep_client():
+    if _ZepClient is None:
+        detail = str(_ZEP_IMPORT_ERROR) if _ZEP_IMPORT_ERROR else "zep_cloud not available"
+        raise RuntimeError(f"Zep client unavailable: {detail}")
+    return _ZepClient
 
 
 @dataclass
@@ -426,8 +438,9 @@ class ZepToolsService:
         self.api_key = api_key or Config.ZEP_API_KEY
         if not self.api_key:
             raise ValueError("ZEP_API_KEY 未配置")
-        
-        self.client = Zep(api_key=self.api_key)
+
+        zep_client_cls = _require_zep_client()
+        self.client = zep_client_cls(api_key=self.api_key)
         # LLM客户端用于InsightForge生成子问题
         self._llm_client = llm_client
         logger.info(t("console.zepToolsInitialized"))
