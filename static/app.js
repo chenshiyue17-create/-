@@ -2765,6 +2765,7 @@ function renderAnalysisState(analysis, runtimeState = {}) {
     }
     dockSub.textContent = dockSummaryBits.join(" · ") || "顶部固定显示当前策略、联网判断和执行环境。";
   }
+  updateDockCollapseSummary();
 }
 
 function extractAutomationStopReason(statusText = "", lastError = "") {
@@ -3449,6 +3450,7 @@ function renderMainstreamBoard() {
       `;
     }).join("");
   }
+  updateDockCollapseSummary();
 }
 
 function renderSelectedTickers() {
@@ -7167,6 +7169,7 @@ async function boot() {
   try {
     initialView = window.localStorage.getItem("okx-desk-view") || "focus";
   } catch (_) {}
+  restoreDockCollapsePreference();
   setWorkspaceView(initialView, { persist: false, scroll: false });
   setupTunnelBackground();
   setPendingEnvironmentUi();
@@ -7627,6 +7630,16 @@ async function boot() {
     } catch (err) {
       setMirofishMessage(err.message, "err");
       await refreshMirofishStatus({ preserveMessage: true }).catch(() => {});
+    }
+  });
+
+  $("dock-toggle")?.addEventListener("click", () => {
+    setDockCollapsed(!dashboardState.dockCollapsed);
+  });
+
+  $("dock-collapse-bar")?.addEventListener("click", () => {
+    if (dashboardState.dockCollapsed) {
+      setDockCollapsed(false);
     }
   });
 

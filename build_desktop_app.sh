@@ -15,6 +15,8 @@ BUNDLED_PYTHON_SOURCE="${BUNDLED_PYTHON_SOURCE:-/Library/Frameworks/Python.frame
 LAUNCH_AGENT_DIR="$HOME/Library/LaunchAgents"
 LAUNCH_AGENT_PLIST="$LAUNCH_AGENT_DIR/com.cc.okxlocalapp.desktop.plist"
 APP_SUPPORT_DIR="$HOME/Library/Application Support/OKXLocalApp"
+RUNTIME_APP_DIR="$APP_SUPPORT_DIR/runtime-app"
+RUNTIME_STAMP_FILE="$APP_SUPPORT_DIR/runtime-source.stamp"
 LAUNCH_AGENT_LABEL="com.cc.okxlocalapp.desktop"
 
 mkdir -p "$MACOS_DIR" "$RESOURCES_DIR/app" "$FRAMEWORKS_DIR"
@@ -96,6 +98,29 @@ mkdir -p "$DESKTOP_APP"
 rsync -a --delete "$APP_BUNDLE/" "$DESKTOP_APP/"
 
 mkdir -p "$LAUNCH_AGENT_DIR" "$APP_SUPPORT_DIR"
+
+rm -rf "$RUNTIME_APP_DIR"
+mkdir -p "$RUNTIME_APP_DIR"
+cp "$ROOT_DIR/server.py" "$RUNTIME_APP_DIR/server.py"
+rm -rf "$RUNTIME_APP_DIR/static"
+cp -R "$ROOT_DIR/static" "$RUNTIME_APP_DIR/static"
+rm -rf "$RUNTIME_APP_DIR/scripts"
+mkdir -p "$RUNTIME_APP_DIR/scripts"
+if [ -d "$ROOT_DIR/scripts" ]; then
+  cp -R "$ROOT_DIR/scripts/." "$RUNTIME_APP_DIR/scripts/"
+fi
+rm -rf "$RUNTIME_APP_DIR/vendor"
+mkdir -p "$RUNTIME_APP_DIR/vendor"
+if [ -d "$ROOT_DIR/vendor/solominer" ]; then
+  cp -R "$ROOT_DIR/vendor/solominer" "$RUNTIME_APP_DIR/vendor/solominer"
+fi
+if [ -d "$ROOT_DIR/vendor/MiroFish" ]; then
+  cp -R "$ROOT_DIR/vendor/MiroFish" "$RUNTIME_APP_DIR/vendor/MiroFish"
+  rm -rf "$RUNTIME_APP_DIR/vendor/MiroFish/.git"
+fi
+find "$RUNTIME_APP_DIR/vendor" -name '__pycache__' -type d -prune -exec rm -rf {} +
+rm -f "$RUNTIME_STAMP_FILE"
+
 cat >"$LAUNCH_AGENT_PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
