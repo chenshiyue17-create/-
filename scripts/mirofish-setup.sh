@@ -45,7 +45,7 @@ pick_uv() {
 
 pick_node() {
   local candidate
-  for candidate in /usr/local/bin/node /opt/homebrew/bin/node node; do
+  for candidate in /usr/local/bin/node /opt/homebrew/bin/node /usr/bin/node node; do
     if [ -n "$candidate" ] && command -v "$candidate" >/dev/null 2>&1; then
       command -v "$candidate"
       return 0
@@ -57,6 +57,7 @@ pick_node() {
 pick_npm_cli() {
   local candidate
   for candidate in \
+    /usr/lib/node_modules/npm/bin/npm-cli.js \
     /usr/local/lib/node_modules/npm/bin/npm-cli.js \
     /opt/homebrew/lib/node_modules/npm/bin/npm-cli.js \
     "$HOME/.npm-global/lib/node_modules/npm/bin/npm-cli.js"
@@ -66,6 +67,14 @@ pick_npm_cli() {
       return 0
     fi
   done
+  if command -v npm >/dev/null 2>&1; then
+    local npm_root
+    npm_root="$(npm root -g 2>/dev/null || true)"
+    if [ -n "$npm_root" ] && [ -f "$npm_root/npm/bin/npm-cli.js" ]; then
+      printf '%s\n' "$npm_root/npm/bin/npm-cli.js"
+      return 0
+    fi
+  fi
   return 1
 }
 
