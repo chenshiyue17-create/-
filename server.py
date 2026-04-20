@@ -10763,6 +10763,22 @@ class MiroFishRuntimeManager:
                 continue
         return ""
 
+    def _backend_python_can_import_runtime(self, python_bin: str) -> bool:
+        if not python_bin:
+            return False
+        try:
+            result = subprocess.run(
+                [python_bin, "-c", "import flask, flask_cors, dotenv, pydantic"],
+                cwd=str(MIROFISH_BACKEND_DIR),
+                capture_output=True,
+                text=True,
+                timeout=12,
+                check=False,
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
+
     def _runtime_env_file_values(self, command_paths: dict[str, str] | None = None) -> dict[str, str]:
         values = self._parse_env_file()
         commands = command_paths or self._command_paths()
@@ -10789,7 +10805,8 @@ class MiroFishRuntimeManager:
         return (MIROFISH_FRONTEND_DIR / "node_modules").exists() or self._frontend_dist_index().exists()
 
     def _backend_deps_ready(self) -> bool:
-        return bool(self._backend_python_bin())
+        python_bin = self._backend_python_bin()
+        return bool(python_bin and self._backend_python_can_import_runtime(python_bin))
 
     def _frontend_sources_stale(self) -> bool:
         index_path = self._frontend_dist_index()

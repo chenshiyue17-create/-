@@ -116,8 +116,10 @@ setup_backend_with_venv() {
   echo "未使用 uv，回退到 Python venv 安装后端依赖..."
   (
     cd backend
+    rm -rf .venv
     "$PYTHON_BIN" -m venv .venv
     . .venv/bin/activate
+    python --version
     python -m pip install --upgrade pip setuptools wheel
     python -m pip install -r "$requirements_file"
   )
