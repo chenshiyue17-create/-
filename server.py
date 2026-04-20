@@ -14833,9 +14833,17 @@ class AutomationEngine:
         taker_fee_pct = safe_decimal(fee_rates.get("takerFeePct"), decimal_to_str(OKX_DEFAULT_SWAP_TAKER_FEE_PCT))
         entry_score = int(signal.get("entryScore") or 0)
         exit_score = int(signal.get("exitScore") or 0)
+        funding_rate_row = extract_first_row(client.get_funding_rate(inst_id))
+        funding_rate_pct = max(Decimal("0"), safe_decimal(funding_rate_row.get("fundingRate"), "0") * Decimal("100"))
+        mark_price = safe_decimal(extract_first_row(client.get_mark_price("SWAP", inst_id)).get("markPx"), "0")
+        basis_pct = (
+            ((last_price - mark_price) / mark_price) * Decimal("100")
+            if mark_price > 0
+            else Decimal("0")
+        )
         cost_snapshot = estimate_dip_swing_cost_snapshot(
             volatility_pct,
-            funding_rate_pct=max(Decimal("0"), safe_decimal(extract_first_row(client.get_funding_rate(inst_id)).get("fundingRate"), "0") * Decimal("100")),
+            funding_rate_pct=funding_rate_pct,
             maker_fee_pct=maker_fee_pct,
             taker_fee_pct=taker_fee_pct,
         )
@@ -14929,6 +14937,8 @@ class AutomationEngine:
         execution_cost_floor_pct = safe_decimal(symbol_pressure.get("executionCostFloorPct"), "0")
         recent_net_pnl = safe_decimal(symbol_pressure.get("recentNetPnl"), "0")
         recent_close_orders = int(symbol_pressure.get("closeOrders") or 0)
+        recent_open_close_gap = int(symbol_pressure.get("openCloseGap") or 0)
+        recent_consecutive_open_streak = int(symbol_pressure.get("consecutiveOpenStreak") or 0)
         symbol_cycle_block_reason = dip_swing_symbol_cycle_block_reason(symbol_pressure)
         symbol_cycle_blocked = bool(symbol_cycle_block_reason)
         symbol_performance_blocked = (
@@ -14943,11 +14953,31 @@ class AutomationEngine:
         if aggressive_scalp_mode:
             symbol_cycle_block_reason = ""
             symbol_cycle_blocked = False
+        liquidity_score = min(avg_quote_volume_usd / Decimal("1000000"), Decimal("12"))
+        symbol_performance_penalty = Decimal("0")
+        if recent_net_pnl < 0:
+            symbol_performance_penalty += abs(recent_net_pnl) / DIP_SWING_SYMBOL_PERFORMANCE_PENALTY_DIVISOR
+        if recent_taker_fill_pct > DIP_SWING_SYMBOL_MAX_TAKER_FILL_PCT:
+            symbol_performance_penalty += (recent_taker_fill_pct - DIP_SWING_SYMBOL_MAX_TAKER_FILL_PCT) * Decimal("0.4")
+        if recent_open_close_gap > DIP_SWING_MAX_OPEN_CLOSE_GAP:
+            symbol_performance_penalty += Decimal(recent_open_close_gap - DIP_SWING_MAX_OPEN_CLOSE_GAP) * Decimal("2")
+        if recent_consecutive_open_streak > DIP_SWING_MAX_CONSECUTIVE_OPEN_STREAK:
+            symbol_performance_penalty += Decimal(recent_consecutive_open_streak - DIP_SWING_MAX_CONSECUTIVE_OPEN_STREAK) * Decimal("1.5")
         estimated_cost_pct = max(
             estimated_cost_pct,
             execution_cost_floor_pct + safe_decimal(cost_snapshot.get("fundingDragPct"), "0"),
         )
         net_edge_pct = setup_edge_pct - estimated_cost_pct
+        edge_cost_ratio = (setup_edge_pct / estimated_cost_pct) if estimated_cost_pct > 0 else Decimal("0")
+        range_cost_ratio = (volatility_pct / estimated_cost_pct) if estimated_cost_pct > 0 else Decimal("0")
+        atr_cost_ratio = (atr_pct / estimated_cost_pct) if estimated_cost_pct > 0 else Decimal("0")
+        execution_quality_score = (
+            max(net_edge_pct, Decimal("0")) * Decimal("6")
+            + edge_cost_ratio * Decimal("1.8")
+            + range_cost_ratio * Decimal("1.2")
+            + atr_cost_ratio * Decimal("1.1")
+            + liquidity_score
+        ) - symbol_performance_penalty
         base_required_predicted_net_pct = required_profit_loop_net_pct(execution_cost_floor_pct)
         quaternion_snapshot = build_execution_quaternion(
             predicted_net_pct=predicted_net_pct,
@@ -14982,9 +15012,6 @@ class AutomationEngine:
         )
         projected_entry_net_pnl = safe_decimal(entry_projection.get("projectedNetPnl"), "0")
         force_market_entry_by_mode = False
-        edge_cost_ratio = (setup_edge_pct / estimated_cost_pct) if estimated_cost_pct > 0 else Decimal("0")
-        range_cost_ratio = (volatility_pct / estimated_cost_pct) if estimated_cost_pct > 0 else Decimal("0")
-        atr_cost_ratio = (atr_pct / estimated_cost_pct) if estimated_cost_pct > 0 else Decimal("0")
         edge_cost_ready = edge_cost_ratio >= DIP_SWING_MIN_EDGE_COST_RATIO
         range_cost_ready = range_cost_ratio >= DIP_SWING_MIN_RANGE_COST_RATIO
         atr_cost_ready = atr_cost_ratio >= DIP_SWING_MIN_ATR_COST_RATIO
