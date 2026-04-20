@@ -38,6 +38,8 @@ import aiohttp
 import requests
 from requests.adapters import HTTPAdapter
 
+from trade_quaternion import build_execution_quaternion, build_research_quaternion
+
 
 APP_DIR = Path(__file__).resolve().parent
 STATIC_DIR = APP_DIR / "static"
@@ -6409,7 +6411,23 @@ def score_research_summary(summary: dict[str, Any]) -> Decimal:
     return_pct = safe_decimal(summary.get("returnPct"), "0")
     drawdown = safe_decimal(summary.get("maxDrawdownPct"), "0")
     win_rate = safe_decimal(summary.get("winRatePct"), "0")
-    return return_pct + drawdown * Decimal("0.35") + win_rate * Decimal("0.05")
+    quaternion = build_research_quaternion(summary)
+    quaternion_adjustment = safe_decimal(quaternion.get("scoreAdjustment"), "0")
+    summary["quaternion"] = {
+        "w": decimal_to_str(safe_decimal(quaternion.get("w"), "0")),
+        "x": decimal_to_str(safe_decimal(quaternion.get("x"), "0")),
+        "y": decimal_to_str(safe_decimal(quaternion.get("y"), "0")),
+        "z": decimal_to_str(safe_decimal(quaternion.get("z"), "0")),
+        "quality": decimal_to_str(safe_decimal(quaternion.get("quality"), "0")),
+        "stability": decimal_to_str(safe_decimal(quaternion.get("stability"), "0")),
+        "driftPenalty": decimal_to_str(safe_decimal(quaternion.get("driftPenalty"), "0")),
+        "biasLabel": str(quaternion.get("biasLabel") or ""),
+        "dominantLabel": str(quaternion.get("dominantLabel") or ""),
+    }
+    summary["quaternionQuality"] = decimal_to_str(safe_decimal(quaternion.get("quality"), "0"))
+    summary["quaternionStability"] = decimal_to_str(safe_decimal(quaternion.get("stability"), "0"))
+    summary["quaternionBias"] = str(quaternion.get("biasLabel") or "")
+    return return_pct + drawdown * Decimal("0.35") + win_rate * Decimal("0.05") + quaternion_adjustment
 
 
 def run_backtest_bundle(
@@ -6464,6 +6482,15 @@ def run_backtest_bundle(
     win_count = sum(int(result.get("winCount", 0)) for result in market_results.values())
     summary = backtest_summary(starting_eq, ending_eq, trade_count, win_count, combined_curve)
     summary["score"] = decimal_to_str(score_research_summary(summary))
+    quaternion_summary = copy.deepcopy(summary.get("quaternion") or {})
+    if quaternion_summary:
+        notes.append(
+            "四元数校准: "
+            f"{quaternion_summary.get('biasLabel') or '中性'}"
+            f" · 质量 {compact_metric(quaternion_summary.get('quality'), '0.001')}"
+            f" · 稳定度 {compact_metric(quaternion_summary.get('stability'), '0.001')}"
+            f" · 主导 {quaternion_summary.get('dominantLabel') or '--'}"
+        )
 
     return {
         "summary": summary,
@@ -9035,7 +9062,27 @@ def build_dip_swing_analysis(
         entry_vetoes = []
     predicted_move_pct = safe_decimal(loop_metrics.get("predictedMovePct"), "0")
     predicted_net_pct = safe_decimal(loop_metrics.get("predictedNetPct"), "0")
-    required_predicted_net_pct = required_profit_loop_net_pct(execution_cost_floor_pct)
+    base_required_predicted_net_pct = required_profit_loop_net_pct(execution_cost_floor_pct)
+    quaternion_snapshot = build_execution_quaternion(
+        predicted_net_pct=predicted_net_pct,
+        required_net_pct=base_required_predicted_net_pct,
+        net_edge_pct=net_edge_pct,
+        volatility_pct=volatility_pct,
+        execution_quality_score=execution_quality_score,
+        taker_fill_pct=recent_taker_fill_pct,
+        abs_slip_pct=recent_avg_abs_slip_mark_pct,
+        funding_rate_pct=funding_rate_pct,
+        basis_pct=basis_pct,
+        liq_buffer_pct=liq_buffer,
+        recent_net_pnl=recent_symbol_net_pnl,
+    )
+    quaternion_quality = safe_decimal(quaternion_snapshot.get("quality"), "0")
+    quaternion_stability = safe_decimal(quaternion_snapshot.get("stability"), "0")
+    quaternion_drift_penalty = safe_decimal(quaternion_snapshot.get("driftPenalty"), "0")
+    quaternion_required_edge_boost_pct = safe_decimal(quaternion_snapshot.get("requiredEdgeBoostPct"), "0")
+    quaternion_maker_bias = bool(quaternion_snapshot.get("makerBias"))
+    quaternion_allow_aggressive_entry = bool(quaternion_snapshot.get("allowAggressiveEntry"))
+    required_predicted_net_pct = base_required_predicted_net_pct + quaternion_required_edge_boost_pct
     loop_quality_score = safe_decimal(loop_metrics.get("loopQualityScore"), "0")
     candidate_count = len(watchlist_entry_ready_snapshots)
     market_candidate_count = len(market_entry_ready_snapshots)
@@ -9226,6 +9273,13 @@ def build_dip_swing_analysis(
         f"当前真实成本地板 {compact_metric(execution_cost_floor_pct, '0.01')}%"
         f" · 净优势开仓门槛 {compact_metric(required_predicted_net_pct, '0.01')}%"
     )
+    warnings.append(
+        f"四元数校准 {str(quaternion_snapshot.get('biasLabel') or '中性')}"
+        f" · 质量 {compact_metric(quaternion_quality, '0.001')}"
+        f" · 稳定度 {compact_metric(quaternion_stability, '0.001')}"
+        f" · 漂移惩罚 {compact_metric(quaternion_drift_penalty, '0.001')}"
+        f" · 主导 {str(quaternion_snapshot.get('dominantLabel') or '--')}"
+    )
 
     ignored_blockers = list(blockers)
     if aggressive_scalp_mode and blockers:
@@ -9304,6 +9358,9 @@ def build_dip_swing_analysis(
         summary_bits.append(f"执行 {len(execution_symbols)} 币并行")
     if position_side in {"long", "short"} and liq_buffer > 0 and not aggressive_scalp_mode:
         summary_bits.append(f"强平缓冲 {compact_metric(liq_buffer, '0.1')}%")
+    summary_bits.append(
+        f"Q {compact_metric(quaternion_quality, '0.001')}/{compact_metric(quaternion_stability, '0.001')}"
+    )
     if blockers:
         summary_bits.append(blockers[0])
     elif position_side in {"long", "short"}:
@@ -9368,6 +9425,23 @@ def build_dip_swing_analysis(
         "projectedEntryNotional": compact_metric(projected_entry_notional, "0.01"),
         "profitTargetUsdt": format_decimal(DIP_SWING_NET_TARGET_USDT, 0),
         "loopQualityScore": compact_metric(loop_quality_score, "0.1"),
+        "quaternion": {
+            "w": compact_metric(quaternion_snapshot.get("w"), "0.001"),
+            "x": compact_metric(quaternion_snapshot.get("x"), "0.001"),
+            "y": compact_metric(quaternion_snapshot.get("y"), "0.001"),
+            "z": compact_metric(quaternion_snapshot.get("z"), "0.001"),
+            "quality": compact_metric(quaternion_quality, "0.001"),
+            "stability": compact_metric(quaternion_stability, "0.001"),
+            "driftPenalty": compact_metric(quaternion_drift_penalty, "0.001"),
+            "biasLabel": str(quaternion_snapshot.get("biasLabel") or ""),
+            "dominantLabel": str(quaternion_snapshot.get("dominantLabel") or ""),
+            "makerBias": quaternion_maker_bias,
+            "allowAggressiveEntry": quaternion_allow_aggressive_entry,
+        },
+        "quaternionQuality": compact_metric(quaternion_quality, "0.001"),
+        "quaternionStability": compact_metric(quaternion_stability, "0.001"),
+        "quaternionDriftPenalty": compact_metric(quaternion_drift_penalty, "0.001"),
+        "quaternionRequiredEdgeBoostPct": compact_metric(quaternion_required_edge_boost_pct, "0.001"),
         "pullbackPct": compact_metric(pullback_pct, "0.1"),
         "reboundPct": compact_metric(rebound_pct, "0.1"),
         "pullbackThresholdPct": compact_metric(pullback_threshold_pct, "0.1"),
@@ -14786,7 +14860,27 @@ class AutomationEngine:
             execution_cost_floor_pct + safe_decimal(cost_snapshot.get("fundingDragPct"), "0"),
         )
         net_edge_pct = setup_edge_pct - estimated_cost_pct
-        required_predicted_net_pct = required_profit_loop_net_pct(execution_cost_floor_pct)
+        base_required_predicted_net_pct = required_profit_loop_net_pct(execution_cost_floor_pct)
+        quaternion_snapshot = build_execution_quaternion(
+            predicted_net_pct=predicted_net_pct,
+            required_net_pct=base_required_predicted_net_pct,
+            net_edge_pct=net_edge_pct,
+            volatility_pct=volatility_pct,
+            execution_quality_score=execution_quality_score,
+            taker_fill_pct=recent_taker_fill_pct,
+            abs_slip_pct=recent_avg_abs_slip_mark_pct,
+            funding_rate_pct=funding_rate_pct,
+            basis_pct=basis_pct,
+            liq_buffer_pct=liq_buffer,
+            recent_net_pnl=recent_net_pnl,
+        )
+        quaternion_quality = safe_decimal(quaternion_snapshot.get("quality"), "0")
+        quaternion_stability = safe_decimal(quaternion_snapshot.get("stability"), "0")
+        quaternion_drift_penalty = safe_decimal(quaternion_snapshot.get("driftPenalty"), "0")
+        quaternion_required_edge_boost_pct = safe_decimal(quaternion_snapshot.get("requiredEdgeBoostPct"), "0")
+        quaternion_maker_bias = bool(quaternion_snapshot.get("makerBias"))
+        quaternion_allow_aggressive_entry = bool(quaternion_snapshot.get("allowAggressiveEntry"))
+        required_predicted_net_pct = base_required_predicted_net_pct + quaternion_required_edge_boost_pct
         effective_projected_net_pct = min(
             max(predicted_net_pct, Decimal("0")),
             max(net_edge_pct, Decimal("0")),
@@ -14846,9 +14940,14 @@ class AutomationEngine:
             f"ATR {compact_metric(atr_pct, '0.01')}% / "
             f"maker {compact_metric(maker_fee_pct, '0.001')}% / taker {compact_metric(taker_fee_pct, '0.001')}% / "
             f"滑点 {compact_metric(recent_avg_abs_slip_mark_pct, '0.001')}% / taker占比 {compact_metric(recent_taker_fill_pct, '0.1')}% / "
+            f"Q {compact_metric(quaternion_quality, '0.001')}/{compact_metric(quaternion_stability, '0.001')} / "
             f"近场净收益 {format_decimal(recent_net_pnl, 2)}U / "
             f"成交额 {format_decimal(avg_quote_volume_usd, 0)}U / "
             f"开平差 {symbol_pressure['openCloseGap']} / 连开 {symbol_pressure['consecutiveOpenStreak']}"
+        )
+        status_text += (
+            f" / 四元数 {str(quaternion_snapshot.get('biasLabel') or '中性')}"
+            f" / 漂移惩罚 {compact_metric(quaternion_drift_penalty, '0.001')}"
         )
         if symbol_cycle_blocked:
             status_text += f" / 闭环拦截 {symbol_cycle_block_reason}"
@@ -15168,6 +15267,8 @@ class AutomationEngine:
                     and effective_projected_net_pct >= max(required_predicted_net_pct, DIP_SWING_MIN_IOC_PROJECTED_NET_PCT)
                     and recent_taker_fill_pct <= DIP_SWING_MAX_IOC_TAKER_FILL_PCT
                     and recent_avg_abs_slip_mark_pct <= DIP_SWING_MAX_IOC_ABS_SLIP_PCT
+                    and quaternion_allow_aggressive_entry
+                    and not quaternion_maker_bias
                 )
                 entry_mode_label = (
                     "最优限价IOC" if prefer_ioc_entry else "maker-first"
@@ -15229,6 +15330,20 @@ class AutomationEngine:
                     "lastMessage": (
                         f"{ONLY_STRATEGY_LABEL}预期净优势 {compact_metric(effective_projected_net_pct, '0.01')}%"
                         f" 低于开仓门槛 {compact_metric(required_predicted_net_pct, '0.01')}%，不开仓"
+                    )
+                },
+            )
+            return
+        if quaternion_quality < Decimal("0.46") or quaternion_stability < Decimal("0.35"):
+            self._set_market(
+                market_key,
+                {
+                    "lastMessage": (
+                        f"{ONLY_STRATEGY_LABEL}四元数校准提示当前结构不稳"
+                        f" · 质量 {compact_metric(quaternion_quality, '0.001')}"
+                        f" / 稳定度 {compact_metric(quaternion_stability, '0.001')}"
+                        f" / 漂移惩罚 {compact_metric(quaternion_drift_penalty, '0.001')}"
+                        "，本轮不开仓"
                     )
                 },
             )
@@ -15347,6 +15462,8 @@ class AutomationEngine:
             and effective_projected_net_pct >= max(required_predicted_net_pct, DIP_SWING_MIN_IOC_PROJECTED_NET_PCT)
             and recent_taker_fill_pct <= DIP_SWING_MAX_IOC_TAKER_FILL_PCT
             and recent_avg_abs_slip_mark_pct <= DIP_SWING_MAX_IOC_ABS_SLIP_PCT
+            and quaternion_allow_aggressive_entry
+            and not quaternion_maker_bias
         )
         entry_mode_label = (
             "最优限价IOC" if prefer_ioc_entry else "maker-first"
