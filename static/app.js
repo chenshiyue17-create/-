@@ -1873,6 +1873,95 @@ function renderMirofishOptimization(optimization = {}, autopilot = {}) {
     || "是否已回写参数、是否继续恢复量化运行，会在这里直接显示。";
 }
 
+function renderDeskMirofishLoop(status = {}) {
+  if (!$("desk-mirofish-main")) return;
+  const snapshot = status && typeof status === "object" ? status : {};
+  const autoSimulation = snapshot.autoSimulation && typeof snapshot.autoSimulation === "object" ? snapshot.autoSimulation : {};
+  const optimization = snapshot.strategyOptimization && typeof snapshot.strategyOptimization === "object" ? snapshot.strategyOptimization : {};
+  const autopilot = snapshot.autopilot && typeof snapshot.autopilot === "object" ? snapshot.autopilot : {};
+  const autoConfig = autopilot.config && typeof autopilot.config === "object" ? autopilot.config : {};
+  const enabled = Boolean(autoConfig.enabled);
+  const autoRunning = Boolean(autoSimulation.running);
+  const optimizationPhase = String(optimization.phase || "idle");
+  const optimizationRunning = Boolean(optimization.running);
+  const optimizationApplied = Boolean(optimization.applied);
+  const bestConfig = optimization.bestConfig && typeof optimization.bestConfig === "object" ? optimization.bestConfig : {};
+  const quaternionSummary = buildQuaternionSummary(optimization);
+
+  let main = "待同步";
+  if (!snapshot.installed) {
+    main = "未接入";
+  } else if (!snapshot.ready) {
+    main = "运行时待就绪";
+  } else if (optimizationRunning) {
+    main = "优化进行中";
+  } else if (optimizationPhase === "completed" && optimizationApplied) {
+    main = "参数已回写";
+  } else if (optimizationPhase === "completed") {
+    main = "优化已完成";
+  } else if (autoRunning) {
+    main = "推演进行中";
+  } else if (enabled) {
+    main = "自动驾驶待命";
+  } else {
+    main = "自动驾驶关闭";
+  }
+  $("desk-mirofish-main").textContent = main;
+
+  const subParts = [];
+  if (snapshot.summary) subParts.push(String(snapshot.summary).trim());
+  if (autoSimulation.message) subParts.push(String(autoSimulation.message).trim());
+  if (optimization.message && optimizationPhase !== "idle") subParts.push(String(optimization.message).trim());
+  $("desk-mirofish-sub").textContent = subParts.join(" · ")
+    || "主工作台会直接显示自动推演、优化和恢复量化运行的最新状态。";
+
+  const lastParts = [];
+  const focusSymbol = String(autoSimulation.focusSymbol || optimization.focusSymbol || "").trim();
+  if (focusSymbol) lastParts.push(focusSymbol);
+  if (Number(autoSimulation.ordersCount || 0) > 0) lastParts.push(`${autoSimulation.ordersCount} 笔`);
+  if (autoSimulation.modeLabel) lastParts.push(String(autoSimulation.modeLabel).trim());
+  else if (autopilot.lastMode) lastParts.push(autopilot.lastMode === "orders" ? "订单推演" : "策略推演");
+  $("desk-mirofish-last").textContent = lastParts.join(" · ") || "-";
+
+  const lastSubParts = [];
+  if (autoSimulation.taskId) lastSubParts.push(`任务 ${autoSimulation.taskId}`);
+  if (autoSimulation.projectName) lastSubParts.push(autoSimulation.projectName);
+  if (autoSimulation.startedAt) lastSubParts.push(`开始 ${formatMirofishIso(autoSimulation.startedAt)}`);
+  if (quaternionSummary) lastSubParts.push(`四元数 ${quaternionSummary}`);
+  $("desk-mirofish-last-sub").textContent = lastSubParts.join(" · ")
+    || "任务编号、焦点币和订单数会显示在这里。";
+
+  let applyMain = "-";
+  if (!enabled) {
+    applyMain = "已关闭";
+  } else if (!autoConfig.autoResumeAutomation) {
+    applyMain = "手动恢复";
+  } else if (optimizationPhase === "completed" && optimizationApplied) {
+    applyMain = "已回写";
+  } else if (optimizationPhase === "completed") {
+    applyMain = "无需改写";
+  } else if (optimizationRunning) {
+    applyMain = "回写评估中";
+  } else if (autoRunning) {
+    applyMain = "等待优化";
+  } else {
+    applyMain = "待下一轮";
+  }
+  $("desk-mirofish-apply").textContent = applyMain;
+
+  const applySubParts = [];
+  if (bestConfig.fastEma && bestConfig.slowEma) {
+    applySubParts.push(`${bestConfig.bar || "--"} · EMA ${bestConfig.fastEma}/${bestConfig.slowEma}`);
+  }
+  if (optimization.appliedAt) applySubParts.push(`回写 ${formatMirofishIso(optimization.appliedAt)}`);
+  if (autopilot.nextRunAt) applySubParts.push(`下轮 ${formatMirofishIso(autopilot.nextRunAt)}`);
+  if (autopilot.lastCompletedAt) applySubParts.push(`完成 ${formatMirofishIso(autopilot.lastCompletedAt)}`);
+  if (optimization.error) applySubParts.push(`错误 ${optimization.error}`);
+  else if (autopilot.lastError) applySubParts.push(`错误 ${autopilot.lastError}`);
+  $("desk-mirofish-apply-sub").textContent = applySubParts.join(" · ")
+    || "是否已回写最佳参数、下一轮何时开始，会在这里显示。";
+}
+
 function syncMirofishSimulationFrame(autoSimulation = {}, options = {}) {
   const frame = $("mirofish-frame");
   if (!frame) return;
@@ -2034,6 +2123,7 @@ function renderMirofishStatus(status = {}, options = {}) {
   });
   renderMirofishAutopilot(snapshot.autopilot || {}, snapshot.strategyOptimization || {});
   renderMirofishOptimization(snapshot.strategyOptimization || {}, snapshot.autopilot || {});
+  renderDeskMirofishLoop(snapshot);
 
   const ready = Boolean(snapshot.ready);
   const launchable = Boolean(snapshot.launchable);
@@ -6678,6 +6768,7 @@ function renderAutomationState(state, options = {}) {
   $("bot-last-cycle").textContent = sanitizedState?.lastCycleAt || "-";
   $("bot-order-count").textContent = sanitizedState?.orderCountToday ?? 0;
   $("bot-drawdown").textContent = `${sanitizedState?.dailyDrawdownPct || "0"}%`;
+  renderDeskMirofishLoop(dashboardState.mirofish || {});
   renderBotMarket("bot-spot-state", sanitizedState?.markets?.spot, sanitizedState?.watchlist || [], "spot");
   renderBotMarket("bot-swap-state", sanitizedState?.markets?.swap, sanitizedState?.watchlist || [], "swap");
   renderLogs(sanitizedState?.logs || []);
@@ -7258,7 +7349,12 @@ function startMirofishPolling() {
   }
   mirofishPollTimer = setInterval(() => {
     const autoSimulation = (dashboardState.mirofish && dashboardState.mirofish.autoSimulation) || {};
-    if (dashboardState.currentView === "mirofish" || autoSimulation.running) {
+    const autopilotEnabled = Boolean(dashboardState.mirofish?.autopilot?.config?.enabled);
+    if (dashboardState.currentView === "mirofish"
+      || dashboardState.currentView === "focus"
+      || dashboardState.currentView === "research"
+      || autoSimulation.running
+      || autopilotEnabled) {
       refreshMirofishStatus({ preserveMessage: true }).catch(() => {});
     }
   }, getMirofishPollIntervalMs());

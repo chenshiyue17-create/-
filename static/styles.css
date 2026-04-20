@@ -1211,6 +1211,10 @@ body {
   font-size: 23px;
 }
 
+.mirofish-loop-bar {
+  margin-top: 14px;
+}
+
 #mirofish-frame {
   display: block;
   width: 100%;
