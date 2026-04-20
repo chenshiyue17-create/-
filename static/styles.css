@@ -1206,6 +1206,11 @@ body {
   margin-top: 14px;
 }
 
+#mirofish-opt-main,
+#mirofish-resume-main {
+  font-size: 23px;
+}
+
 #mirofish-frame {
   display: block;
   width: 100%;

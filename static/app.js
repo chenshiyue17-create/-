@@ -1787,6 +1787,92 @@ function buildQuaternionSummary(source = {}) {
   return parts.join(" · ");
 }
 
+function buildOptimizationPhaseLabel(phase = "") {
+  const key = String(phase || "idle");
+  const phaseLabelMap = {
+    idle: "待命",
+    "pending-simulation": "等待推演",
+    queued: "排队中",
+    running: "优化中",
+    applying: "回写中",
+    completed: "已完成",
+    failed: "失败",
+  };
+  return phaseLabelMap[key] || key || "待命";
+}
+
+function renderMirofishOptimization(optimization = {}, autopilot = {}) {
+  if (!$("mirofish-opt-main")) return;
+  const snapshot = optimization && typeof optimization === "object" ? optimization : {};
+  const autopilotSnapshot = autopilot && typeof autopilot === "object" ? autopilot : {};
+  const phase = String(snapshot.phase || "idle");
+  const phaseLabel = buildOptimizationPhaseLabel(phase);
+  const running = Boolean(snapshot.running);
+  const completed = phase === "completed";
+  const failed = phase === "failed";
+  const applied = Boolean(snapshot.applied);
+  const quaternionSummary = buildQuaternionSummary(snapshot);
+  const bestConfig = snapshot.bestConfig && typeof snapshot.bestConfig === "object" ? snapshot.bestConfig : {};
+  const focusSymbol = String(snapshot.focusSymbol || autopilotSnapshot.lastMode || "").trim();
+  const ordersCount = Number(snapshot.ordersCount || autopilotSnapshot.lastOrdersCount || 0);
+
+  let optMain = phaseLabel;
+  if (running) {
+    optMain = "优化进行中";
+  } else if (completed && applied) {
+    optMain = "参数已回写";
+  } else if (completed) {
+    optMain = "优化已完成";
+  } else if (failed) {
+    optMain = "优化失败";
+  }
+  $("mirofish-opt-main").textContent = optMain;
+
+  const optSubParts = [];
+  const message = String(snapshot.message || "").trim();
+  if (message) optSubParts.push(message);
+  if (bestConfig.fastEma && bestConfig.slowEma) {
+    optSubParts.push(`${bestConfig.bar || "--"} · EMA ${bestConfig.fastEma}/${bestConfig.slowEma}`);
+  }
+  if (Number.isFinite(ordersCount) && ordersCount > 0) optSubParts.push(`订单 ${ordersCount} 笔`);
+  if (focusSymbol) optSubParts.push(`焦点 ${focusSymbol}`);
+  if (quaternionSummary) optSubParts.push(`四元数 ${quaternionSummary}`);
+  $("mirofish-opt-sub").textContent = optSubParts.join(" · ")
+    || "推演完成后会自动生成优化结论与参数回写状态。";
+
+  let resumeMain = "待命";
+  if (failed) {
+    resumeMain = "闭环异常";
+  } else if (!autopilotSnapshot?.config?.autoResumeAutomation) {
+    resumeMain = "手动恢复";
+  } else if (completed && applied) {
+    resumeMain = "已回写待恢复";
+  } else if (completed && !applied) {
+    resumeMain = "无需改写";
+  } else if (running || String(autopilotSnapshot.status || "") === "triggered") {
+    resumeMain = "闭环运行中";
+  } else if (String(autopilotSnapshot.status || "") === "waiting" && autopilotSnapshot.lastCompletedAt) {
+    resumeMain = "已完成一轮";
+  }
+  $("mirofish-resume-main").textContent = resumeMain;
+
+  const resumeSubParts = [];
+  if (snapshot.appliedAt) resumeSubParts.push(`回写 ${formatMirofishIso(snapshot.appliedAt)}`);
+  if (autopilotSnapshot.lastCompletedAt) resumeSubParts.push(`最近完成 ${formatMirofishIso(autopilotSnapshot.lastCompletedAt)}`);
+  if (autopilotSnapshot.nextRunAt) resumeSubParts.push(`下轮 ${formatMirofishIso(autopilotSnapshot.nextRunAt)}`);
+  if (snapshot.error) {
+    resumeSubParts.push(`错误 ${snapshot.error}`);
+  } else if (autopilotSnapshot.lastError) {
+    resumeSubParts.push(`错误 ${autopilotSnapshot.lastError}`);
+  } else if (completed && applied) {
+    resumeSubParts.push("最新优化参数已经写回当前量化配置");
+  } else if (completed) {
+    resumeSubParts.push("本轮优化判断当前配置无需变更");
+  }
+  $("mirofish-resume-sub").textContent = resumeSubParts.join(" · ")
+    || "是否已回写参数、是否继续恢复量化运行，会在这里直接显示。";
+}
+
 function syncMirofishSimulationFrame(autoSimulation = {}, options = {}) {
   const frame = $("mirofish-frame");
   if (!frame) return;
@@ -1947,6 +2033,7 @@ function renderMirofishStatus(status = {}, options = {}) {
     optimization: snapshot.strategyOptimization || {},
   });
   renderMirofishAutopilot(snapshot.autopilot || {}, snapshot.strategyOptimization || {});
+  renderMirofishOptimization(snapshot.strategyOptimization || {}, snapshot.autopilot || {});
 
   const ready = Boolean(snapshot.ready);
   const launchable = Boolean(snapshot.launchable);

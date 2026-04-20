@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>10U战神</title>
-    <link rel="stylesheet" href="/styles.css?v=20260420-quaternion-ui1" />
+    <link rel="stylesheet" href="/styles.css?v=20260420-quaternion-ui2" />
   </head>
   <body data-view="focus">
     <canvas id="tunnel-bg" aria-hidden="true"></canvas>
@@ -741,6 +741,16 @@
               <strong id="mirofish-auto-ids">-</strong>
               <small id="mirofish-auto-link">完成后会自动切到对应模拟运行页。</small>
             </div>
+            <div class="mirofish-card">
+              <span>策略优化</span>
+              <strong id="mirofish-opt-main">待命</strong>
+              <small id="mirofish-opt-sub">推演完成后会自动生成优化结论与参数回写状态。</small>
+            </div>
+            <div class="mirofish-card">
+              <span>闭环结果</span>
+              <strong id="mirofish-resume-main">待命</strong>
+              <small id="mirofish-resume-sub">是否已回写参数、是否继续恢复量化运行，会在这里直接显示。</small>
+            </div>
           </div>
           <div class="mirofish-embed-shell mirofish-autopilot-shell">
             <div class="block-head">
@@ -1056,6 +1066,6 @@
     </div>
 
     <!-- BOOTSTRAP_DATA -->
-    <script src="/app.js?v=20260420-quaternion-ui1"></script>
+    <script src="/app.js?v=20260420-quaternion-ui2"></script>
   </body>
 </html>
