@@ -1805,6 +1805,9 @@ function renderMirofishOptimization(optimization = {}, autopilot = {}) {
   if (!$("mirofish-opt-main")) return;
   const snapshot = optimization && typeof optimization === "object" ? optimization : {};
   const autopilotSnapshot = autopilot && typeof autopilot === "object" ? autopilot : {};
+  const currentAnalysis = ((getCurrentAutomationState() || {}).analysis) || {};
+  const thresholdState = buildDipSwingThresholdState(currentAnalysis);
+  const candidateState = buildDipSwingCandidateState(currentAnalysis);
   const phase = String(snapshot.phase || "idle");
   const phaseLabel = buildOptimizationPhaseLabel(phase);
   const running = Boolean(snapshot.running);
@@ -1837,6 +1840,8 @@ function renderMirofishOptimization(optimization = {}, autopilot = {}) {
   if (Number.isFinite(ordersCount) && ordersCount > 0) optSubParts.push(`订单 ${ordersCount} 笔`);
   if (focusSymbol) optSubParts.push(`焦点 ${focusSymbol}`);
   if (quaternionSummary) optSubParts.push(`四元数 ${quaternionSummary}`);
+  if (thresholdState.text) optSubParts.push(`门槛 ${thresholdState.text}`);
+  if (candidateState.selectedSymbol) optSubParts.push(`候选 ${candidateState.text}`);
   $("mirofish-opt-sub").textContent = optSubParts.join(" · ")
     || "推演完成后会自动生成优化结论与参数回写状态。";
 
@@ -1876,6 +1881,9 @@ function renderMirofishOptimization(optimization = {}, autopilot = {}) {
 function renderDeskMirofishLoop(status = {}) {
   if (!$("desk-mirofish-main")) return;
   const snapshot = status && typeof status === "object" ? status : {};
+  const currentAnalysis = ((getCurrentAutomationState() || {}).analysis) || {};
+  const thresholdState = buildDipSwingThresholdState(currentAnalysis);
+  const candidateState = buildDipSwingCandidateState(currentAnalysis);
   const autoSimulation = snapshot.autoSimulation && typeof snapshot.autoSimulation === "object" ? snapshot.autoSimulation : {};
   const optimization = snapshot.strategyOptimization && typeof snapshot.strategyOptimization === "object" ? snapshot.strategyOptimization : {};
   const autopilot = snapshot.autopilot && typeof snapshot.autopilot === "object" ? snapshot.autopilot : {};
@@ -1912,6 +1920,7 @@ function renderDeskMirofishLoop(status = {}) {
   if (snapshot.summary) subParts.push(String(snapshot.summary).trim());
   if (autoSimulation.message) subParts.push(String(autoSimulation.message).trim());
   if (optimization.message && optimizationPhase !== "idle") subParts.push(String(optimization.message).trim());
+  if (thresholdState.text) subParts.push(`门槛 ${thresholdState.text}`);
   $("desk-mirofish-sub").textContent = subParts.join(" · ")
     || "主工作台会直接显示自动推演、优化和恢复量化运行的最新状态。";
 
@@ -1928,6 +1937,7 @@ function renderDeskMirofishLoop(status = {}) {
   if (autoSimulation.projectName) lastSubParts.push(autoSimulation.projectName);
   if (autoSimulation.startedAt) lastSubParts.push(`开始 ${formatMirofishIso(autoSimulation.startedAt)}`);
   if (quaternionSummary) lastSubParts.push(`四元数 ${quaternionSummary}`);
+  if (candidateState.text) lastSubParts.push(`候选 ${candidateState.text}`);
   $("desk-mirofish-last-sub").textContent = lastSubParts.join(" · ")
     || "任务编号、焦点币和订单数会显示在这里。";
 
@@ -1978,6 +1988,9 @@ function renderMirofishAutoSimulation(status = {}, options = {}) {
   if (!$("mirofish-auto-main")) return;
   const snapshot = status && typeof status === "object" ? status : {};
   const optimization = options.optimization && typeof options.optimization === "object" ? options.optimization : {};
+  const currentAnalysis = ((getCurrentAutomationState() || {}).analysis) || {};
+  const thresholdState = buildDipSwingThresholdState(currentAnalysis);
+  const candidateState = buildDipSwingCandidateState(currentAnalysis);
   const running = Boolean(snapshot.running);
   const failed = String(snapshot.phase || "") === "failed";
   const completed = String(snapshot.phase || "") === "completed";
@@ -2009,6 +2022,7 @@ function renderMirofishAutoSimulation(status = {}, options = {}) {
       || "可根据当前订单或策略一键发起自动推演。",
   ];
   if (quaternionSummary) autoSubParts.push(`四元数 ${quaternionSummary}`);
+  if (thresholdState.text) autoSubParts.push(`门槛 ${thresholdState.text}`);
   $("mirofish-auto-sub").textContent = autoSubParts.join(" · ");
   $("mirofish-auto-stage").textContent = progress > 0 ? `${phaseLabel} · ${Math.min(100, Math.max(0, progress))}%` : phaseLabel;
 
@@ -2016,6 +2030,7 @@ function renderMirofishAutoSimulation(status = {}, options = {}) {
   if (focusSymbol) metaParts.push(`焦点 ${focusSymbol}`);
   if (snapshot.ordersCount) metaParts.push(`订单 ${snapshot.ordersCount} 笔`);
   if (snapshot.startedAt) metaParts.push(`开始 ${formatMirofishIso(snapshot.startedAt)}`);
+  if (candidateState.text) metaParts.push(`候选 ${candidateState.text}`);
   if (!metaParts.length && snapshot.updatedAt) metaParts.push(`更新 ${formatMirofishIso(snapshot.updatedAt)}`);
   $("mirofish-auto-meta").textContent = metaParts.join(" · ") || "项目、图谱、模拟和启动状态会在这里连续更新。";
 
@@ -2440,6 +2455,63 @@ function formatPercentValue(value) {
   if (!Number.isFinite(num)) return "--";
   const sign = num > 0 ? "+" : "";
   return `${sign}${num.toFixed(2)}%`;
+}
+
+function buildDipSwingThresholdState(analysis = {}) {
+  const snapshot = analysis && typeof analysis === "object" ? analysis : {};
+  const predictedNet = Number(snapshot.predictedNetPct ?? NaN);
+  const requiredNet = Number(snapshot.requiredPredictedNetPct ?? NaN);
+  const predictedNetDeficit = Number(snapshot.predictedNetDeficitPct ?? NaN);
+  const nearThresholdReady = Boolean(snapshot.nearThresholdReady);
+  const parts = [];
+  if (Number.isFinite(predictedNet) && Number.isFinite(requiredNet)) {
+    parts.push(`净优势 ${formatPercentValue(predictedNet)} / 门槛 ${formatPercentValue(requiredNet)}`);
+  }
+  if (nearThresholdReady) {
+    parts.push(
+      Number.isFinite(predictedNetDeficit)
+        ? `近阈值待放行 · 差值 ${formatPercentValue(predictedNetDeficit)}`
+        : "近阈值待放行"
+    );
+  } else if (Number.isFinite(predictedNetDeficit) && predictedNetDeficit > 0) {
+    parts.push(`还差 ${formatPercentValue(predictedNetDeficit)}`);
+  }
+  return {
+    nearThresholdReady,
+    predictedNet,
+    requiredNet,
+    predictedNetDeficit,
+    parts,
+    text: parts.join(" · "),
+  };
+}
+
+function buildDipSwingCandidateState(analysis = {}) {
+  const snapshot = analysis && typeof analysis === "object" ? analysis : {};
+  const selectedSymbol = String(snapshot.selectedWatchlistSymbol || "").trim();
+  const selectedFromMarket = Boolean(snapshot.selectedFromMarketScan);
+  const candidateCount = Number(snapshot.candidateCount || 0);
+  const watchlistViableCount = Number(snapshot.watchlistViableCount || 0);
+  const marketCandidateCount = Number(snapshot.marketCandidateCount || 0);
+  const marketViableCount = Number(snapshot.marketViableCount || 0);
+  const parts = [];
+  if (selectedSymbol) {
+    parts.push(`${selectedFromMarket ? "市场轮动" : "主盯标"} ${selectedSymbol}`);
+  }
+  parts.push(`watchlist 真候选 ${candidateCount}`);
+  if (watchlistViableCount > 0) parts.push(`watchlist 近候选 ${watchlistViableCount}`);
+  parts.push(`市场真候选 ${marketCandidateCount}`);
+  if (marketViableCount > 0) parts.push(`市场近候选 ${marketViableCount}`);
+  return {
+    selectedSymbol,
+    selectedFromMarket,
+    candidateCount,
+    watchlistViableCount,
+    marketCandidateCount,
+    marketViableCount,
+    parts,
+    text: parts.join(" · "),
+  };
 }
 
 function buildSmoothPath(points) {
@@ -2901,16 +2973,9 @@ function renderAnalysisState(analysis, runtimeState = {}) {
   const data = sanitizeAnalysisForSwingOnly(analysis || {});
   const runtime = runtimeState && typeof runtimeState === "object" ? runtimeState : {};
   const refreshAt = data.lastAnalyzedAt || runtime.lastCycleAt || "";
-  const predictedNet = Number(data.predictedNetPct ?? NaN);
-  const requiredNet = Number(data.requiredPredictedNetPct ?? NaN);
-  const predictedNetDeficit = Number(data.predictedNetDeficitPct ?? NaN);
-  const nearThresholdReady = Boolean(data.nearThresholdReady);
-  const selectedSymbol = String(data.selectedWatchlistSymbol || "").trim();
-  const selectedFromMarket = Boolean(data.selectedFromMarketScan);
-  const candidateCount = Number(data.candidateCount || 0);
-  const watchlistViableCount = Number(data.watchlistViableCount || 0);
-  const marketCandidateCount = Number(data.marketCandidateCount || 0);
-  const marketViableCount = Number(data.marketViableCount || 0);
+  const thresholdState = buildDipSwingThresholdState(data);
+  const candidateState = buildDipSwingCandidateState(data);
+  const nearThresholdReady = thresholdState.nearThresholdReady;
   $("analysis-decision").textContent =
     data.decisionLabel
       ? `${data.decisionLabel}${data.selectedScore ? ` · 分数 ${data.selectedScore}` : ""}`
@@ -2954,31 +3019,10 @@ function renderAnalysisState(analysis, runtimeState = {}) {
               ].filter(Boolean).join(" · ")
         )
       : "等待最新分析时间";
-  const thresholdBits = [];
-  if (Number.isFinite(predictedNet) && Number.isFinite(requiredNet)) {
-    thresholdBits.push(`净优势 ${formatPercentValue(predictedNet)} / 门槛 ${formatPercentValue(requiredNet)}`);
-  }
-  if (nearThresholdReady) {
-    thresholdBits.push(
-      Number.isFinite(predictedNetDeficit)
-        ? `近阈值放行 · 差值 ${formatPercentValue(predictedNetDeficit)}`
-        : "近阈值放行已激活"
-    );
-  } else if (Number.isFinite(predictedNetDeficit) && predictedNetDeficit > 0) {
-    thresholdBits.push(`还差 ${formatPercentValue(predictedNetDeficit)}`);
-  }
   $("analysis-threshold").textContent =
-    thresholdBits.join(" · ") || "等待净优势与门槛差值";
-  const candidateBits = [];
-  if (selectedSymbol) {
-    candidateBits.push(`${selectedFromMarket ? "市场轮动" : "主盯标"} ${selectedSymbol}`);
-  }
-  candidateBits.push(`watchlist 真候选 ${candidateCount}`);
-  if (watchlistViableCount > 0) candidateBits.push(`watchlist 近候选 ${watchlistViableCount}`);
-  candidateBits.push(`市场真候选 ${marketCandidateCount}`);
-  if (marketViableCount > 0) candidateBits.push(`市场近候选 ${marketViableCount}`);
+    thresholdState.text || "等待净优势与门槛差值";
   $("analysis-candidate").textContent =
-    candidateBits.join(" · ") || "等待候选池快照";
+    candidateState.text || "等待候选池快照";
   const reasonBits = [];
   if (data.summary) reasonBits.push(data.summary);
   if (data.blockers?.length) reasonBits.push(`阻断: ${data.blockers.join("；")}`);
@@ -5466,6 +5510,9 @@ function renderOrderTerminalToolbar(groups, hasVisibleGroups = true) {
       ? "只看永续"
       : "现货 + 永续";
   const journal = getCurrentExecutionJournal() || {};
+  const currentAnalysis = ((getCurrentAutomationState() || {}).analysis) || {};
+  const thresholdState = buildDipSwingThresholdState(currentAnalysis);
+  const candidateState = buildDipSwingCandidateState(currentAnalysis);
   const todayIso = String(journal.today || "").trim();
   const todayOrderCount = Number(journal.todayOrderCount ?? 0);
   const latestOrderAt = String(journal.latestOrderAt || "").trim();
@@ -5481,7 +5528,7 @@ function renderOrderTerminalToolbar(groups, hasVisibleGroups = true) {
       <div class="order-terminal-toolbar-copy">
         <span class="order-terminal-toolbar-eyebrow">订单流控制台</span>
         <strong>${escapeHtml(selected.symbol)} · ${escapeHtml(filterLabel)} · ${escapeHtml(marketLabel)}</strong>
-        <small>${selected.orderCount} 笔订单 · ${selected.scopeLabel} · ${selected.latestInstId} · ${escapeHtml(timeSummary)}${hasVisibleGroups ? "" : " · 当前筛选无匹配订单"}</small>
+        <small>${selected.orderCount} 笔订单 · ${selected.scopeLabel} · ${selected.latestInstId} · ${escapeHtml(timeSummary)}${thresholdState.text ? ` · ${escapeHtml(thresholdState.text)}` : ""}${candidateState.selectedSymbol ? ` · ${escapeHtml(candidateState.text)}` : ""}${hasVisibleGroups ? "" : " · 当前筛选无匹配订单"}</small>
       </div>
       <button class="btn btn-ghost order-toolbar-clear-focus" type="button">清除聚焦</button>
     </div>
@@ -5728,6 +5775,9 @@ function renderOrderTerminalFocus(selectedGroup, meta = {}) {
           ? "REST 聚合"
           : "REST";
   const envLabel = $("order-env-label")?.textContent || "等待环境";
+  const currentAnalysis = ((getCurrentAutomationState() || {}).analysis) || {};
+  const thresholdState = buildDipSwingThresholdState(currentAnalysis);
+  const candidateState = buildDipSwingCandidateState(currentAnalysis);
   const spotLabel = $("order-spot-label")?.textContent || `${selectedGroup.symbol}-USDT`;
   const swapLabel = $("order-swap-label")?.textContent || `${selectedGroup.symbol}-USDT-SWAP`;
   const watchlistLabel = $("order-watchlist-label")?.textContent || selectedGroup.symbol;
@@ -5784,6 +5834,8 @@ function renderOrderTerminalFocus(selectedGroup, meta = {}) {
       <div><b>watchlist</b><span>${escapeHtml(watchlistLabel)}</span></div>
       <div><b>工作中 / 已成交</b><span>${selectedGroup.working} / ${selectedGroup.filled}</span></div>
       <div><b>异常 / 成交率</b><span>${selectedGroup.riskCount} / ${formatPercentValue(selectedGroup.successRate)}</span></div>
+      <div><b>策略门槛</b><span>${escapeHtml(thresholdState.text || "等待净优势与门槛差值")}</span></div>
+      <div><b>候选质量</b><span>${escapeHtml(candidateState.text || "等待候选池快照")}</span></div>
       <div><b>订单金额</b><span>${selectedGroup.orderAmount > 0 ? `${formatMoney(selectedGroup.orderAmount)} USDT` : "--"}</span></div>
       <div><b>套利腿进度</b><span>${selectedGroup.arbOrderCount ? `开腿 ${selectedGroup.arbEntryOrders} · 对冲 ${selectedGroup.arbHedgeOrders} · 退场 ${selectedGroup.arbExitOrders} · 回滚 ${selectedGroup.arbRollbackOrders}` : "当前不是套利腿订单流"}</span></div>
       <div><b>${focusInsight ? "收益判断" : isBenignExecutionCancelReason(selectedGroup.topCancelReason) ? "最近执行提示" : "最近异常"}</b><span>${escapeHtml(focusInsight || selectedGroup.topCancelReason || "当前没有明显异常撤单")}</span></div>
