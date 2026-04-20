@@ -18,6 +18,7 @@ APP_SUPPORT_DIR="$HOME/Library/Application Support/OKXLocalApp"
 RUNTIME_APP_DIR="$APP_SUPPORT_DIR/runtime-app"
 RUNTIME_STAMP_FILE="$APP_SUPPORT_DIR/runtime-source.stamp"
 LAUNCH_AGENT_LABEL="com.cc.okxlocalapp.desktop"
+ENABLE_AUTOLAUNCH="${OKX_LOCAL_APP_ENABLE_AUTOLAUNCH:-0}"
 
 mkdir -p "$MACOS_DIR" "$RESOURCES_DIR/app" "$FRAMEWORKS_DIR"
 
@@ -162,8 +163,14 @@ EOF
 
 pkill -f "$DESKTOP_APP/Contents/MacOS/$APP_NAME" >/dev/null 2>&1 || true
 launchctl bootout "gui/$(id -u)" "$LAUNCH_AGENT_PLIST" >/dev/null 2>&1 || true
-launchctl bootstrap "gui/$(id -u)" "$LAUNCH_AGENT_PLIST" >/dev/null 2>&1 || launchctl load -w "$LAUNCH_AGENT_PLIST" >/dev/null 2>&1 || true
-launchctl enable "gui/$(id -u)/$LAUNCH_AGENT_LABEL" >/dev/null 2>&1 || true
-launchctl kickstart -k "gui/$(id -u)/$LAUNCH_AGENT_LABEL" >/dev/null 2>&1 || true
+launchctl disable "gui/$(id -u)/$LAUNCH_AGENT_LABEL" >/dev/null 2>&1 || true
+
+if [ "$ENABLE_AUTOLAUNCH" = "1" ]; then
+  launchctl bootstrap "gui/$(id -u)" "$LAUNCH_AGENT_PLIST" >/dev/null 2>&1 || launchctl load -w "$LAUNCH_AGENT_PLIST" >/dev/null 2>&1 || true
+  launchctl enable "gui/$(id -u)/$LAUNCH_AGENT_LABEL" >/dev/null 2>&1 || true
+  launchctl kickstart -k "gui/$(id -u)/$LAUNCH_AGENT_LABEL" >/dev/null 2>&1 || true
+else
+  rm -f "$LAUNCH_AGENT_PLIST"
+fi
 
 echo "$DESKTOP_APP"
