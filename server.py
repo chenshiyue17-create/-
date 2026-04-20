@@ -174,6 +174,13 @@ DIP_SWING_NEAR_THRESHOLD_MAX_DEFICIT_PCT = Decimal("0.02")
 DIP_SWING_NEAR_THRESHOLD_MIN_EXECUTION_QUALITY = Decimal("58")
 DIP_SWING_NEAR_THRESHOLD_MIN_QUATERNION_QUALITY = Decimal("0.68")
 DIP_SWING_NEAR_THRESHOLD_MIN_QUATERNION_STABILITY = Decimal("0.58")
+DIP_SWING_RELU_GATE_MIN_SCORE = Decimal("62")
+DIP_SWING_RELU_GATE_STRONG_SCORE = Decimal("78")
+DIP_SWING_RELU_MAX_RELIEF_PCT = Decimal("0.025")
+DIP_SWING_RELU_MAX_PENALTY_PCT = Decimal("0.030")
+DIP_SWING_RELU_SOFT_MAX_DEFICIT_PCT = Decimal("0.030")
+DIP_SWING_RELU_MIN_LIQUIDITY_SCORE = Decimal("3")
+DIP_SWING_RELU_SLIP_WARN_PCT = Decimal("0.05")
 DIP_SWING_MIN_IOC_PROJECTED_NET_PCT = Decimal("0.35")
 DIP_SWING_MIN_IOC_PROJECTED_NET_USDT = Decimal("2")
 DIP_SWING_MAX_IOC_TAKER_FILL_PCT = Decimal("55")
@@ -6356,6 +6363,136 @@ def required_profit_loop_net_pct(execution_cost_floor_pct: Decimal) -> Decimal:
     )
 
 
+def relu_decimal(value: Decimal | str | int | float | None) -> Decimal:
+    return max(safe_decimal(value, "0"), Decimal("0"))
+
+
+def relu_ratio(value: Decimal | str | int | float | None, width: Decimal | str | int | float) -> Decimal:
+    span = safe_decimal(width, "1")
+    if span <= 0:
+        return Decimal("0")
+    return relu_decimal(value) / span
+
+
+def build_dip_swing_relu_gate(
+    *,
+    predicted_net_pct: Decimal,
+    base_required_predicted_net_pct: Decimal,
+    execution_quality_score: Decimal,
+    quaternion_quality: Decimal,
+    quaternion_stability: Decimal,
+    liquidity_score: Decimal,
+    edge_cost_ratio: Decimal,
+    range_cost_ratio: Decimal,
+    atr_cost_ratio: Decimal,
+    recent_taker_fill_pct: Decimal,
+    recent_abs_slip_pct: Decimal,
+    liquidity_ready: bool,
+    edge_cost_ready: bool,
+    range_cost_ready: bool,
+    atr_cost_ready: bool,
+    symbol_performance_blocked: bool = False,
+    symbol_taker_blocked: bool = False,
+    symbol_pressure_blocked: bool = False,
+) -> dict[str, Any]:
+    predicted = max(safe_decimal(predicted_net_pct, "0"), Decimal("0"))
+    base_required = max(safe_decimal(base_required_predicted_net_pct, "0"), Decimal("0"))
+    execution_quality = safe_decimal(execution_quality_score, "0")
+    quaternion_q = safe_decimal(quaternion_quality, "0")
+    quaternion_s = safe_decimal(quaternion_stability, "0")
+    liquidity = safe_decimal(liquidity_score, "0")
+    edge_ratio = safe_decimal(edge_cost_ratio, "0")
+    range_ratio = safe_decimal(range_cost_ratio, "0")
+    atr_ratio = safe_decimal(atr_cost_ratio, "0")
+    taker_fill = safe_decimal(recent_taker_fill_pct, "0")
+    slip_pct = safe_decimal(recent_abs_slip_pct, "0")
+
+    relief_pct = min(
+        DIP_SWING_RELU_MAX_RELIEF_PCT,
+        relu_ratio(execution_quality - Decimal("64"), Decimal("12")) * Decimal("0.004")
+        + relu_ratio(quaternion_q - Decimal("0.72"), Decimal("0.04")) * Decimal("0.004")
+        + relu_ratio(quaternion_s - Decimal("0.62"), Decimal("0.04")) * Decimal("0.003")
+        + relu_ratio(edge_ratio - DIP_SWING_MIN_EDGE_COST_RATIO, Decimal("0.35")) * Decimal("0.003")
+        + relu_ratio(range_ratio - DIP_SWING_MIN_RANGE_COST_RATIO, Decimal("0.60")) * Decimal("0.003")
+        + relu_ratio(atr_ratio - DIP_SWING_MIN_ATR_COST_RATIO, Decimal("0.30")) * Decimal("0.003")
+        + relu_ratio(liquidity - DIP_SWING_RELU_MIN_LIQUIDITY_SCORE, Decimal("1.50")) * Decimal("0.002")
+    )
+    penalty_pct = min(
+        DIP_SWING_RELU_MAX_PENALTY_PCT,
+        relu_ratio(Decimal("58") - execution_quality, Decimal("10")) * Decimal("0.005")
+        + relu_ratio(taker_fill - DIP_SWING_SYMBOL_MAX_TAKER_FILL_PCT, Decimal("8")) * Decimal("0.006")
+        + relu_ratio(slip_pct - DIP_SWING_RELU_SLIP_WARN_PCT, Decimal("0.02")) * Decimal("0.005")
+    )
+    required_predicted_net_pct = max(
+        DIP_SWING_MIN_PROJECTED_NET_PCT,
+        base_required + penalty_pct - relief_pct,
+    )
+    predicted_net_deficit_pct = max(required_predicted_net_pct - predicted, Decimal("0"))
+
+    gate_score = (
+        Decimal("50")
+        + relu_ratio(predicted - base_required, Decimal("0.01")) * Decimal("10")
+        + relu_ratio(execution_quality - DIP_SWING_NEAR_THRESHOLD_MIN_EXECUTION_QUALITY, Decimal("8")) * Decimal("12")
+        + relu_ratio(quaternion_q - DIP_SWING_NEAR_THRESHOLD_MIN_QUATERNION_QUALITY, Decimal("0.05")) * Decimal("10")
+        + relu_ratio(quaternion_s - DIP_SWING_NEAR_THRESHOLD_MIN_QUATERNION_STABILITY, Decimal("0.05")) * Decimal("8")
+        + relu_ratio(edge_ratio - DIP_SWING_MIN_EDGE_COST_RATIO, Decimal("0.25")) * Decimal("8")
+        + relu_ratio(range_ratio - DIP_SWING_MIN_RANGE_COST_RATIO, Decimal("0.40")) * Decimal("6")
+        + relu_ratio(atr_ratio - DIP_SWING_MIN_ATR_COST_RATIO, Decimal("0.25")) * Decimal("5")
+        + relu_ratio(liquidity - DIP_SWING_RELU_MIN_LIQUIDITY_SCORE, Decimal("1.25")) * Decimal("4")
+        - relu_ratio(predicted_net_deficit_pct, Decimal("0.005")) * Decimal("8")
+        - relu_ratio(taker_fill - DIP_SWING_SYMBOL_MAX_TAKER_FILL_PCT, Decimal("6")) * Decimal("8")
+        - relu_ratio(slip_pct - DIP_SWING_RELU_SLIP_WARN_PCT, Decimal("0.02")) * Decimal("7")
+    )
+    if symbol_performance_blocked:
+        gate_score -= Decimal("30")
+    if symbol_taker_blocked:
+        gate_score -= Decimal("22")
+    if symbol_pressure_blocked:
+        gate_score -= Decimal("18")
+    gate_score = max(Decimal("0"), gate_score)
+
+    hard_blocked = symbol_performance_blocked or symbol_taker_blocked or symbol_pressure_blocked
+    soft_window_pct = min(
+        DIP_SWING_RELU_SOFT_MAX_DEFICIT_PCT,
+        DIP_SWING_NEAR_THRESHOLD_MAX_DEFICIT_PCT + relief_pct,
+    )
+    near_threshold_ready = (
+        not hard_blocked
+        and predicted_net_deficit_pct > 0
+        and predicted_net_deficit_pct <= soft_window_pct
+        and gate_score >= DIP_SWING_RELU_GATE_MIN_SCORE
+        and liquidity_ready
+        and edge_cost_ready
+        and range_cost_ready
+        and atr_cost_ready
+    )
+    allow_entry_ready = (
+        not hard_blocked
+        and predicted >= required_predicted_net_pct
+    )
+    if gate_score >= DIP_SWING_RELU_GATE_STRONG_SCORE:
+        gate_label = "强放行"
+    elif gate_score >= DIP_SWING_RELU_GATE_MIN_SCORE:
+        gate_label = "接近放行"
+    elif predicted_net_deficit_pct > 0:
+        gate_label = "仍需等待"
+    else:
+        gate_label = "观察中"
+
+    return {
+        "requiredPredictedNetPct": required_predicted_net_pct,
+        "predictedNetDeficitPct": predicted_net_deficit_pct,
+        "nearThresholdReady": near_threshold_ready,
+        "allowEntryReady": allow_entry_ready,
+        "gateScore": gate_score,
+        "gateLabel": gate_label,
+        "thresholdReliefPct": relief_pct,
+        "thresholdPenaltyPct": penalty_pct,
+        "softWindowPct": soft_window_pct,
+        "hardBlocked": hard_blocked,
+    }
+
+
 def dip_swing_near_threshold_ready(
     *,
     predicted_net_pct: Decimal,
@@ -9409,6 +9546,7 @@ def build_dip_swing_analysis(
     atr_cost_ratio = safe_decimal(selected_snapshot.get("atrCostRatio"), "0")
     avg_quote_volume_usd = safe_decimal(selected_snapshot.get("avgQuoteVolumeUsd"), "0")
     open_interest_usd = safe_decimal(selected_snapshot.get("openInterestUsd"), "0")
+    liquidity_score = safe_decimal(selected_snapshot.get("liquidityScore"), "0")
     execution_quality_score = safe_decimal(selected_snapshot.get("executionQualityScore"), "0")
     recent_avg_abs_slip_mark_pct = safe_decimal(selected_snapshot.get("recentAvgAbsSlipMarkPct"), "0")
     recent_avg_abs_slip_index_pct = safe_decimal(selected_snapshot.get("recentAvgAbsSlipIndexPct"), "0")
@@ -9479,13 +9617,18 @@ def build_dip_swing_analysis(
     quaternion_required_edge_boost_pct = safe_decimal(quaternion_snapshot.get("requiredEdgeBoostPct"), "0")
     quaternion_maker_bias = bool(quaternion_snapshot.get("makerBias"))
     quaternion_allow_aggressive_entry = bool(quaternion_snapshot.get("allowAggressiveEntry"))
-    required_predicted_net_pct = base_required_predicted_net_pct + quaternion_required_edge_boost_pct
-    near_threshold_ready, predicted_net_deficit_pct = dip_swing_near_threshold_ready(
+    relu_gate = build_dip_swing_relu_gate(
         predicted_net_pct=predicted_net_pct,
-        required_predicted_net_pct=required_predicted_net_pct,
+        base_required_predicted_net_pct=base_required_predicted_net_pct + quaternion_required_edge_boost_pct,
         execution_quality_score=execution_quality_score,
         quaternion_quality=quaternion_quality,
         quaternion_stability=quaternion_stability,
+        liquidity_score=liquidity_score,
+        edge_cost_ratio=edge_cost_ratio,
+        range_cost_ratio=range_cost_ratio,
+        atr_cost_ratio=atr_cost_ratio,
+        recent_taker_fill_pct=recent_taker_fill_pct,
+        recent_abs_slip_pct=recent_avg_abs_slip_mark_pct,
         liquidity_ready=liquidity_ready,
         edge_cost_ready=edge_cost_ready,
         range_cost_ready=range_cost_ready,
@@ -9494,6 +9637,13 @@ def build_dip_swing_analysis(
         symbol_taker_blocked=symbol_taker_blocked,
         symbol_pressure_blocked=symbol_pressure_blocked,
     )
+    required_predicted_net_pct = safe_decimal(relu_gate.get("requiredPredictedNetPct"), "0")
+    near_threshold_ready = bool(relu_gate.get("nearThresholdReady"))
+    predicted_net_deficit_pct = safe_decimal(relu_gate.get("predictedNetDeficitPct"), "0")
+    relu_gate_score = safe_decimal(relu_gate.get("gateScore"), "0")
+    relu_gate_label = str(relu_gate.get("gateLabel") or "")
+    relu_threshold_relief_pct = safe_decimal(relu_gate.get("thresholdReliefPct"), "0")
+    relu_threshold_penalty_pct = safe_decimal(relu_gate.get("thresholdPenaltyPct"), "0")
     loop_quality_score = safe_decimal(loop_metrics.get("loopQualityScore"), "0")
     candidate_count = len(watchlist_entry_ready_snapshots)
     market_candidate_count = len(market_entry_ready_snapshots)
@@ -9701,6 +9851,12 @@ def build_dip_swing_analysis(
         f" · 稳定度 {compact_metric(quaternion_stability, '0.001')}"
         f" · 漂移惩罚 {compact_metric(quaternion_drift_penalty, '0.001')}"
         f" · 主导 {str(quaternion_snapshot.get('dominantLabel') or '--')}"
+    )
+    warnings.append(
+        f"ReLU 门控 {relu_gate_label or '观察中'}"
+        f" · 分数 {compact_metric(relu_gate_score, '0.1')}"
+        f" · 阈值缓释 {compact_metric(relu_threshold_relief_pct, '0.001')}%"
+        f" · 阈值惩罚 {compact_metric(relu_threshold_penalty_pct, '0.001')}%"
     )
     if near_threshold_ready:
         warnings.append(
@@ -9926,6 +10082,11 @@ def build_dip_swing_analysis(
         "atrCostRatio": compact_metric(atr_cost_ratio, "0.01"),
         "avgQuoteVolumeUsd": compact_metric(avg_quote_volume_usd, "1"),
         "openInterestUsd": compact_metric(open_interest_usd, "1"),
+        "liquidityScore": compact_metric(liquidity_score, "0.1"),
+        "reluGateScore": compact_metric(relu_gate_score, "0.1"),
+        "reluGateLabel": relu_gate_label,
+        "reluThresholdReliefPct": compact_metric(relu_threshold_relief_pct, "0.001"),
+        "reluThresholdPenaltyPct": compact_metric(relu_threshold_penalty_pct, "0.001"),
         "executionQualityScore": compact_metric(execution_quality_score, "0.1"),
         "recentAvgAbsSlipMarkPct": compact_metric(recent_avg_abs_slip_mark_pct, "0.001"),
         "recentAvgAbsSlipIndexPct": compact_metric(recent_avg_abs_slip_index_pct, "0.001"),
@@ -15425,17 +15586,22 @@ class AutomationEngine:
         quaternion_required_edge_boost_pct = safe_decimal(quaternion_snapshot.get("requiredEdgeBoostPct"), "0")
         quaternion_maker_bias = bool(quaternion_snapshot.get("makerBias"))
         quaternion_allow_aggressive_entry = bool(quaternion_snapshot.get("allowAggressiveEntry"))
-        required_predicted_net_pct = base_required_predicted_net_pct + quaternion_required_edge_boost_pct
         effective_projected_net_pct = min(
             max(predicted_net_pct, Decimal("0")),
             max(net_edge_pct, Decimal("0")),
         )
-        near_threshold_ready, predicted_net_deficit_pct = dip_swing_near_threshold_ready(
+        relu_gate = build_dip_swing_relu_gate(
             predicted_net_pct=effective_projected_net_pct,
-            required_predicted_net_pct=required_predicted_net_pct,
+            base_required_predicted_net_pct=base_required_predicted_net_pct + quaternion_required_edge_boost_pct,
             execution_quality_score=execution_quality_score,
             quaternion_quality=quaternion_quality,
             quaternion_stability=quaternion_stability,
+            liquidity_score=liquidity_score,
+            edge_cost_ratio=edge_cost_ratio,
+            range_cost_ratio=range_cost_ratio,
+            atr_cost_ratio=atr_cost_ratio,
+            recent_taker_fill_pct=recent_taker_fill_pct,
+            recent_abs_slip_pct=recent_avg_abs_slip_mark_pct,
             liquidity_ready=liquidity_ready,
             edge_cost_ready=edge_cost_ready,
             range_cost_ready=range_cost_ready,
@@ -15444,6 +15610,11 @@ class AutomationEngine:
             symbol_taker_blocked=symbol_taker_blocked,
             symbol_pressure_blocked=symbol_pressure_blocked,
         )
+        required_predicted_net_pct = safe_decimal(relu_gate.get("requiredPredictedNetPct"), "0")
+        near_threshold_ready = bool(relu_gate.get("nearThresholdReady"))
+        predicted_net_deficit_pct = safe_decimal(relu_gate.get("predictedNetDeficitPct"), "0")
+        relu_gate_score = safe_decimal(relu_gate.get("gateScore"), "0")
+        relu_gate_label = str(relu_gate.get("gateLabel") or "")
         predicted_net_ready = effective_projected_net_pct >= required_predicted_net_pct or near_threshold_ready
         entry_projection = estimate_profit_loop_entry_net_pnl(
             planned_contracts=trade_contracts,
@@ -15504,6 +15675,10 @@ class AutomationEngine:
         status_text += (
             f" / 四元数 {str(quaternion_snapshot.get('biasLabel') or '中性')}"
             f" / 漂移惩罚 {compact_metric(quaternion_drift_penalty, '0.001')}"
+        )
+        status_text += (
+            f" / ReLU {relu_gate_label or '观察中'}"
+            f" {compact_metric(relu_gate_score, '0.1')}"
         )
         if symbol_cycle_blocked:
             status_text += f" / 闭环拦截 {symbol_cycle_block_reason}"

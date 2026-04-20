@@ -2468,9 +2468,18 @@ function buildDipSwingThresholdState(analysis = {}) {
   const requiredNet = Number(snapshot.requiredPredictedNetPct ?? NaN);
   const predictedNetDeficit = Number(snapshot.predictedNetDeficitPct ?? NaN);
   const nearThresholdReady = Boolean(snapshot.nearThresholdReady);
+  const reluGateScore = Number(snapshot.reluGateScore ?? NaN);
+  const reluGateLabel = String(snapshot.reluGateLabel || "").trim();
   const parts = [];
   if (Number.isFinite(predictedNet) && Number.isFinite(requiredNet)) {
     parts.push(`净优势 ${formatPercentValue(predictedNet)} / 门槛 ${formatPercentValue(requiredNet)}`);
+  }
+  if (reluGateLabel) {
+    parts.push(
+      Number.isFinite(reluGateScore)
+        ? `ReLU ${reluGateLabel} ${reluGateScore.toFixed(1)}`
+        : `ReLU ${reluGateLabel}`
+    );
   }
   if (nearThresholdReady) {
     parts.push(
@@ -2486,6 +2495,8 @@ function buildDipSwingThresholdState(analysis = {}) {
     predictedNet,
     requiredNet,
     predictedNetDeficit,
+    reluGateScore,
+    reluGateLabel,
     parts,
     text: parts.join(" · "),
   };
