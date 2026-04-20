@@ -11263,6 +11263,10 @@ class MiroFishRuntimeManager:
             return 0
         return pid if self._pid_is_alive(pid) else 0
 
+    def _stamped_backend_updated_at(self) -> str:
+        payload = self._load_backend_stamp() or {}
+        return str(payload.get("updatedAt") or "").strip()
+
     def _backend_stamp_mismatch(self, current_stamp: str | None = None) -> bool:
         desired = str(current_stamp or self._current_backend_stamp()).strip()
         current = str((self._load_backend_stamp() or {}).get("stamp") or "").strip()
@@ -11734,6 +11738,7 @@ class MiroFishRuntimeManager:
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
             self._cleanup_dead_backend()
+            current_stamp = self._current_backend_stamp()
             commands = self._command_paths()
             env_values = self._runtime_env_file_values(commands)
             env_exists = MIROFISH_ENV_PATH.exists()
@@ -11745,8 +11750,17 @@ class MiroFishRuntimeManager:
             backend_healthy = self._backend_healthy()
             managed_pid = self.backend_process.pid if self.backend_process and self.backend_process.poll() is None else 0
             stamped_pid = self._stamped_backend_pid() if not managed_pid else 0
-            backend_pid = managed_pid or stamped_pid
+            listener_pid = 0
+            if backend_healthy and not (managed_pid or stamped_pid):
+                for pid in self._port_listener_pids(MIROFISH_BACKEND_PORT):
+                    if pid != os.getpid():
+                        listener_pid = pid
+                        break
+            backend_pid = managed_pid or stamped_pid or listener_pid
+            if backend_healthy and listener_pid and not stamped_pid:
+                self._save_backend_stamp(current_stamp, listener_pid)
             backend_running = bool(backend_pid and backend_healthy)
+            started_at = self.started_at or self._stamped_backend_updated_at()
             status = {
                 "installed": MIROFISH_ROOT.exists(),
                 "frontendBuilt": frontend_built,
@@ -11765,7 +11779,7 @@ class MiroFishRuntimeManager:
                 "missingEnvKeys": missing_env,
                 "missingCommands": missing_commands,
                 "commands": commands,
-                "startedAt": self.started_at,
+                "startedAt": started_at,
                 "logTail": tail_lines(MIROFISH_LOG_PATH, 40),
             }
             frontend_runtime_ready = bool(frontend_built or status["frontendDepsReady"])
