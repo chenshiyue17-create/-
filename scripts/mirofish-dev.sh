@@ -40,6 +40,21 @@ pick_npm_cli() {
   return 1
 }
 
+pick_codex() {
+  local candidate
+  for candidate in \
+    /Applications/Codex.app/Contents/Resources/codex \
+    "$HOME/.npm-global/bin/codex" \
+    codex
+  do
+    if [ -n "$candidate" ] && command -v "$candidate" >/dev/null 2>&1; then
+      command -v "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
 if [ ! -d "$MIROFISH_DIR" ]; then
   echo "MiroFish 目录不存在: $MIROFISH_DIR" >&2
   exit 1
@@ -67,7 +82,7 @@ fi
 
 export UV_PYTHON="$PYTHON_BIN"
 export PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1
-export CODEX_PATH="${CODEX_PATH:-$(command -v codex || true)}"
+export CODEX_PATH="${CODEX_PATH:-$(pick_codex || true)}"
 export MIROFISH_LLM_BACKEND="${MIROFISH_LLM_BACKEND:-codex}"
 export MIROFISH_GRAPH_BACKEND="${MIROFISH_GRAPH_BACKEND:-local}"
 export MIROFISH_CODEX_COMMAND="${MIROFISH_CODEX_COMMAND:-${CODEX_PATH:-codex}}"

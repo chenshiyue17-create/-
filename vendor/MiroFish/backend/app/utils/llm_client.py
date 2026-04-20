@@ -9,7 +9,6 @@ import subprocess
 import tempfile
 from pathlib import Path
 from typing import Optional, Dict, Any, List
-from openai import OpenAI
 
 from ..config import Config
 
@@ -38,6 +37,10 @@ class LLMClient:
         else:
             if not self.api_key:
                 raise ValueError("LLM_API_KEY 未配置")
+            try:
+                from openai import OpenAI
+            except Exception as exc:
+                raise RuntimeError(f"OpenAI SDK 不可用: {exc}") from exc
             self.client = OpenAI(
                 api_key=self.api_key,
                 base_url=self.base_url

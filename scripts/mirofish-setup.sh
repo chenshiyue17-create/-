@@ -3,7 +3,23 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 MIROFISH_DIR="$ROOT_DIR/vendor/MiroFish"
-CODEX_PATH="$(command -v codex || true)"
+
+pick_codex() {
+  local candidate
+  for candidate in \
+    /Applications/Codex.app/Contents/Resources/codex \
+    "$HOME/.npm-global/bin/codex" \
+    codex
+  do
+    if [ -n "$candidate" ] && command -v "$candidate" >/dev/null 2>&1; then
+      command -v "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+CODEX_PATH="$(pick_codex || true)"
 
 pick_python() {
   local candidate

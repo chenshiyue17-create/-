@@ -10,8 +10,12 @@ import time
 from collections.abc import Callable
 from typing import Any
 
-from zep_cloud import InternalServerError
-from zep_cloud.client import Zep
+try:
+    from zep_cloud import InternalServerError
+    from zep_cloud.client import Zep
+except Exception:  # pragma: no cover - optional dependency in local graph mode
+    InternalServerError = OSError  # type: ignore[assignment]
+    Zep = Any  # type: ignore[assignment]
 
 from .logger import get_logger
 

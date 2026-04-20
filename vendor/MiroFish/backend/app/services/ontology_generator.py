@@ -3,7 +3,6 @@
 接口1：分析文本内容，生成适合社会模拟的实体和关系类型定义
 """
 
-import json
 import logging
 import re
 from typing import Dict, Any, List, Optional
@@ -213,17 +212,236 @@ class OntologyGenerator:
             {"role": "user", "content": user_message}
         ]
         
-        # 调用LLM
-        result = self.llm_client.chat_json(
-            messages=messages,
-            temperature=0.3,
-            max_tokens=4096
-        )
+        if getattr(self.llm_client, "use_codex", False):
+            logger.info("当前运行在本地自主模式，直接使用确定性本体生成。")
+            result = self._build_local_fallback_ontology(
+                document_texts=document_texts,
+                simulation_requirement=simulation_requirement,
+                additional_context=additional_context,
+                error_message="当前推演改走本地确定性生成链路，不依赖外部 LLM 配额。",
+            )
+        else:
+            try:
+                result = self.llm_client.chat_json(
+                    messages=messages,
+                    temperature=0.3,
+                    max_tokens=4096
+                )
+            except Exception as exc:
+                logger.warning("LLM 本体生成失败，回退到本地确定性生成: %s", exc)
+                result = self._build_local_fallback_ontology(
+                    document_texts=document_texts,
+                    simulation_requirement=simulation_requirement,
+                    additional_context=additional_context,
+                    error_message=str(exc),
+                )
         
         # 验证和后处理
         result = self._validate_and_process(result)
         
         return result
+
+    def _extract_focus_symbols(self, text: str) -> List[str]:
+        raw = re.findall(r'\b[A-Z][A-Z0-9]{1,9}(?:-USDT(?:-SWAP)?)?\b', text or "")
+        blocked = {
+            "JSON", "USER", "SYSTEM", "FINAL", "REQUIREMENT", "OKX", "USDT", "SWAP",
+            "HTTP", "API", "GET", "POST", "TRUE", "FALSE", "NULL",
+        }
+        ordered: List[str] = []
+        seen = set()
+        for item in raw:
+            token = item.strip().upper()
+            if not token or token in blocked or token.endswith("-USDT") or token.endswith("-SWAP"):
+                continue
+            if token not in seen:
+                seen.add(token)
+                ordered.append(token)
+        return ordered[:5]
+
+    def _build_local_fallback_ontology(
+        self,
+        document_texts: List[str],
+        simulation_requirement: str,
+        additional_context: Optional[str] = None,
+        error_message: str = "",
+    ) -> Dict[str, Any]:
+        combined_text = "\n".join(document_texts or [])
+        focus_symbols = self._extract_focus_symbols(f"{simulation_requirement}\n{combined_text}\n{additional_context or ''}")
+        focus_label = " / ".join(focus_symbols) if focus_symbols else "BTC / ETH / SOL"
+        examples_suffix = focus_symbols[:2] or ["BTC", "ETH"]
+
+        entity_types = [
+            {
+                "name": "StrategyEngine",
+                "description": "Automated strategy process coordinating trade intent and signal routing.",
+                "attributes": [
+                    {"name": "strategy_name", "type": "text", "description": "Strategy label"},
+                    {"name": "signal_bias", "type": "text", "description": "Current directional bias"},
+                ],
+                "examples": ["利润循环引擎", "反向策略主控"],
+            },
+            {
+                "name": "ExecutionDesk",
+                "description": "Trader or execution process responsible for routing live orders.",
+                "attributes": [
+                    {"name": "execution_style", "type": "text", "description": "Maker, IOC or market style"},
+                    {"name": "focus_symbol", "type": "text", "description": "Main traded symbol"},
+                ],
+                "examples": [f"{examples_suffix[0]} 执行桌", f"{examples_suffix[-1]} 高频执行"],
+            },
+            {
+                "name": "RiskSentinel",
+                "description": "Risk role monitoring leverage, drawdown and exposure limits.",
+                "attributes": [
+                    {"name": "risk_mode", "type": "text", "description": "Active risk profile"},
+                    {"name": "limit_note", "type": "text", "description": "Primary blocking reason"},
+                ],
+                "examples": ["风控观察员", "仓位管控器"],
+            },
+            {
+                "name": "MarketMaker",
+                "description": "Liquidity provider quoting both sides and shaping fill quality.",
+                "attributes": [
+                    {"name": "quote_style", "type": "text", "description": "How liquidity is quoted"},
+                    {"name": "symbol_scope", "type": "text", "description": "Supported markets"},
+                ],
+                "examples": [f"{examples_suffix[0]} 做市商", "盘口深度提供者"],
+            },
+            {
+                "name": "TrendTrader",
+                "description": "Directional participant amplifying momentum continuation.",
+                "attributes": [
+                    {"name": "preferred_side", "type": "text", "description": "Long or short bias"},
+                    {"name": "trigger_note", "type": "text", "description": "Entry trigger summary"},
+                ],
+                "examples": ["趋势跟随交易员", "加速买盘账户"],
+            },
+            {
+                "name": "ContrarianTrader",
+                "description": "Mean-reversion participant fading overextended moves.",
+                "attributes": [
+                    {"name": "reversion_anchor", "type": "text", "description": "Main reversion anchor"},
+                    {"name": "tolerance", "type": "text", "description": "Risk tolerance note"},
+                ],
+                "examples": ["反转交易员", "止盈承接账户"],
+            },
+            {
+                "name": "FundingWatcher",
+                "description": "Participant reacting to funding, basis and crowded positioning.",
+                "attributes": [
+                    {"name": "funding_bias", "type": "text", "description": "Funding interpretation"},
+                    {"name": "crowding_signal", "type": "text", "description": "Crowding indicator"},
+                ],
+                "examples": ["资金费观察者", "拥挤度监控器"],
+            },
+            {
+                "name": "NewsCatalyst",
+                "description": "External news or sentiment source affecting market attention.",
+                "attributes": [
+                    {"name": "headline_type", "type": "text", "description": "News category"},
+                    {"name": "impact_direction", "type": "text", "description": "Expected directional effect"},
+                ],
+                "examples": ["新闻脉冲源", f"{focus_label} 舆情事件"],
+            },
+            {
+                "name": "Person",
+                "description": "Fallback natural-person actor when no more specific role applies.",
+                "attributes": [
+                    {"name": "full_name", "type": "text", "description": "Display name"},
+                    {"name": "role_note", "type": "text", "description": "Short actor note"},
+                ],
+                "examples": ["普通交易员", "评论用户"],
+            },
+            {
+                "name": "Organization",
+                "description": "Fallback organization actor when no more specific type applies.",
+                "attributes": [
+                    {"name": "org_name", "type": "text", "description": "Organization name"},
+                    {"name": "org_role", "type": "text", "description": "Organization role"},
+                ],
+                "examples": ["交易所机构", "研究团队"],
+            },
+        ]
+
+        edge_types = [
+            {
+                "name": "ROUTES_ORDER_TO",
+                "description": "Execution desk routes orders to a liquidity venue.",
+                "source_targets": [{"source": "ExecutionDesk", "target": "Organization"}],
+                "attributes": [],
+            },
+            {
+                "name": "IMPLEMENTS_STRATEGY_FOR",
+                "description": "Execution desk carries out strategy intent.",
+                "source_targets": [{"source": "ExecutionDesk", "target": "StrategyEngine"}],
+                "attributes": [],
+            },
+            {
+                "name": "SUPERVISES_RISK_FOR",
+                "description": "Risk role supervises trader or strategy exposure.",
+                "source_targets": [
+                    {"source": "RiskSentinel", "target": "ExecutionDesk"},
+                    {"source": "RiskSentinel", "target": "StrategyEngine"},
+                ],
+                "attributes": [],
+            },
+            {
+                "name": "QUOTES_LIQUIDITY_TO",
+                "description": "Market maker provides liquidity to the execution desk.",
+                "source_targets": [{"source": "MarketMaker", "target": "ExecutionDesk"}],
+                "attributes": [],
+            },
+            {
+                "name": "RESPONDS_TO_SIGNAL",
+                "description": "Trader reacts to strategy or funding signals.",
+                "source_targets": [
+                    {"source": "TrendTrader", "target": "StrategyEngine"},
+                    {"source": "ContrarianTrader", "target": "StrategyEngine"},
+                    {"source": "FundingWatcher", "target": "StrategyEngine"},
+                ],
+                "attributes": [],
+            },
+            {
+                "name": "AMPLIFIES_MOVE_FOR",
+                "description": "News or sentiment catalyst amplifies a trader response.",
+                "source_targets": [
+                    {"source": "NewsCatalyst", "target": "TrendTrader"},
+                    {"source": "NewsCatalyst", "target": "ContrarianTrader"},
+                ],
+                "attributes": [],
+            },
+            {
+                "name": "COMPETES_WITH",
+                "description": "Two trader roles compete for directional dominance.",
+                "source_targets": [
+                    {"source": "TrendTrader", "target": "ContrarianTrader"},
+                    {"source": "MarketMaker", "target": "ExecutionDesk"},
+                ],
+                "attributes": [],
+            },
+            {
+                "name": "REPORTS_TO",
+                "description": "Fallback person or organization reports into a system role.",
+                "source_targets": [
+                    {"source": "Person", "target": "ExecutionDesk"},
+                    {"source": "Organization", "target": "RiskSentinel"},
+                ],
+                "attributes": [],
+            },
+        ]
+
+        summary = (
+            f"已改用本地确定性本体生成，围绕 {focus_label} 构造交易推演角色。"
+            f"本次不依赖外部 LLM 或 Codex CLI 配额，适合根据订单与策略直接发起自动推演。"
+        )
+        if error_message:
+            summary += f" 原始 LLM 路径失败原因：{error_message[:120]}"
+
+        return {
+            "entity_types": entity_types,
+            "edge_types": edge_types,
+            "analysis_summary": summary,
+        }
     
     # 传给 LLM 的文本最大长度（5万字）
     MAX_TEXT_LENGTH_FOR_LLM = 50000
@@ -503,4 +721,3 @@ class OntologyGenerator:
         code_lines.append('}')
         
         return '\n'.join(code_lines)
-

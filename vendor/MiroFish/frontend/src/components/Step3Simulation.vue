@@ -437,6 +437,55 @@ const doStartSimulation = async () => {
   }
 }
 
+const attachToExistingSimulation = (data) => {
+  runStatus.value = data || {}
+  prevTwitterRound.value = Number(data?.twitter_current_round || 0)
+  prevRedditRound.value = Number(data?.reddit_current_round || 0)
+}
+
+const restoreExistingSimulation = async () => {
+  if (!props.simulationId) return false
+
+  try {
+    const res = await getRunStatus(props.simulationId)
+    if (!(res.success && res.data)) {
+      return false
+    }
+
+    const data = res.data
+    const runnerStatus = String(data.runner_status || '').trim().toLowerCase()
+    const platformsCompleted = checkPlatformsCompleted(data)
+    const alreadyCompleted = runnerStatus === 'completed' || runnerStatus === 'stopped' || platformsCompleted
+    const alreadyRunning = runnerStatus === 'running'
+
+    if (!alreadyRunning && !alreadyCompleted) {
+      return false
+    }
+
+    attachToExistingSimulation(data)
+
+    if (alreadyCompleted) {
+      addLog(platformsCompleted && !['completed', 'stopped'].includes(runnerStatus)
+        ? t('log.allPlatformsCompleted')
+        : t('log.simCompleted'))
+      addLog('检测到已有完成的模拟，已直接恢复结果视图')
+      phase.value = 2
+      emit('update-status', 'completed')
+      return true
+    }
+
+    addLog('检测到已有运行中的模拟，已接管实时状态而不是重新启动')
+    phase.value = 1
+    emit('update-status', 'processing')
+    startStatusPolling()
+    startDetailPolling()
+    return true
+  } catch (err) {
+    console.warn('恢复已有模拟状态失败:', err)
+    return false
+  }
+}
+
 // 停止模拟
 const handleStopSimulation = async () => {
   if (!props.simulationId) return
@@ -690,7 +739,11 @@ watch(() => props.systemLogs?.length, () => {
 onMounted(() => {
   addLog(t('log.step3Init'))
   if (props.simulationId) {
-    doStartSimulation()
+    restoreExistingSimulation().then((restored) => {
+      if (!restored) {
+        doStartSimulation()
+      }
+    })
   }
 })
 

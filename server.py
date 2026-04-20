@@ -10424,6 +10424,23 @@ class MiroFishRuntimeManager:
         except Exception:
             pass
 
+    def _pid_is_alive(self, pid: int) -> bool:
+        if pid <= 0:
+            return False
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return False
+        return True
+
+    def _stamped_backend_pid(self) -> int:
+        payload = self._load_backend_stamp() or {}
+        try:
+            pid = int(payload.get("pid") or 0)
+        except (TypeError, ValueError):
+            return 0
+        return pid if self._pid_is_alive(pid) else 0
+
     def _backend_stamp_mismatch(self, current_stamp: str | None = None) -> bool:
         desired = str(current_stamp or self._current_backend_stamp()).strip()
         current = str((self._load_backend_stamp() or {}).get("stamp") or "").strip()
@@ -10873,8 +10890,11 @@ class MiroFishRuntimeManager:
             missing_commands = self._missing_commands(env_values, commands)
             frontend_built = self._frontend_dist_index().exists()
             frontend_stale = self._frontend_sources_stale()
-            backend_running = bool(self.backend_process and self.backend_process.poll() is None)
             backend_healthy = self._backend_healthy()
+            managed_pid = self.backend_process.pid if self.backend_process and self.backend_process.poll() is None else 0
+            stamped_pid = self._stamped_backend_pid() if not managed_pid else 0
+            backend_pid = managed_pid or stamped_pid
+            backend_running = bool(backend_pid and backend_healthy)
             status = {
                 "installed": MIROFISH_ROOT.exists(),
                 "frontendBuilt": frontend_built,
@@ -10883,7 +10903,7 @@ class MiroFishRuntimeManager:
                 "backendDepsReady": self._backend_deps_ready(),
                 "backendRunning": backend_running,
                 "backendHealthy": backend_healthy,
-                "backendPid": self.backend_process.pid if backend_running and self.backend_process else 0,
+                "backendPid": backend_pid,
                 "backendPort": MIROFISH_BACKEND_PORT,
                 "appBase": MIROFISH_APP_BASE,
                 "apiBase": MIROFISH_API_BASE,

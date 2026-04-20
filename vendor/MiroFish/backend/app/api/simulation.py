@@ -1485,6 +1485,7 @@ def start_simulation():
         max_rounds = data.get('max_rounds')  # 可选：最大模拟轮数
         enable_graph_memory_update = data.get('enable_graph_memory_update', False)  # 可选：是否启用图谱记忆更新
         force = data.get('force', False)  # 可选：强制重新开始
+        restart_running = data.get('restart_running', False)  # 可选：仅在明确要求时重启已运行模拟
 
         # 验证 max_rounds 参数
         if max_rounds is not None:
@@ -1532,12 +1533,23 @@ def start_simulation():
                     if run_state and run_state.runner_status.value == "running":
                         # 进程确实在运行
                         if force:
-                            # 强制模式：停止运行中的模拟
-                            logger.info(f"强制模式：停止运行中的模拟 {simulation_id}")
-                            try:
-                                SimulationRunner.stop_simulation(simulation_id)
-                            except Exception as e:
-                                logger.warning(f"停止模拟时出现警告: {str(e)}")
+                            if restart_running:
+                                # 强制模式：停止运行中的模拟
+                                logger.info(f"强制模式：停止运行中的模拟 {simulation_id}")
+                                try:
+                                    SimulationRunner.stop_simulation(simulation_id)
+                                except Exception as e:
+                                    logger.warning(f"停止模拟时出现警告: {str(e)}")
+                            else:
+                                logger.info(f"检测到运行中的模拟，直接复用当前实例: {simulation_id}")
+                                payload = run_state.to_dict()
+                                payload["force_restarted"] = False
+                                payload["reused_running"] = True
+                                payload["graph_memory_update_enabled"] = bool(enable_graph_memory_update)
+                                return jsonify({
+                                    "success": True,
+                                    "data": payload
+                                })
                         else:
                             return jsonify({
                                 "success": False,

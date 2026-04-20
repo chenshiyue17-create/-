@@ -1839,7 +1839,7 @@ function renderMirofishAutoSimulation(status = {}, options = {}) {
   }
 
   if ((running || completed) && snapshot.simulationPath) {
-    syncMirofishSimulationFrame(snapshot, { forceReload: options.forceReload || completed });
+    syncMirofishSimulationFrame(snapshot, { forceReload: options.forceReload === true });
   }
 }
 
