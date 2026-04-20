@@ -262,8 +262,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
 
     private func syncRuntimeApp(sourceURL: URL, runtimeURL: URL) throws {
         let fileManager = FileManager.default
-        let serverSource = sourceURL.appendingPathComponent("server.py")
-        let serverRuntime = runtimeURL.appendingPathComponent("server.py")
         let staticSource = sourceURL.appendingPathComponent("static", isDirectory: true)
         let staticRuntime = runtimeURL.appendingPathComponent("static", isDirectory: true)
         let scriptsSource = sourceURL.appendingPathComponent("scripts", isDirectory: true)
@@ -271,7 +269,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
         let vendorSource = sourceURL.appendingPathComponent("vendor", isDirectory: true)
         let vendorRuntime = runtimeURL.appendingPathComponent("vendor", isDirectory: true)
 
-        try copyItemReplacing(source: serverSource, destination: serverRuntime)
+        let rootEntries = try fileManager.contentsOfDirectory(
+            at: sourceURL,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        )
+        for entry in rootEntries where entry.pathExtension == "py" {
+            let destination = runtimeURL.appendingPathComponent(entry.lastPathComponent)
+            try copyItemReplacing(source: entry, destination: destination)
+        }
         if fileManager.fileExists(atPath: staticSource.path) {
             try copyItemReplacing(source: staticSource, destination: staticRuntime)
         }
@@ -303,8 +309,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
 
     private func runtimeSourceStamp(for sourceURL: URL) throws -> String {
         let fileManager = FileManager.default
-        let interestingRoots = [
-            sourceURL.appendingPathComponent("server.py"),
+        let rootPythonFiles = try fileManager.contentsOfDirectory(
+            at: sourceURL,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ).filter { $0.pathExtension == "py" }
+        let interestingRoots = rootPythonFiles + [
             sourceURL.appendingPathComponent("static", isDirectory: true),
             sourceURL.appendingPathComponent("scripts", isDirectory: true),
             sourceURL.appendingPathComponent("vendor", isDirectory: true),

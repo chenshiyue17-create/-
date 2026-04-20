@@ -8,6 +8,11 @@ NAME="okx-remote-node-${STAMP}.tar.gz"
 
 mkdir -p "$OUT_DIR"
 
+ROOT_PY_FILES=()
+while IFS= read -r -d '' file; do
+  ROOT_PY_FILES+=("$(basename "$file")")
+done < <(find "$ROOT_DIR" -maxdepth 1 -type f -name '*.py' -print0)
+
 tar \
   --exclude '.git' \
   --exclude 'dist' \
@@ -15,7 +20,7 @@ tar \
   --exclude '.DS_Store' \
   -czf "${OUT_DIR}/${NAME}" \
   -C "$ROOT_DIR" \
-  server.py \
+  "${ROOT_PY_FILES[@]}" \
   static \
   scripts \
   deploy \

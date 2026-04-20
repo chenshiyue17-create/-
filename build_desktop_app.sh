@@ -21,6 +21,14 @@ LAUNCH_AGENT_LABEL="com.cc.okxlocalapp.desktop"
 
 mkdir -p "$MACOS_DIR" "$RESOURCES_DIR/app" "$FRAMEWORKS_DIR"
 
+sync_root_python_modules() {
+  local dest_dir="$1"
+  mkdir -p "$dest_dir"
+  find "$ROOT_DIR" -maxdepth 1 -type f -name '*.py' -print0 | while IFS= read -r -d '' pyfile; do
+    cp "$pyfile" "$dest_dir/$(basename "$pyfile")"
+  done
+}
+
 cat >"$APP_BUNDLE/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -73,7 +81,7 @@ if [ -d "$BUNDLED_PYTHON_SOURCE" ]; then
   rsync -a "$BUNDLED_PYTHON_SOURCE/" "$FRAMEWORKS_DIR/Python.framework/"
 fi
 
-cp "$ROOT_DIR/server.py" "$RESOURCES_DIR/app/server.py"
+sync_root_python_modules "$RESOURCES_DIR/app"
 rm -rf "$RESOURCES_DIR/app/static"
 cp -R "$ROOT_DIR/static" "$RESOURCES_DIR/app/static"
 rm -rf "$RESOURCES_DIR/app/scripts"
@@ -101,7 +109,7 @@ mkdir -p "$LAUNCH_AGENT_DIR" "$APP_SUPPORT_DIR"
 
 rm -rf "$RUNTIME_APP_DIR"
 mkdir -p "$RUNTIME_APP_DIR"
-cp "$ROOT_DIR/server.py" "$RUNTIME_APP_DIR/server.py"
+sync_root_python_modules "$RUNTIME_APP_DIR"
 rm -rf "$RUNTIME_APP_DIR/static"
 cp -R "$ROOT_DIR/static" "$RUNTIME_APP_DIR/static"
 rm -rf "$RUNTIME_APP_DIR/scripts"
