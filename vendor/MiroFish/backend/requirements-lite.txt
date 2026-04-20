@@ -1,6 +1,7 @@
 # Minimal backend dependencies for Codex + local graph mode
 flask>=3.0.0
 flask-cors>=6.0.0
+waitress>=3.0.0
 openai>=1.0.0
 PyMuPDF>=1.24.0
 charset-normalizer>=3.0.0

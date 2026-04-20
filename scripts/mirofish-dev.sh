@@ -21,7 +21,7 @@ pick_python() {
 
 pick_node() {
   local candidate
-  for candidate in /usr/local/bin/node /opt/homebrew/bin/node node; do
+  for candidate in /usr/local/bin/node /opt/homebrew/bin/node /usr/bin/node node; do
     if [ -n "$candidate" ] && command -v "$candidate" >/dev/null 2>&1; then
       command -v "$candidate"
       return 0

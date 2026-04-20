@@ -40,11 +40,28 @@ def main():
     host = os.environ.get('FLASK_HOST', '0.0.0.0')
     port = int(os.environ.get('FLASK_PORT', 5001))
     debug = Config.DEBUG
-    
-    # 启动服务
-    app.run(host=host, port=port, debug=debug, threaded=True)
+    waitress_threads = max(4, int(os.environ.get('MIROFISH_WAITRESS_THREADS', '8') or '8'))
+
+    if debug:
+        print("[MiroFish] DEBUG 模式启用，使用 Flask development server")
+        app.run(host=host, port=port, debug=True, threaded=True)
+        return
+
+    try:
+        from waitress import serve
+    except Exception as exc:
+        print(f"[MiroFish] Waitress 不可用，回退到 Flask development server: {exc}")
+        app.run(host=host, port=port, debug=False, threaded=True)
+        return
+
+    print(f"[MiroFish] 使用 Waitress 启动，监听 http://{host}:{port} ，threads={waitress_threads}")
+    serve(
+        app,
+        host=host,
+        port=port,
+        threads=waitress_threads,
+    )
 
 
 if __name__ == '__main__':
     main()
-

@@ -11516,7 +11516,7 @@ class MiroFishRuntimeManager:
             return False
         try:
             result = subprocess.run(
-                [python_bin, "-c", "import flask, flask_cors, dotenv, pydantic"],
+                [python_bin, "-c", "import flask, flask_cors, dotenv, pydantic, waitress"],
                 cwd=str(MIROFISH_BACKEND_DIR),
                 capture_output=True,
                 text=True,
