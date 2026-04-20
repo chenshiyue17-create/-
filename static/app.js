@@ -2901,6 +2901,16 @@ function renderAnalysisState(analysis, runtimeState = {}) {
   const data = sanitizeAnalysisForSwingOnly(analysis || {});
   const runtime = runtimeState && typeof runtimeState === "object" ? runtimeState : {};
   const refreshAt = data.lastAnalyzedAt || runtime.lastCycleAt || "";
+  const predictedNet = Number(data.predictedNetPct ?? NaN);
+  const requiredNet = Number(data.requiredPredictedNetPct ?? NaN);
+  const predictedNetDeficit = Number(data.predictedNetDeficitPct ?? NaN);
+  const nearThresholdReady = Boolean(data.nearThresholdReady);
+  const selectedSymbol = String(data.selectedWatchlistSymbol || "").trim();
+  const selectedFromMarket = Boolean(data.selectedFromMarketScan);
+  const candidateCount = Number(data.candidateCount || 0);
+  const watchlistViableCount = Number(data.watchlistViableCount || 0);
+  const marketCandidateCount = Number(data.marketCandidateCount || 0);
+  const marketViableCount = Number(data.marketViableCount || 0);
   $("analysis-decision").textContent =
     data.decisionLabel
       ? `${data.decisionLabel}${data.selectedScore ? ` · 分数 ${data.selectedScore}` : ""}`
@@ -2944,6 +2954,31 @@ function renderAnalysisState(analysis, runtimeState = {}) {
               ].filter(Boolean).join(" · ")
         )
       : "等待最新分析时间";
+  const thresholdBits = [];
+  if (Number.isFinite(predictedNet) && Number.isFinite(requiredNet)) {
+    thresholdBits.push(`净优势 ${formatPercentValue(predictedNet)} / 门槛 ${formatPercentValue(requiredNet)}`);
+  }
+  if (nearThresholdReady) {
+    thresholdBits.push(
+      Number.isFinite(predictedNetDeficit)
+        ? `近阈值放行 · 差值 ${formatPercentValue(predictedNetDeficit)}`
+        : "近阈值放行已激活"
+    );
+  } else if (Number.isFinite(predictedNetDeficit) && predictedNetDeficit > 0) {
+    thresholdBits.push(`还差 ${formatPercentValue(predictedNetDeficit)}`);
+  }
+  $("analysis-threshold").textContent =
+    thresholdBits.join(" · ") || "等待净优势与门槛差值";
+  const candidateBits = [];
+  if (selectedSymbol) {
+    candidateBits.push(`${selectedFromMarket ? "市场轮动" : "主盯标"} ${selectedSymbol}`);
+  }
+  candidateBits.push(`watchlist 真候选 ${candidateCount}`);
+  if (watchlistViableCount > 0) candidateBits.push(`watchlist 近候选 ${watchlistViableCount}`);
+  candidateBits.push(`市场真候选 ${marketCandidateCount}`);
+  if (marketViableCount > 0) candidateBits.push(`市场近候选 ${marketViableCount}`);
+  $("analysis-candidate").textContent =
+    candidateBits.join(" · ") || "等待候选池快照";
   const reasonBits = [];
   if (data.summary) reasonBits.push(data.summary);
   if (data.blockers?.length) reasonBits.push(`阻断: ${data.blockers.join("；")}`);
@@ -2958,6 +2993,10 @@ function renderAnalysisState(analysis, runtimeState = {}) {
     pill.textContent = "允许执行";
     pill.style.color = "var(--success)";
     pill.style.borderColor = "rgba(105, 240, 174, 0.22)";
+  } else if (nearThresholdReady) {
+    pill.textContent = "近阈值待放行";
+    pill.style.color = "var(--accent)";
+    pill.style.borderColor = "rgba(255, 184, 77, 0.28)";
   } else if (data.decision === "observe") {
     pill.textContent = "观察中";
     pill.style.color = "var(--accent)";
