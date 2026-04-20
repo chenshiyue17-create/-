@@ -1816,6 +1816,7 @@ function renderMirofishOptimization(optimization = {}, autopilot = {}) {
   const applied = Boolean(snapshot.applied);
   const quaternionSummary = buildQuaternionSummary(snapshot);
   const bestConfig = snapshot.bestConfig && typeof snapshot.bestConfig === "object" ? snapshot.bestConfig : {};
+  const configDiffSummary = buildOptimizationConfigDiffSummary(snapshot);
   const focusSymbol = String(snapshot.focusSymbol || autopilotSnapshot.lastMode || "").trim();
   const ordersCount = Number(snapshot.ordersCount || autopilotSnapshot.lastOrdersCount || 0);
 
@@ -1840,6 +1841,7 @@ function renderMirofishOptimization(optimization = {}, autopilot = {}) {
   if (Number.isFinite(ordersCount) && ordersCount > 0) optSubParts.push(`订单 ${ordersCount} 笔`);
   if (focusSymbol) optSubParts.push(`焦点 ${focusSymbol}`);
   if (quaternionSummary) optSubParts.push(`四元数 ${quaternionSummary}`);
+  if (configDiffSummary) optSubParts.push(`改动 ${configDiffSummary}`);
   if (thresholdState.text) optSubParts.push(`门槛 ${thresholdState.text}`);
   if (candidateState.selectedSymbol) optSubParts.push(`候选 ${candidateState.text}`);
   $("mirofish-opt-sub").textContent = optSubParts.join(" · ")
@@ -1874,6 +1876,7 @@ function renderMirofishOptimization(optimization = {}, autopilot = {}) {
   } else if (completed) {
     resumeSubParts.push("本轮优化判断当前配置无需变更");
   }
+  if (configDiffSummary) resumeSubParts.push(`参数 ${configDiffSummary}`);
   $("mirofish-resume-sub").textContent = resumeSubParts.join(" · ")
     || "是否已回写参数、是否继续恢复量化运行，会在这里直接显示。";
 }
@@ -1894,6 +1897,7 @@ function renderDeskMirofishLoop(status = {}) {
   const optimizationRunning = Boolean(optimization.running);
   const optimizationApplied = Boolean(optimization.applied);
   const bestConfig = optimization.bestConfig && typeof optimization.bestConfig === "object" ? optimization.bestConfig : {};
+  const configDiffSummary = buildOptimizationConfigDiffSummary(optimization);
   const quaternionSummary = buildQuaternionSummary(optimization);
 
   let main = "待同步";
@@ -1963,6 +1967,7 @@ function renderDeskMirofishLoop(status = {}) {
   if (bestConfig.fastEma && bestConfig.slowEma) {
     applySubParts.push(`${bestConfig.bar || "--"} · EMA ${bestConfig.fastEma}/${bestConfig.slowEma}`);
   }
+  if (configDiffSummary) applySubParts.push(`参数 ${configDiffSummary}`);
   if (optimization.appliedAt) applySubParts.push(`回写 ${formatMirofishIso(optimization.appliedAt)}`);
   if (autopilot.nextRunAt) applySubParts.push(`下轮 ${formatMirofishIso(autopilot.nextRunAt)}`);
   if (autopilot.lastCompletedAt) applySubParts.push(`完成 ${formatMirofishIso(autopilot.lastCompletedAt)}`);
@@ -2514,6 +2519,17 @@ function buildDipSwingCandidateState(analysis = {}) {
   };
 }
 
+function buildOptimizationConfigDiffSummary(snapshot = {}, limit = 4) {
+  const diff = Array.isArray(snapshot.configDiff) ? snapshot.configDiff : [];
+  if (!diff.length) return "";
+  return diff.slice(0, limit).map((item) => {
+    const label = String(item?.label || item?.key || "参数").trim();
+    const before = String(item?.before || "--").trim() || "--";
+    const after = String(item?.after || "--").trim() || "--";
+    return `${label} ${before} → ${after}`;
+  }).join(" / ");
+}
+
 function buildSmoothPath(points) {
   if (!points.length) return "";
   if (points.length === 1) return `M ${points[0][0]} ${points[0][1]}`;
@@ -3025,8 +3041,14 @@ function renderAnalysisState(analysis, runtimeState = {}) {
     candidateState.text || "等待候选池快照";
   const reasonBits = [];
   if (data.summary) reasonBits.push(data.summary);
-  if (data.blockers?.length) reasonBits.push(`阻断: ${data.blockers.join("；")}`);
-  else if (data.warnings?.length) reasonBits.push(`提醒: ${data.warnings.join("；")}`);
+  if (Array.isArray(data.hardBlockers) && data.hardBlockers.length) {
+    reasonBits.push(`硬拦截: ${data.hardBlockers.join("；")}`);
+  }
+  if (Array.isArray(data.softBlockers) && data.softBlockers.length) {
+    reasonBits.push(`软拦截: ${data.softBlockers.join("；")}`);
+  } else if (data.warnings?.length) {
+    reasonBits.push(`提醒: ${data.warnings.join("；")}`);
+  }
   $("analysis-reason").textContent =
     reasonBits.join(" | ") || "这里只保留利润循环、观察和风控解释。";
 
@@ -5778,6 +5800,9 @@ function renderOrderTerminalFocus(selectedGroup, meta = {}) {
   const currentAnalysis = ((getCurrentAutomationState() || {}).analysis) || {};
   const thresholdState = buildDipSwingThresholdState(currentAnalysis);
   const candidateState = buildDipSwingCandidateState(currentAnalysis);
+  const blockStateLabel = String(currentAnalysis.blockStateLabel || "").trim();
+  const hardBlockers = Array.isArray(currentAnalysis.hardBlockers) ? currentAnalysis.hardBlockers : [];
+  const softBlockers = Array.isArray(currentAnalysis.softBlockers) ? currentAnalysis.softBlockers : [];
   const spotLabel = $("order-spot-label")?.textContent || `${selectedGroup.symbol}-USDT`;
   const swapLabel = $("order-swap-label")?.textContent || `${selectedGroup.symbol}-USDT-SWAP`;
   const watchlistLabel = $("order-watchlist-label")?.textContent || selectedGroup.symbol;
@@ -5836,9 +5861,11 @@ function renderOrderTerminalFocus(selectedGroup, meta = {}) {
       <div><b>异常 / 成交率</b><span>${selectedGroup.riskCount} / ${formatPercentValue(selectedGroup.successRate)}</span></div>
       <div><b>策略门槛</b><span>${escapeHtml(thresholdState.text || "等待净优势与门槛差值")}</span></div>
       <div><b>候选质量</b><span>${escapeHtml(candidateState.text || "等待候选池快照")}</span></div>
+      <div><b>阻断级别</b><span>${escapeHtml(blockStateLabel || "待分析")}</span></div>
       <div><b>订单金额</b><span>${selectedGroup.orderAmount > 0 ? `${formatMoney(selectedGroup.orderAmount)} USDT` : "--"}</span></div>
       <div><b>套利腿进度</b><span>${selectedGroup.arbOrderCount ? `开腿 ${selectedGroup.arbEntryOrders} · 对冲 ${selectedGroup.arbHedgeOrders} · 退场 ${selectedGroup.arbExitOrders} · 回滚 ${selectedGroup.arbRollbackOrders}` : "当前不是套利腿订单流"}</span></div>
       <div><b>${focusInsight ? "收益判断" : isBenignExecutionCancelReason(selectedGroup.topCancelReason) ? "最近执行提示" : "最近异常"}</b><span>${escapeHtml(focusInsight || selectedGroup.topCancelReason || "当前没有明显异常撤单")}</span></div>
+      <div class="span-wide"><b>策略阻断</b><span>${escapeHtml(hardBlockers[0] || softBlockers[0] || "当前没有新增阻断，等待下一轮分析。")}</span></div>
     </div>
   `;
 

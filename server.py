@@ -1162,6 +1162,120 @@ def deep_merge(defaults: Any, current: Any) -> Any:
     return copy.deepcopy(current)
 
 
+AUTOMATION_CONFIG_DIFF_LABELS = {
+    "watchlistSymbols": "主盯标",
+    "bar": "周期",
+    "fastEma": "快 EMA",
+    "slowEma": "慢 EMA",
+    "pollSeconds": "轮询秒数",
+    "cooldownSeconds": "冷却秒数",
+    "swapContracts": "永续张数",
+    "swapLeverage": "永续杠杆",
+    "swapStrategyMode": "永续方向",
+    "stopLossPct": "止损",
+    "takeProfitPct": "止盈",
+    "maxDailyLossPct": "日内最大回撤",
+    "targetBalanceMultiple": "目标倍数",
+    "autostart": "自动启动",
+    "allowLiveTrading": "允许实盘自动交易",
+    "allowLiveAutostart": "允许实盘自动启动",
+}
+
+
+def dedupe_text_items(values: list[Any]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = str(value or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        result.append(text)
+    return result
+
+
+def format_automation_config_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return "开启" if value else "关闭"
+    if value is None:
+        return "--"
+    if isinstance(value, (int, float, Decimal)):
+        return decimal_to_str(safe_decimal(value, "0"))
+    text = str(value).strip()
+    return text or "--"
+
+
+def build_automation_config_diff(before: dict[str, Any], after: dict[str, Any]) -> list[dict[str, str]]:
+    diff: list[dict[str, str]] = []
+    keys = list(AUTOMATION_CONFIG_DIFF_LABELS.keys())
+    for key in after.keys():
+        if key not in AUTOMATION_CONFIG_DIFF_LABELS:
+            keys.append(key)
+    for key in keys:
+        before_value = before.get(key)
+        after_value = after.get(key)
+        if before_value == after_value:
+            continue
+        diff.append(
+            {
+                "key": key,
+                "label": AUTOMATION_CONFIG_DIFF_LABELS.get(key, key),
+                "before": format_automation_config_value(before_value),
+                "after": format_automation_config_value(after_value),
+            }
+        )
+    return diff
+
+
+def summarize_analysis_block_state(
+    blockers: list[Any] | None = None,
+    warnings: list[Any] | None = None,
+    entry_vetoes: list[Any] | None = None,
+    *,
+    allow_new_entries: bool = False,
+    near_threshold_ready: bool = False,
+) -> dict[str, Any]:
+    hard_blockers = dedupe_text_items(list(blockers or []))
+    soft_blockers = dedupe_text_items(list(entry_vetoes or []) + list(warnings or []))
+    if near_threshold_ready:
+        soft_blockers.insert(0, "已进入近阈值待放行，当前主要等待执行窗口进一步确认")
+        soft_blockers = dedupe_text_items(soft_blockers)
+    if allow_new_entries and not hard_blockers:
+        return {
+            "blockState": "clear",
+            "blockStateLabel": "允许执行",
+            "hardBlockers": hard_blockers,
+            "softBlockers": soft_blockers,
+        }
+    if hard_blockers:
+        return {
+            "blockState": "hard-stop",
+            "blockStateLabel": "硬拦截",
+            "hardBlockers": hard_blockers,
+            "softBlockers": soft_blockers,
+        }
+    if near_threshold_ready:
+        return {
+            "blockState": "near-threshold",
+            "blockStateLabel": "近阈值待放行",
+            "hardBlockers": hard_blockers,
+            "softBlockers": soft_blockers,
+        }
+    if soft_blockers:
+        return {
+            "blockState": "soft-wait",
+            "blockStateLabel": "软拦截",
+            "hardBlockers": hard_blockers,
+            "softBlockers": soft_blockers,
+        }
+    return {
+        "blockState": "observe",
+        "blockStateLabel": "等待候选",
+        "hardBlockers": hard_blockers,
+        "softBlockers": soft_blockers,
+    }
+
+
 def default_automation_config() -> dict[str, Any]:
     return {
         "strategyPreset": ONLY_STRATEGY_PRESET,
@@ -1349,6 +1463,10 @@ def default_automation_state() -> dict[str, Any]:
             "openInterest": "",
             "warnings": [],
             "blockers": [],
+            "hardBlockers": [],
+            "softBlockers": [],
+            "blockState": "pending",
+            "blockStateLabel": "待分析",
         },
         "markets": {
             "spot": default_market_state(),
@@ -1386,6 +1504,8 @@ def default_automation_state() -> dict[str, Any]:
             "applied": False,
             "appliedAt": "",
             "bestConfig": {},
+            "baseConfig": {},
+            "configDiff": [],
             "researchSummary": {},
             "notes": [],
             "metrics": {},
@@ -2935,9 +3055,20 @@ def enrich_remote_dip_swing_runtime_state(
         if entry_vetoes
         else "当前为利润循环模式，但本轮候选还没过执行门槛。"
     )
+    block_state = summarize_analysis_block_state(
+        blockers,
+        analysis.get("warnings") or [],
+        entry_vetoes,
+        allow_new_entries=allow_new_entries,
+        near_threshold_ready=bool(analysis.get("nearThresholdReady")),
+    )
 
     if not analysis.get("warnings"):
         analysis["warnings"] = []
+    analysis["hardBlockers"] = block_state["hardBlockers"]
+    analysis["softBlockers"] = block_state["softBlockers"]
+    analysis["blockState"] = block_state["blockState"]
+    analysis["blockStateLabel"] = block_state["blockStateLabel"]
     sanitized["analysis"] = analysis
 
     sanitized["statusText"] = (
@@ -9509,6 +9640,13 @@ def build_dip_swing_analysis(
             and not symbol_performance_blocked
             and not symbol_taker_blocked
         )
+    block_state = summarize_analysis_block_state(
+        blockers,
+        warnings,
+        entry_vetoes,
+        allow_new_entries=allow_new_entries,
+        near_threshold_ready=near_threshold_ready,
+    )
     if blockers:
         decision = "skip"
         decision_label = "这单预计净利不够"
@@ -9605,6 +9743,10 @@ def build_dip_swing_analysis(
         "warnings": warnings,
         "blockers": blockers,
         "entryVetoes": entry_vetoes,
+        "hardBlockers": block_state["hardBlockers"],
+        "softBlockers": block_state["softBlockers"],
+        "blockState": block_state["blockState"],
+        "blockStateLabel": block_state["blockStateLabel"],
         "selectedConfig": deep_merge({}, selected_config),
         "selectedWatchlistSymbol": selected_symbol,
         "executionWatchlistSymbols": execution_symbols,
@@ -12392,11 +12534,13 @@ class StrategyAutoOptimizationManager:
             ok, message, normalized = validate_automation_config(candidate)
             if not ok:
                 raise RuntimeError(f"优化结果校验失败: {message}")
+            current_normalized = validate_automation_config(current_config)[2]
             changed = json.dumps(normalized, sort_keys=True, ensure_ascii=False) != json.dumps(
-                validate_automation_config(current_config)[2],
+                current_normalized,
                 sort_keys=True,
                 ensure_ascii=False,
             )
+            config_diff = build_automation_config_diff(current_normalized, normalized)
             if is_remote_execution_enabled(CONFIG.current()):
                 remote_response = remote_gateway_request(
                     CONFIG.current(),
@@ -12444,7 +12588,9 @@ class StrategyAutoOptimizationManager:
                 completedAt=applied_at,
                 applied=changed,
                 appliedAt=applied_at,
+                baseConfig=current_normalized,
                 bestConfig=normalized,
+                configDiff=config_diff,
                 researchSummary=copy.deepcopy(research.get("summary") or {}),
                 notes=list(research.get("notes") or []),
                 metrics={
