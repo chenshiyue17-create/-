@@ -209,10 +209,8 @@ else
   echo "使用 uv: 未找到，改走 venv 回退链路"
 fi
 echo "使用 Node: $NODE_BIN"
-echo "安装根目录依赖..."
-"$NODE_BIN" "$NPM_CLI" install
 echo "安装前端依赖..."
-( cd frontend && "$NODE_BIN" "$NPM_CLI" install )
+( cd frontend && "$NODE_BIN" "$NPM_CLI" install --no-fund --no-audit )
 echo "同步后端依赖..."
 if [ -n "$UV_BIN" ]; then
   if ! ( cd backend && "$UV_BIN" sync ); then

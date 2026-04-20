@@ -28,6 +28,7 @@ pick_node() {
 pick_npm_cli() {
   local candidate
   for candidate in \
+    /usr/lib/node_modules/npm/bin/npm-cli.js \
     /usr/local/lib/node_modules/npm/bin/npm-cli.js \
     /opt/homebrew/lib/node_modules/npm/bin/npm-cli.js \
     "$HOME/.npm-global/lib/node_modules/npm/bin/npm-cli.js"
@@ -37,6 +38,14 @@ pick_npm_cli() {
       return 0
     fi
   done
+  if command -v npm >/dev/null 2>&1; then
+    local npm_root
+    npm_root="$(npm root -g 2>/dev/null || true)"
+    if [ -n "$npm_root" ] && [ -f "$npm_root/npm/bin/npm-cli.js" ]; then
+      printf '%s\n' "$npm_root/npm/bin/npm-cli.js"
+      return 0
+    fi
+  fi
   return 1
 }
 
@@ -115,7 +124,14 @@ trap cleanup EXIT INT TERM
 
 (
   cd backend
-  uv run python run.py
+  if command -v uv >/dev/null 2>&1; then
+    uv run python run.py
+  elif [ -x .venv/bin/python ]; then
+    .venv/bin/python run.py
+  else
+    echo "未找到 uv，且 backend/.venv/bin/python 不存在，请先运行 $ROOT_DIR/scripts/mirofish-setup.sh" >&2
+    exit 1
+  fi
 ) &
 BACKEND_PID=$!
 
