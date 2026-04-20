@@ -139,6 +139,7 @@ if [ -z "$NODE_BIN" ] || [ -z "$NPM_CLI" ]; then
   exit 1
 fi
 
+UV_BIN="${UV_BIN:-}"
 export CODEX_PATH
 export UV_PYTHON="$PYTHON_BIN"
 if [ -n "$UV_BIN" ]; then
