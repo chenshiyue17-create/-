@@ -5,7 +5,12 @@ ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 MIROFISH_DIR="$ROOT_DIR/vendor/MiroFish"
 
 pick_python() {
-  for candidate in python3.12 python3.11 python3; do
+  local candidate
+  for candidate in "$ROOT_DIR/.venv/bin/python3" "$ROOT_DIR/.venv/bin/python" python3.12 python3.11 python3; do
+    if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
     if command -v "$candidate" >/dev/null 2>&1; then
       command -v "$candidate"
       return 0
