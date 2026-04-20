@@ -170,6 +170,10 @@ DIP_SWING_EST_ROUNDTRIP_COST_PCT = Decimal("0.09")
 DIP_SWING_MIN_NET_EDGE_PCT = Decimal("0.08")
 DIP_SWING_MIN_PROJECTED_NET_PCT = Decimal("0.25")
 DIP_SWING_PREDICTED_NET_COST_BUFFER_PCT = Decimal("0.07")
+DIP_SWING_NEAR_THRESHOLD_MAX_DEFICIT_PCT = Decimal("0.02")
+DIP_SWING_NEAR_THRESHOLD_MIN_EXECUTION_QUALITY = Decimal("58")
+DIP_SWING_NEAR_THRESHOLD_MIN_QUATERNION_QUALITY = Decimal("0.68")
+DIP_SWING_NEAR_THRESHOLD_MIN_QUATERNION_STABILITY = Decimal("0.58")
 DIP_SWING_MIN_IOC_PROJECTED_NET_PCT = Decimal("0.35")
 DIP_SWING_MIN_IOC_PROJECTED_NET_USDT = Decimal("2")
 DIP_SWING_MAX_IOC_TAKER_FILL_PCT = Decimal("55")
@@ -6122,6 +6126,41 @@ def required_profit_loop_net_pct(execution_cost_floor_pct: Decimal) -> Decimal:
     )
 
 
+def dip_swing_near_threshold_ready(
+    *,
+    predicted_net_pct: Decimal,
+    required_predicted_net_pct: Decimal,
+    execution_quality_score: Decimal,
+    quaternion_quality: Decimal,
+    quaternion_stability: Decimal,
+    liquidity_ready: bool,
+    edge_cost_ready: bool,
+    range_cost_ready: bool,
+    atr_cost_ready: bool,
+    symbol_performance_blocked: bool = False,
+    symbol_taker_blocked: bool = False,
+    symbol_pressure_blocked: bool = False,
+) -> tuple[bool, Decimal]:
+    predicted = max(safe_decimal(predicted_net_pct, "0"), Decimal("0"))
+    required = max(safe_decimal(required_predicted_net_pct, "0"), Decimal("0"))
+    deficit = max(required - predicted, Decimal("0"))
+    ready = (
+        deficit > 0
+        and deficit <= DIP_SWING_NEAR_THRESHOLD_MAX_DEFICIT_PCT
+        and safe_decimal(execution_quality_score, "0") >= DIP_SWING_NEAR_THRESHOLD_MIN_EXECUTION_QUALITY
+        and safe_decimal(quaternion_quality, "0") >= DIP_SWING_NEAR_THRESHOLD_MIN_QUATERNION_QUALITY
+        and safe_decimal(quaternion_stability, "0") >= DIP_SWING_NEAR_THRESHOLD_MIN_QUATERNION_STABILITY
+        and liquidity_ready
+        and edge_cost_ready
+        and range_cost_ready
+        and atr_cost_ready
+        and not symbol_performance_blocked
+        and not symbol_taker_blocked
+        and not symbol_pressure_blocked
+    )
+    return ready, deficit
+
+
 def liquidation_buffer_pct(last_price: Decimal, liq_price: Decimal, position_side: str) -> Decimal:
     if liq_price <= 0 or last_price <= 0:
         return Decimal("0")
@@ -9191,6 +9230,20 @@ def build_dip_swing_analysis(
     quaternion_maker_bias = bool(quaternion_snapshot.get("makerBias"))
     quaternion_allow_aggressive_entry = bool(quaternion_snapshot.get("allowAggressiveEntry"))
     required_predicted_net_pct = base_required_predicted_net_pct + quaternion_required_edge_boost_pct
+    near_threshold_ready, predicted_net_deficit_pct = dip_swing_near_threshold_ready(
+        predicted_net_pct=predicted_net_pct,
+        required_predicted_net_pct=required_predicted_net_pct,
+        execution_quality_score=execution_quality_score,
+        quaternion_quality=quaternion_quality,
+        quaternion_stability=quaternion_stability,
+        liquidity_ready=liquidity_ready,
+        edge_cost_ready=edge_cost_ready,
+        range_cost_ready=range_cost_ready,
+        atr_cost_ready=atr_cost_ready,
+        symbol_performance_blocked=symbol_performance_blocked,
+        symbol_taker_blocked=symbol_taker_blocked,
+        symbol_pressure_blocked=symbol_pressure_blocked,
+    )
     loop_quality_score = safe_decimal(loop_metrics.get("loopQualityScore"), "0")
     candidate_count = len(watchlist_entry_ready_snapshots)
     market_candidate_count = len(market_entry_ready_snapshots)
@@ -9399,6 +9452,11 @@ def build_dip_swing_analysis(
         f" · 漂移惩罚 {compact_metric(quaternion_drift_penalty, '0.001')}"
         f" · 主导 {str(quaternion_snapshot.get('dominantLabel') or '--')}"
     )
+    if near_threshold_ready:
+        warnings.append(
+            f"{selected_symbol} 进入近阈值放行窗口：净优势只差 {compact_metric(predicted_net_deficit_pct, '0.001')}%，"
+            " 但执行质量和流动性达标，允许继续观察并准备执行"
+        )
 
     ignored_blockers = list(blockers)
     if aggressive_scalp_mode and blockers:
@@ -9409,7 +9467,7 @@ def build_dip_swing_analysis(
         blockers.append(
             f"预计这单净赚只有 {format_decimal(projected_entry_net_pnl, 2)}U，达不到每单 {format_decimal(DIP_SWING_NET_TARGET_USDT, 0)}U"
         )
-    if position_side == "flat" and predicted_net_pct < required_predicted_net_pct:
+    if position_side == "flat" and predicted_net_pct < required_predicted_net_pct and not near_threshold_ready:
         blockers.append(
             f"预期净优势只有 {compact_metric(predicted_net_pct, '0.001')}%，低于开仓门槛 {compact_metric(required_predicted_net_pct, '0.001')}%"
         )
@@ -9447,7 +9505,7 @@ def build_dip_swing_analysis(
             not blockers
             and
             projected_entry_net_pnl >= DIP_SWING_NET_TARGET_USDT
-            and predicted_net_pct >= required_predicted_net_pct
+            and (predicted_net_pct >= required_predicted_net_pct or near_threshold_ready)
             and not symbol_performance_blocked
             and not symbol_taker_blocked
         )
@@ -9565,6 +9623,8 @@ def build_dip_swing_analysis(
         "predictedMovePct": compact_metric(predicted_move_pct, "0.01"),
         "predictedNetPct": compact_metric(predicted_net_pct, "0.01"),
         "projectedEntryNetPnl": compact_metric(projected_entry_net_pnl, "0.01"),
+        "predictedNetDeficitPct": compact_metric(predicted_net_deficit_pct, "0.001"),
+        "nearThresholdReady": near_threshold_ready,
         "projectedEntryNotional": compact_metric(projected_entry_notional, "0.01"),
         "profitTargetUsdt": format_decimal(DIP_SWING_NET_TARGET_USDT, 0),
         "loopQualityScore": compact_metric(loop_quality_score, "0.1"),
@@ -15100,7 +15160,21 @@ class AutomationEngine:
             max(predicted_net_pct, Decimal("0")),
             max(net_edge_pct, Decimal("0")),
         )
-        predicted_net_ready = effective_projected_net_pct >= required_predicted_net_pct
+        near_threshold_ready, predicted_net_deficit_pct = dip_swing_near_threshold_ready(
+            predicted_net_pct=effective_projected_net_pct,
+            required_predicted_net_pct=required_predicted_net_pct,
+            execution_quality_score=execution_quality_score,
+            quaternion_quality=quaternion_quality,
+            quaternion_stability=quaternion_stability,
+            liquidity_ready=liquidity_ready,
+            edge_cost_ready=edge_cost_ready,
+            range_cost_ready=range_cost_ready,
+            atr_cost_ready=atr_cost_ready,
+            symbol_performance_blocked=symbol_performance_blocked,
+            symbol_taker_blocked=symbol_taker_blocked,
+            symbol_pressure_blocked=symbol_pressure_blocked,
+        )
+        predicted_net_ready = effective_projected_net_pct >= required_predicted_net_pct or near_threshold_ready
         entry_projection = estimate_profit_loop_entry_net_pnl(
             planned_contracts=trade_contracts,
             last_price=last_price,
@@ -15163,6 +15237,10 @@ class AutomationEngine:
         )
         if symbol_cycle_blocked:
             status_text += f" / 闭环拦截 {symbol_cycle_block_reason}"
+        if near_threshold_ready:
+            status_text += (
+                f" / 近阈值放行 {compact_metric(predicted_net_deficit_pct, '0.001')}%"
+            )
         if liq_buffer > 0 and not aggressive_scalp_mode:
             status_text += f" / 强平缓冲 {compact_metric(liq_buffer, '0.1')}%"
         if safe_decimal(target_snapshot.get("targetEq"), "0") > 0 and not aggressive_scalp_mode:
@@ -15541,7 +15619,8 @@ class AutomationEngine:
                 {
                     "lastMessage": (
                         f"{ONLY_STRATEGY_LABEL}预期净优势 {compact_metric(effective_projected_net_pct, '0.01')}%"
-                        f" 低于开仓门槛 {compact_metric(required_predicted_net_pct, '0.01')}%，不开仓"
+                        f" 低于开仓门槛 {compact_metric(required_predicted_net_pct, '0.01')}%"
+                        f" · 差值 {compact_metric(predicted_net_deficit_pct, '0.001')}%，不开仓"
                     )
                 },
             )
