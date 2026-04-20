@@ -10786,7 +10786,7 @@ class MiroFishRuntimeManager:
         return values
 
     def _frontend_deps_ready(self) -> bool:
-        return (MIROFISH_FRONTEND_DIR / "node_modules").exists()
+        return (MIROFISH_FRONTEND_DIR / "node_modules").exists() or self._frontend_dist_index().exists()
 
     def _backend_deps_ready(self) -> bool:
         return bool(self._backend_python_bin())
@@ -10961,7 +10961,7 @@ class MiroFishRuntimeManager:
 
     def ensure_started(self) -> dict[str, Any]:
         with self.lock:
-            if self._frontend_sources_stale():
+            if self._frontend_sources_stale() and (MIROFISH_FRONTEND_DIR / "node_modules").exists():
                 self._build_frontend_locked()
             self._start_backend_locked()
             return self.snapshot()
@@ -11003,13 +11003,14 @@ class MiroFishRuntimeManager:
                 "startedAt": self.started_at,
                 "logTail": tail_lines(MIROFISH_LOG_PATH, 40),
             }
+            frontend_runtime_ready = bool(frontend_built or status["frontendDepsReady"])
             status["setupRequired"] = not (
-                status["frontendDepsReady"]
+                frontend_runtime_ready
                 and status["backendDepsReady"]
             )
-            status["ready"] = bool(frontend_built and backend_healthy and not missing_env and not missing_commands)
+            status["ready"] = bool(frontend_runtime_ready and backend_healthy and not missing_env and not missing_commands)
             status["launchable"] = bool(
-                status["frontendDepsReady"]
+                frontend_runtime_ready
                 and status["backendDepsReady"]
                 and env_exists
                 and not missing_env
