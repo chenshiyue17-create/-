@@ -12990,8 +12990,19 @@ class AutomationEngine:
         self._queued_swap_orders: list[dict[str, Any]] = []
         self._queued_swap_orders_lock = threading.RLock()
 
+    def is_thread_alive(self) -> bool:
+        return bool(self.thread and self.thread.is_alive() and not self.stop_event.is_set())
+
     def snapshot(self) -> dict[str, Any]:
         snapshot = self.state_store.current()
+        if bool(snapshot.get("running")) and not self.is_thread_alive():
+            snapshot["running"] = False
+            status_text = str(snapshot.get("statusText") or "").strip()
+            if not status_text or status_text == "运行中":
+                snapshot["statusText"] = "服务重启后待恢复"
+            mode_text = str(snapshot.get("modeText") or "").strip()
+            if mode_text and "待恢复" not in mode_text:
+                snapshot["modeText"] = f"{mode_text} · 循环线程未恢复"
         ok, _, automation = validate_automation_config(self.automation_store.current())
         if not ok:
             return snapshot
@@ -17213,10 +17224,34 @@ def maybe_autostart() -> None:
         AUTOMATION_ENGINE._log("error", f"自动启动失败: {exc}")
 
 
+def maybe_resume_running_automation() -> None:
+    if AUTOMATION_ENGINE.is_thread_alive():
+        return
+    persisted_state = AUTOMATION_STATE.current()
+    if not bool(persisted_state.get("running")):
+        return
+    try:
+        AUTOMATION_ENGINE.start(autostart=False)
+        AUTOMATION_ENGINE._log("info", "检测到服务重启前自动量化仍在运行，已自动恢复轮询线程。")
+    except Exception as exc:
+        error_text = f"服务重启后恢复自动量化失败: {exc}"
+        AUTOMATION_STATE.update(
+            lambda state: state.update(
+                {
+                    "running": False,
+                    "statusText": "服务重启后恢复失败",
+                    "lastError": str(exc),
+                }
+            )
+        )
+        AUTOMATION_ENGINE._log("error", error_text)
+
+
 def main() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     ensure_private_permissions(DATA_DIR, is_dir=True)
     maybe_autostart()
+    maybe_resume_running_automation()
     MIROFISH_AUTOPILOT.ensure_supervisor()
     startup_config = CONFIG.current()
     if should_run_local_okx_background_tasks(startup_config):
