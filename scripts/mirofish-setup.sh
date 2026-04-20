@@ -32,6 +32,17 @@ pick_python() {
   return 1
 }
 
+pick_uv() {
+  local candidate
+  for candidate in "${MIROFISH_UV:-}" "$HOME/.local/bin/uv" /usr/local/bin/uv /opt/homebrew/bin/uv uv; do
+    if [ -n "$candidate" ] && command -v "$candidate" >/dev/null 2>&1; then
+      command -v "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
 pick_node() {
   local candidate
   for candidate in /usr/local/bin/node /opt/homebrew/bin/node node; do
@@ -71,6 +82,23 @@ if [ -z "$PYTHON_BIN" ]; then
   exit 1
 fi
 
+ensure_uv() {
+  local uv_bin
+  uv_bin="$(pick_uv || true)"
+  if [ -n "$uv_bin" ]; then
+    printf '%s\n' "$uv_bin"
+    return 0
+  fi
+  echo "未检测到 uv，正在自动安装到 ~/.local/bin ..."
+  "$PYTHON_BIN" -m pip install --user uv
+  uv_bin="$(pick_uv || true)"
+  if [ -z "$uv_bin" ]; then
+    echo "uv 安装后仍不可用，请检查 ~/.local/bin 是否在 PATH 中。" >&2
+    exit 1
+  fi
+  printf '%s\n' "$uv_bin"
+}
+
 NODE_BIN="$(pick_node || true)"
 NPM_CLI="$(pick_npm_cli || true)"
 if [ -z "$NODE_BIN" ] || [ -z "$NPM_CLI" ]; then
@@ -78,8 +106,11 @@ if [ -z "$NODE_BIN" ] || [ -z "$NPM_CLI" ]; then
   exit 1
 fi
 
+UV_BIN="$(ensure_uv)"
+
 export CODEX_PATH
 export UV_PYTHON="$PYTHON_BIN"
+export PATH="$(dirname "$UV_BIN"):$PATH"
 export PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1
 unset PYTHONHOME PYTHONPATH PYTHONEXECUTABLE PYTHONSTARTUP VIRTUAL_ENV __PYVENV_LAUNCHER__
 
@@ -150,13 +181,14 @@ PY
 
 echo "开始安装 MiroFish 依赖..."
 echo "使用 Python: $UV_PYTHON"
+echo "使用 uv: $UV_BIN"
 echo "使用 Node: $NODE_BIN"
 echo "安装根目录依赖..."
 "$NODE_BIN" "$NPM_CLI" install
 echo "安装前端依赖..."
 ( cd frontend && "$NODE_BIN" "$NPM_CLI" install )
 echo "同步后端依赖..."
-( cd backend && uv sync )
+( cd backend && "$UV_BIN" sync )
 
 echo
 echo "MiroFish 依赖安装完成。"
