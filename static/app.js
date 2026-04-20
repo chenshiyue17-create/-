@@ -170,6 +170,16 @@ const LOCAL_REQUEST_TIMEOUT_MS = 12000;
 const BOOT_CACHE_KEY = "okx-desk-boot-cache-v4";
 const BOOT_CACHE_MAX_AGE_MS = 12 * 60 * 60 * 1000;
 const DOCK_COLLAPSE_KEY = "okx-dock-collapsed-v1";
+const POLL_INTERVALS = {
+  automationActiveMs: 5000,
+  automationIdleMs: 15000,
+  snapshotActiveMs: 15000,
+  snapshotIdleMs: 45000,
+  orderActiveMs: 3000,
+  orderIdleMs: 12000,
+  mirofishActiveMs: 5000,
+  mirofishIdleMs: 20000,
+};
 
 const MAINSTREAM_MARKETS = [
   "BTC-USDT",
@@ -491,6 +501,33 @@ function restoreDockCollapsePreference() {
     collapsed = window.localStorage.getItem(DOCK_COLLAPSE_KEY) === "1";
   } catch (_) {}
   setDockCollapsed(collapsed, { persist: false });
+}
+
+function isDocumentVisible() {
+  return typeof document === "undefined" ? true : document.visibilityState !== "hidden";
+}
+
+function getAutomationPollIntervalMs() {
+  return isDocumentVisible() ? POLL_INTERVALS.automationActiveMs : POLL_INTERVALS.automationIdleMs;
+}
+
+function getSnapshotPollIntervalMs() {
+  return isDocumentVisible() ? POLL_INTERVALS.snapshotActiveMs : POLL_INTERVALS.snapshotIdleMs;
+}
+
+function getOrderPollIntervalMs() {
+  return isDocumentVisible() ? POLL_INTERVALS.orderActiveMs : POLL_INTERVALS.orderIdleMs;
+}
+
+function getMirofishPollIntervalMs() {
+  return isDocumentVisible() ? POLL_INTERVALS.mirofishActiveMs : POLL_INTERVALS.mirofishIdleMs;
+}
+
+function restartDashboardPollers() {
+  startAutomationPolling();
+  startSnapshotPolling();
+  syncOrderPolling();
+  startMirofishPolling();
 }
 
 function hydrateOrdersFromCurrentSnapshot() {
@@ -1706,7 +1743,7 @@ function setWorkspaceView(view, { persist = true, scroll = true } = {}) {
   if (key === "mirofish") {
     refreshMirofishStatus().catch(() => {});
   }
-  syncOrderPolling();
+  restartDashboardPollers();
 }
 
 function mirofishBaseWithReload(base, forceReload = false) {
@@ -7127,7 +7164,7 @@ function startAutomationPolling() {
   }
   automationPollTimer = setInterval(() => {
     refreshAutomationState().catch(() => {});
-  }, 5000);
+  }, getAutomationPollIntervalMs());
 }
 
 function startSnapshotPolling() {
@@ -7136,7 +7173,7 @@ function startSnapshotPolling() {
   }
   snapshotPollTimer = setInterval(() => {
     refreshDeskState().catch(() => {});
-  }, 15000);
+  }, getSnapshotPollIntervalMs());
 }
 
 function syncOrderPolling() {
@@ -7149,7 +7186,7 @@ function syncOrderPolling() {
   }
   orderPollTimer = setInterval(() => {
     refreshOrders().catch(() => {});
-  }, 3000);
+  }, getOrderPollIntervalMs());
 }
 
 function startMirofishPolling() {
@@ -7161,7 +7198,7 @@ function startMirofishPolling() {
     if (dashboardState.currentView === "mirofish" || autoSimulation.running) {
       refreshMirofishStatus({ preserveMessage: true }).catch(() => {});
     }
-  }, 5000);
+  }, getMirofishPollIntervalMs());
 }
 
 async function boot() {
@@ -7702,6 +7739,9 @@ async function boot() {
       tunnelBgState.cleanup();
       tunnelBgState = null;
     }
+  });
+  document.addEventListener("visibilitychange", () => {
+    restartDashboardPollers();
   });
 }
 

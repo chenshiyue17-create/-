@@ -1,4 +1,5 @@
 import Cocoa
+import CryptoKit
 import Foundation
 import WebKit
 
@@ -282,6 +283,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
         }
     }
 
+    private func shouldSkipRuntimeFingerprintPath(relativePath: String) -> Bool {
+        let normalized = relativePath.replacingOccurrences(of: "\\", with: "/")
+        let parts = normalized.split(separator: "/").map(String.init)
+        if parts.contains("node_modules") { return true }
+        if parts.contains("dist") { return true }
+        if parts.contains("__pycache__") { return true }
+        if parts.contains(".pytest_cache") { return true }
+        if parts.contains(".mypy_cache") { return true }
+        if parts.contains(".ruff_cache") { return true }
+        if parts.contains(".cache") { return true }
+        if parts.contains("coverage") { return true }
+        if normalized.contains("/vendor/MiroFish/backend/.venv/") { return true }
+        if normalized.hasPrefix("vendor/MiroFish/backend/.venv/") { return true }
+        if normalized.contains("/vendor/MiroFish/frontend/node_modules/") { return true }
+        if normalized.hasPrefix("vendor/MiroFish/frontend/node_modules/") { return true }
+        return false
+    }
+
     private func runtimeSourceStamp(for sourceURL: URL) throws -> String {
         let fileManager = FileManager.default
         let interestingRoots = [
@@ -290,9 +309,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
             sourceURL.appendingPathComponent("scripts", isDirectory: true),
             sourceURL.appendingPathComponent("vendor", isDirectory: true),
         ]
-        var totalBytes: UInt64 = 0
-        var latestTimestamp: TimeInterval = 0
-        var fileCount = 0
+        var entries: [String] = []
 
         for root in interestingRoots {
             var isDirectory: ObjCBool = false
@@ -306,19 +323,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
                 for case let url as URL in enumerator {
                     let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .contentModificationDateKey, .fileSizeKey])
                     if values?.isDirectory == true { continue }
-                    fileCount += 1
-                    totalBytes += UInt64(values?.fileSize ?? 0)
-                    latestTimestamp = max(latestTimestamp, values?.contentModificationDate?.timeIntervalSince1970 ?? 0)
+                    let relativePath = url.path.replacingOccurrences(of: sourceURL.path + "/", with: "")
+                    if shouldSkipRuntimeFingerprintPath(relativePath: relativePath) { continue }
+                    let fileSize = values?.fileSize ?? 0
+                    let timestamp = values?.contentModificationDate?.timeIntervalSince1970 ?? 0
+                    entries.append("\(relativePath)|\(fileSize)|\(String(format: "%.6f", timestamp))")
                 }
             } else {
                 let values = try? root.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
-                fileCount += 1
-                totalBytes += UInt64(values?.fileSize ?? 0)
-                latestTimestamp = max(latestTimestamp, values?.contentModificationDate?.timeIntervalSince1970 ?? 0)
+                let relativePath = root.lastPathComponent
+                if shouldSkipRuntimeFingerprintPath(relativePath: relativePath) { continue }
+                let fileSize = values?.fileSize ?? 0
+                let timestamp = values?.contentModificationDate?.timeIntervalSince1970 ?? 0
+                entries.append("\(relativePath)|\(fileSize)|\(String(format: "%.6f", timestamp))")
             }
         }
 
-        return "\(sourceURL.path)|\(fileCount)|\(totalBytes)|\(Int(latestTimestamp))"
+        entries.sort()
+        let payload = entries.joined(separator: "\n")
+        let digest = SHA256.hash(data: Data(payload.utf8))
+        let digestHex = digest.map { String(format: "%02x", $0) }.joined()
+        return "\(sourceURL.path)|\(entries.count)|\(digestHex)"
     }
 
     private func terminateManagedEmbeddedServices(runtimeSource: RuntimeAppSource) -> Bool {
