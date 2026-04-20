@@ -4462,6 +4462,16 @@ function formatOrderTime(value) {
   });
 }
 
+function isSameLocalOrderDay(timestampValue, dayIso = "") {
+  const rawDay = String(dayIso || "").trim();
+  const stamp = Number(timestampValue || 0);
+  if (!rawDay || !Number.isFinite(stamp) || stamp <= 0) return false;
+  const date = new Date(stamp);
+  if (Number.isNaN(date.getTime())) return false;
+  const localIso = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+  return localIso === rawDay;
+}
+
 function renderOrderTimeStackText(text) {
   const raw = String(text || "").trim();
   if (!raw || raw === "--") return "--";
@@ -5410,13 +5420,23 @@ function renderOrderTerminalToolbar(groups, hasVisibleGroups = true) {
     : marketFilter === "swap"
       ? "只看永续"
       : "现货 + 永续";
+  const journal = getCurrentExecutionJournal() || {};
+  const todayIso = String(journal.today || "").trim();
+  const todayOrderCount = Number(journal.todayOrderCount ?? 0);
+  const latestOrderAt = String(journal.latestOrderAt || "").trim();
+  const latestIsToday = isSameLocalOrderDay(latestOrderAt, todayIso);
+  const timeSummary = latestOrderAt
+    ? (latestIsToday
+      ? `今天 ${todayOrderCount} 笔`
+      : `今天 0 笔 · 最近一笔 ${formatOrderTime(latestOrderAt)}`)
+    : "今天暂无订单";
   target.className = "order-terminal-toolbar";
   target.innerHTML = `
     <div class="order-terminal-toolbar-main">
       <div class="order-terminal-toolbar-copy">
         <span class="order-terminal-toolbar-eyebrow">订单流控制台</span>
         <strong>${escapeHtml(selected.symbol)} · ${escapeHtml(filterLabel)} · ${escapeHtml(marketLabel)}</strong>
-        <small>${selected.orderCount} 笔订单 · ${selected.scopeLabel} · ${selected.latestInstId}${hasVisibleGroups ? "" : " · 当前筛选无匹配订单"}</small>
+        <small>${selected.orderCount} 笔订单 · ${selected.scopeLabel} · ${selected.latestInstId} · ${escapeHtml(timeSummary)}${hasVisibleGroups ? "" : " · 当前筛选无匹配订单"}</small>
       </div>
       <button class="btn btn-ghost order-toolbar-clear-focus" type="button">清除聚焦</button>
     </div>
@@ -5486,6 +5506,15 @@ function renderOrderGlobalSummary(groups) {
   const arbNetPnl = Number(journal.arbNetPnl ?? (arbRealizedPnl + arbTotalFees));
   const totalFees = Number(journal.totalFees ?? 0);
   const netResult = Number(journal.netPnl ?? (realized + totalFees));
+  const todayIso = String(journal.today || "").trim();
+  const todayOrderCount = Number(journal.todayOrderCount ?? 0);
+  const latestOrderAt = String(journal.latestOrderAt || "").trim();
+  const latestIsToday = isSameLocalOrderDay(latestOrderAt, todayIso);
+  const todaySummary = latestOrderAt
+    ? (latestIsToday
+      ? `今天订单 ${todayOrderCount} 笔`
+      : `今天订单 0 笔 · 最近一笔 ${formatOrderTime(latestOrderAt)}`)
+    : "今天还没有订单";
   const successRate = totalCount ? (filledCount / totalCount) * 100 : execution.successRate;
   const totalTone = netResult > 0 ? "positive" : netResult < 0 ? "negative" : "muted";
   const realizedTone = realized > 0 ? "positive" : realized < 0 ? "negative" : "muted";
@@ -5513,7 +5542,7 @@ function renderOrderGlobalSummary(groups) {
       <div>
         <span class="order-global-summary-eyebrow">组合订单收益总览</span>
         <strong class="tone-${totalTone}">${formatSignedMoney(netResult)} USDT</strong>
-        <small>${activeSymbols} 个币种 · ${visibleOrders} 笔当前可见订单 · 账本成交 ${filledCount} / 异常 ${riskCount}${arbOrderCount ? ` · 套利 ${arbOrderCount} 笔` : ""}</small>
+        <small>${activeSymbols} 个币种 · ${visibleOrders} 笔当前可见订单 · 账本成交 ${filledCount} / 异常 ${riskCount}${arbOrderCount ? ` · 套利 ${arbOrderCount} 笔` : ""} · ${escapeHtml(todaySummary)}</small>
       </div>
     </div>
     <div class="order-global-summary-hero-grid">

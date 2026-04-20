@@ -2400,6 +2400,13 @@ def compose_runtime_snapshot_payload(
 ) -> dict[str, Any]:
     state = copy.deepcopy(automation_state or {})
     journal = copy.deepcopy(execution_journal or {})
+    journal_day_stats = build_execution_journal_day_stats(journal.get("orders") or [])
+    state["today"] = str(journal_day_stats.get("today") or datetime.now().date().isoformat())
+    state["orderCountToday"] = int(journal_day_stats.get("todayOrderCount") or 0)
+    if journal_day_stats.get("latestOrderAt"):
+        state["lastOrderAt"] = str(journal_day_stats.get("latestOrderAt") or "")
+    if journal_day_stats.get("latestOrderDay"):
+        state["lastOrderDay"] = str(journal_day_stats.get("latestOrderDay") or "")
     account = copy.deepcopy(account_payload or {}) or synthesize_runtime_account_payload(state)
     state["executionJournal"] = journal
     state["equityDisplay"] = build_equity_display(
@@ -2442,8 +2449,14 @@ def slice_execution_journal_snapshot(
         reverse=True,
     )
     effective_limit = max(1, int(limit or 80))
-    limited_orders = orders[:effective_limit]
+    full_orders = list(orders)
+    limited_orders = full_orders[:effective_limit]
     summary = build_execution_journal_summary(limited_orders)
+    day_stats = build_execution_journal_day_stats(full_orders)
+    summary["today"] = str(day_stats.get("today") or "")
+    summary["todayOrderCount"] = int(day_stats.get("todayOrderCount") or 0)
+    summary["latestOrderAt"] = str(day_stats.get("latestOrderAt") or "")
+    summary["latestOrderDay"] = str(day_stats.get("latestOrderDay") or "")
     return {
         "orders": limited_orders,
         "summary": {key: value for key, value in summary.items() if key != "symbols"},
@@ -3717,6 +3730,39 @@ def order_event_timestamp_ms(order: dict[str, Any]) -> int:
         if value > 0:
             return value
     return 0
+
+
+def local_order_day_iso_from_ms(timestamp_ms: int) -> str:
+    if int(timestamp_ms or 0) <= 0:
+        return ""
+    try:
+        return datetime.fromtimestamp(int(timestamp_ms) / 1000).date().isoformat()
+    except Exception:
+        return ""
+
+
+def build_execution_journal_day_stats(orders: list[dict[str, Any]]) -> dict[str, Any]:
+    normalized_orders = [normalize_execution_order(item) for item in (orders or [])]
+    today = datetime.now().date().isoformat()
+    today_count = 0
+    latest_timestamp_ms = 0
+    latest_day = ""
+    for order in normalized_orders:
+        stamp = order_event_timestamp_ms(order)
+        if stamp <= 0:
+            continue
+        order_day = local_order_day_iso_from_ms(stamp)
+        if order_day == today:
+            today_count += 1
+        if stamp >= latest_timestamp_ms:
+            latest_timestamp_ms = stamp
+            latest_day = order_day
+    return {
+        "today": today,
+        "todayOrderCount": int(today_count),
+        "latestOrderAt": str(latest_timestamp_ms) if latest_timestamp_ms > 0 else "",
+        "latestOrderDay": latest_day,
+    }
 
 
 def build_execution_symbol_pressure_snapshot(
