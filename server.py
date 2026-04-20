@@ -57,6 +57,10 @@ from strategy_execution_gate import (
     DIP_SWING_SYMBOL_MAX_TAKER_FILL_PCT,
     build_dip_swing_relu_gate,
 )
+from strategy_auto_optimization import (
+    StrategyAutoOptimizationDependencies,
+    StrategyAutoOptimizationManager,
+)
 from strategy_research_review import review_research_candidates_with_execution_gate
 from trade_quaternion import build_execution_quaternion, build_research_quaternion
 
@@ -12521,276 +12525,6 @@ class MiroFishAutoSimulationManager:
         return state
 
 
-def attempt_resume_automation_after_optimization() -> dict[str, Any]:
-    config = CONFIG.current()
-    result = {
-        "attempted": False,
-        "started": False,
-        "alreadyRunning": False,
-        "remote": is_remote_execution_enabled(config),
-        "stateSource": "",
-        "detail": "",
-    }
-    if not normalize_mirofish_autopilot_config(MIROFISH_AUTOPILOT_CONFIG.current()).get("autoResumeAutomation", True):
-        result["detail"] = "自动恢复量化运行已关闭。"
-        return result
-    if result["remote"]:
-        result["attempted"] = True
-        try:
-            state_response = remote_gateway_request(
-                config,
-                "GET",
-                "/api/automation/state",
-                timeout=6.0,
-            )
-            state_payload = state_response.json() if state_response.content else {}
-            state = state_payload.get("state") or {}
-            result["stateSource"] = str(state_payload.get("remoteStateSource") or state.get("stateSource") or "")
-            if bool(state.get("running")):
-                result["started"] = True
-                result["alreadyRunning"] = True
-                result["detail"] = "远端量化引擎已在运行，无需重复启动。"
-                return result
-            start_response = remote_gateway_request(
-                config,
-                "POST",
-                "/api/automation/start",
-                body=b"{}",
-                content_type="application/json; charset=utf-8",
-                timeout=10.0,
-            )
-            start_payload = start_response.json() if start_response.content else {}
-            if not start_response.ok or start_payload.get("ok") is False:
-                raise RuntimeError(str(start_payload.get("error") or f"远端返回 {start_response.status_code}"))
-            result["started"] = True
-            result["detail"] = "已自动恢复远端量化运行。"
-            return result
-        except Exception as exc:
-            result["detail"] = f"自动恢复远端量化运行失败: {exc}"
-            return result
-    result["attempted"] = True
-    if AUTOMATION_ENGINE.snapshot().get("running"):
-        result["started"] = True
-        result["alreadyRunning"] = True
-        result["detail"] = "本地量化引擎已在运行，无需重复启动。"
-        return result
-    try:
-        AUTOMATION_ENGINE.start(autostart=False)
-    except Exception as exc:
-        result["detail"] = f"自动恢复本地量化运行失败: {exc}"
-        return result
-    result["started"] = True
-    result["detail"] = "已自动恢复本地量化运行。"
-    return result
-
-
-class StrategyAutoOptimizationManager:
-    def __init__(self) -> None:
-        self.lock = threading.RLock()
-        self.state = self._blank_state()
-
-    def _blank_state(self) -> dict[str, Any]:
-        return {
-            "running": False,
-            "phase": "idle",
-            "message": "等待自动推演完成后再执行策略优化。",
-            "startedAt": "",
-            "updatedAt": "",
-            "completedAt": "",
-            "error": "",
-            "optimizationId": "",
-            "sourceSimulationId": "",
-            "focusSymbol": "",
-            "ordersCount": 0,
-            "applied": False,
-            "appliedAt": "",
-            "bestConfig": {},
-            "researchSummary": {},
-            "researchPipeline": {},
-            "executionOverlay": {},
-            "notes": [],
-            "metrics": {},
-        }
-
-    def snapshot(self) -> dict[str, Any]:
-        with self.lock:
-            return copy.deepcopy(self.state)
-
-    def _sync_automation_state(self) -> None:
-        try:
-            state_snapshot = self.snapshot()
-            AUTOMATION_STATE.update(lambda current: current.update({"strategyOptimization": state_snapshot}))
-        except Exception:
-            return
-
-    def _update(self, **patch: Any) -> dict[str, Any]:
-        with self.lock:
-            next_state = copy.deepcopy(self.state)
-            next_state.update({k: v for k, v in patch.items() if v is not None})
-            next_state["updatedAt"] = now_local_iso()
-            self.state = next_state
-        self._sync_automation_state()
-        return self.snapshot()
-
-    def _set_running(
-        self,
-        *,
-        simulation_id: str,
-        focus_symbol: str,
-        orders_count: int,
-    ) -> dict[str, Any]:
-        with self.lock:
-            if self.state.get("running"):
-                raise RuntimeError("已有策略优化任务在运行。")
-            self.state = self._blank_state()
-            self.state.update(
-                {
-                    "running": True,
-                    "phase": "preparing",
-                    "message": "正在根据最新推演结果和订单快照生成优化方案。",
-                    "startedAt": now_local_iso(),
-                    "updatedAt": now_local_iso(),
-                    "optimizationId": f"opt_{secrets.token_hex(5)}",
-                    "sourceSimulationId": simulation_id,
-                    "focusSymbol": focus_symbol,
-                    "ordersCount": orders_count,
-                }
-            )
-        self._sync_automation_state()
-        return self.snapshot()
-
-    def reset_for_simulation(self, *, simulation_id: str, focus_symbol: str, orders_count: int) -> dict[str, Any]:
-        with self.lock:
-            self.state = self._blank_state()
-            self.state.update(
-                {
-                    "phase": "pending-simulation",
-                    "message": "推演已启动，等待模拟完成后自动优化策略。",
-                    "sourceSimulationId": simulation_id,
-                    "focusSymbol": focus_symbol,
-                    "ordersCount": orders_count,
-                    "updatedAt": now_local_iso(),
-                }
-            )
-        self._sync_automation_state()
-        return self.snapshot()
-
-    def run(
-        self,
-        *,
-        mode: str,
-        simulation_id: str,
-        focus_symbol: str,
-        orders_count: int,
-        simulation_result: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        self._set_running(
-            simulation_id=simulation_id,
-            focus_symbol=focus_symbol,
-            orders_count=orders_count,
-        )
-        try:
-            current_config = AUTOMATION_CONFIG.current()
-            self._update(phase="optimizing", message="正在回测并搜索更优参数。")
-            research = research_optimize(
-                current_config,
-                runtime_research_options(current_config),
-                build_public_client(CONFIG.current()),
-            )
-            best_config = deep_merge({}, research.get("bestConfig") or current_config)
-            candidate = merge_optimized_automation_config(current_config, best_config)
-            ok, message, normalized = validate_automation_config(candidate)
-            if not ok:
-                raise RuntimeError(f"优化结果校验失败: {message}")
-            current_normalized = validate_automation_config(current_config)[2]
-            changed = json.dumps(normalized, sort_keys=True, ensure_ascii=False) != json.dumps(
-                current_normalized,
-                sort_keys=True,
-                ensure_ascii=False,
-            )
-            config_diff = build_automation_config_diff(current_normalized, normalized)
-            if is_remote_execution_enabled(CONFIG.current()):
-                remote_response = remote_gateway_request(
-                    CONFIG.current(),
-                    "POST",
-                    "/api/automation/config",
-                    body=json.dumps(normalized, ensure_ascii=False).encode("utf-8"),
-                    content_type="application/json; charset=utf-8",
-                    timeout=20.0,
-                )
-                remote_payload = remote_response.json() if remote_response.content else {}
-                if not remote_response.ok or remote_payload.get("ok") is False:
-                    remote_error = remote_payload.get("error") or f"远端返回 {remote_response.status_code}"
-                    raise RuntimeError(f"远端策略配置回写失败: {remote_error}")
-                mirrored = normalize_remote_automation_config_payload(remote_payload, normalized)
-                AUTOMATION_CONFIG.replace(mirrored)
-            else:
-                AUTOMATION_CONFIG.replace(normalized)
-            applied_at = now_local_iso()
-            resume_result = {}
-            if normalize_mirofish_autopilot_config(MIROFISH_AUTOPILOT_CONFIG.current()).get("autoResumeAutomation", True):
-                self._update(phase="resuming-automation", message="最佳参数已写回，正在恢复量化运行。")
-                resume_result = attempt_resume_automation_after_optimization()
-            applied_strategy = {
-                "stage": "strategy-optimization",
-                "title": "自动推演已回写策略",
-                "detail": (
-                    f"来源模拟 {simulation_id} · 焦点 {focus_symbol or '未指定'} · "
-                    f"EMA {normalized.get('fastEma')}/{normalized.get('slowEma')} · "
-                    f"{normalized.get('swapStrategyMode')} · 杠杆 {normalized.get('swapLeverage')}x"
-                ),
-                "appliedAt": applied_at,
-            }
-            final_state = self._update(
-                running=False,
-                phase="completed",
-                message=(
-                    "策略优化完成，最佳配置已自动回写并恢复量化运行。"
-                    if resume_result.get("started")
-                    else (
-                        f"策略优化完成，最佳配置已自动回写；{resume_result.get('detail')}"
-                        if resume_result.get("detail")
-                        else "策略优化完成，最佳配置已自动回写。"
-                    )
-                ),
-                completedAt=applied_at,
-                applied=changed,
-                appliedAt=applied_at,
-                baseConfig=current_normalized,
-                bestConfig=normalized,
-                configDiff=config_diff,
-                researchSummary=copy.deepcopy(research.get("summary") or {}),
-                researchPipeline=copy.deepcopy(research.get("pipeline") or {}),
-                executionOverlay=copy.deepcopy(((research.get("pipeline") or {}).get("executionOverlay") or {})),
-                notes=list(research.get("notes") or []),
-                metrics={
-                    "sampleCount": int(research.get("sampleCount") or 0),
-                    "focusSymbol": focus_symbol,
-                    "ordersCount": orders_count,
-                    "simulationResult": simulation_result or {},
-                    "resumeResult": resume_result,
-                },
-            )
-            AUTOMATION_STATE.update(
-                lambda current: current.update(
-                    {
-                        "research": research,
-                        "lastAppliedStrategy": applied_strategy,
-                        "strategyOptimization": final_state,
-                    }
-                )
-            )
-            return final_state
-        except Exception as exc:
-            return self._update(
-                running=False,
-                phase="failed",
-                message=f"策略优化失败: {exc}",
-                completedAt=now_local_iso(),
-                error=str(exc),
-            )
-
-
 class MiroFishAutopilotManager:
     def __init__(self, config_store: JsonStore) -> None:
         self.config_store = config_store
@@ -16798,7 +16532,26 @@ MAC_LOTTO = MacLottoManager()
 AUTOMATION_ENGINE = AutomationEngine(CONFIG, AUTOMATION_CONFIG, AUTOMATION_STATE)
 PRIVATE_ORDER_STREAM = OkxPrivateOrderStream()
 MIROFISH_AUTO_SIMULATION = MiroFishAutoSimulationManager()
-STRATEGY_AUTO_OPTIMIZATION = StrategyAutoOptimizationManager()
+STRATEGY_AUTO_OPTIMIZATION = StrategyAutoOptimizationManager(
+    StrategyAutoOptimizationDependencies(
+        automation_state=AUTOMATION_STATE,
+        automation_config=AUTOMATION_CONFIG,
+        config=CONFIG,
+        mirofish_autopilot_config=MIROFISH_AUTOPILOT_CONFIG,
+        automation_engine=AUTOMATION_ENGINE,
+        now_local_iso=now_local_iso,
+        normalize_mirofish_autopilot_config=normalize_mirofish_autopilot_config,
+        is_remote_execution_enabled=is_remote_execution_enabled,
+        remote_gateway_request=remote_gateway_request,
+        research_optimize=research_optimize,
+        runtime_research_options=runtime_research_options,
+        build_public_client=build_public_client,
+        merge_optimized_automation_config=merge_optimized_automation_config,
+        validate_automation_config=validate_automation_config,
+        build_automation_config_diff=build_automation_config_diff,
+        normalize_remote_automation_config_payload=normalize_remote_automation_config_payload,
+    )
+)
 MIROFISH_AUTOPILOT = MiroFishAutopilotManager(MIROFISH_AUTOPILOT_CONFIG)
 
 
