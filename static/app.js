@@ -1765,6 +1765,28 @@ function formatMirofishIso(value) {
   });
 }
 
+function buildQuaternionSummary(source = {}) {
+  const summary = source && typeof source === "object"
+    ? ((source.researchSummary && typeof source.researchSummary === "object") ? source.researchSummary : source)
+    : {};
+  const quaternion = summary.quaternion && typeof summary.quaternion === "object" ? summary.quaternion : {};
+  const quality = Number(summary.quaternionQuality ?? quaternion.quality ?? NaN);
+  const stability = Number(summary.quaternionStability ?? quaternion.stability ?? NaN);
+  const driftPenalty = Number(summary.quaternionDriftPenalty ?? quaternion.driftPenalty ?? NaN);
+  const biasLabel = String(summary.quaternionBias || quaternion.biasLabel || "").trim();
+  const dominantLabel = String(quaternion.dominantLabel || "").trim();
+  const parts = [];
+  if (Number.isFinite(quality) || Number.isFinite(stability)) {
+    const qText = Number.isFinite(quality) ? quality.toFixed(3) : "--";
+    const sText = Number.isFinite(stability) ? stability.toFixed(3) : "--";
+    parts.push(`Q ${qText}/${sText}`);
+  }
+  if (biasLabel) parts.push(biasLabel);
+  if (dominantLabel) parts.push(`主导 ${dominantLabel}`);
+  if (Number.isFinite(driftPenalty) && driftPenalty > 0) parts.push(`漂移 ${driftPenalty.toFixed(3)}`);
+  return parts.join(" · ");
+}
+
 function syncMirofishSimulationFrame(autoSimulation = {}, options = {}) {
   const frame = $("mirofish-frame");
   if (!frame) return;
@@ -1780,12 +1802,16 @@ function syncMirofishSimulationFrame(autoSimulation = {}, options = {}) {
 function renderMirofishAutoSimulation(status = {}, options = {}) {
   if (!$("mirofish-auto-main")) return;
   const snapshot = status && typeof status === "object" ? status : {};
+  const optimization = options.optimization && typeof options.optimization === "object" ? options.optimization : {};
   const running = Boolean(snapshot.running);
   const failed = String(snapshot.phase || "") === "failed";
   const completed = String(snapshot.phase || "") === "completed";
   const modeLabel = String(snapshot.modeLabel || snapshot.mode || "").trim() || "自动推演";
   const progress = Number(snapshot.progress || 0);
   const focusSymbol = String(snapshot.focusSymbol || "").trim();
+  const quaternionSummary = buildQuaternionSummary(
+    (snapshot.result && snapshot.result.strategyOptimization) || optimization || {}
+  );
   const phaseLabelMap = {
     idle: "空闲",
     queued: "排队中",
@@ -1803,8 +1829,12 @@ function renderMirofishAutoSimulation(status = {}, options = {}) {
   $("mirofish-auto-main").textContent = running
     ? `${modeLabel}进行中`
     : (completed ? `${modeLabel}已启动` : (failed ? `${modeLabel}失败` : "待命"));
-  $("mirofish-auto-sub").textContent = String(snapshot.message || "可根据当前订单或策略一键发起自动推演。").trim()
-    || "可根据当前订单或策略一键发起自动推演。";
+  const autoSubParts = [
+    String(snapshot.message || "可根据当前订单或策略一键发起自动推演。").trim()
+      || "可根据当前订单或策略一键发起自动推演。",
+  ];
+  if (quaternionSummary) autoSubParts.push(`四元数 ${quaternionSummary}`);
+  $("mirofish-auto-sub").textContent = autoSubParts.join(" · ");
   $("mirofish-auto-stage").textContent = progress > 0 ? `${phaseLabel} · ${Math.min(100, Math.max(0, progress))}%` : phaseLabel;
 
   const metaParts = [];
@@ -1858,12 +1888,14 @@ function syncMirofishAutopilotInputs(config = {}) {
   if (minOrders && document.activeElement !== minOrders) minOrders.value = String(config.minOrdersCount || 12);
 }
 
-function renderMirofishAutopilot(status = {}) {
+function renderMirofishAutopilot(status = {}, optimization = {}) {
   if (!$("mirofish-autopilot-main")) return;
   const snapshot = status && typeof status === "object" ? status : {};
+  const optimizationSnapshot = optimization && typeof optimization === "object" ? optimization : {};
   const config = snapshot.config && typeof snapshot.config === "object" ? snapshot.config : {};
   const enabled = Boolean(config.enabled ?? snapshot.enabled);
   const statusKey = String(snapshot.status || (enabled ? "waiting" : "disabled"));
+  const quaternionSummary = buildQuaternionSummary(optimizationSnapshot);
   const statusLabelMap = {
     idle: "待启动",
     waiting: "待命中",
@@ -1892,6 +1924,7 @@ function renderMirofishAutopilot(status = {}) {
   const lastSubParts = [];
   if (snapshot.lastCompletedAt) lastSubParts.push(`完成 ${formatMirofishIso(snapshot.lastCompletedAt)}`);
   if (snapshot.lastOrdersCount) lastSubParts.push(`最近订单 ${snapshot.lastOrdersCount} 笔`);
+  if (quaternionSummary) lastSubParts.push(`四元数 ${quaternionSummary}`);
   $("mirofish-autopilot-last-sub").textContent = lastSubParts.join(" · ")
     || "最近推演模式、订单数量和任务编号会显示在这里。";
 
@@ -1909,8 +1942,11 @@ function renderMirofishStatus(status = {}, options = {}) {
   if (!$("mirofish-status-main")) return;
   const snapshot = status && typeof status === "object" ? status : {};
   dashboardState.mirofish = snapshot;
-  renderMirofishAutoSimulation(snapshot.autoSimulation || {}, options);
-  renderMirofishAutopilot(snapshot.autopilot || {});
+  renderMirofishAutoSimulation(snapshot.autoSimulation || {}, {
+    ...options,
+    optimization: snapshot.strategyOptimization || {},
+  });
+  renderMirofishAutopilot(snapshot.autopilot || {}, snapshot.strategyOptimization || {});
 
   const ready = Boolean(snapshot.ready);
   const launchable = Boolean(snapshot.launchable);
@@ -6207,9 +6243,19 @@ function renderResearchState(research) {
   $("research-best").textContent = bestConfig.fastEma
     ? `${bestConfig.bar} · EMA ${bestConfig.fastEma}/${bestConfig.slowEma}`
     : "--";
-  $("research-best-sub").textContent = bestConfig.stopLossPct
-    ? `SL ${bestConfig.stopLossPct}% / TP ${bestConfig.takeProfitPct}%${pipeline?.evolutionLoops ? ` · ${pipeline.evolutionLoops} 轮进化` : ""}${pipeline?.populationSize ? ` · 池 ${pipeline.populationSize}` : ""}${capital?.perHorseCapital ? ` · 单马约 ${Number(capital.perHorseCapital).toFixed(2)}U` : ""}`
-    : "自动优化后可直接应用";
+  if (bestConfig.stopLossPct) {
+    const bestSubParts = [
+      `SL ${bestConfig.stopLossPct}% / TP ${bestConfig.takeProfitPct}%`,
+    ];
+    if (pipeline?.evolutionLoops) bestSubParts.push(`${pipeline.evolutionLoops} 轮进化`);
+    if (pipeline?.populationSize) bestSubParts.push(`池 ${pipeline.populationSize}`);
+    if (capital?.perHorseCapital) bestSubParts.push(`单马约 ${Number(capital.perHorseCapital).toFixed(2)}U`);
+    const quaternionSummary = buildQuaternionSummary(summary);
+    if (quaternionSummary) bestSubParts.push(`四元数 ${quaternionSummary}`);
+    $("research-best-sub").textContent = bestSubParts.join(" · ");
+  } else {
+    $("research-best-sub").textContent = "自动优化后可直接应用";
+  }
 
   const board = $("research-board");
   if (!leaderboard.length) {
