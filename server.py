@@ -211,6 +211,19 @@ DIP_SWING_STALLED_POSITION_MAX_HOLD_MINUTES = 20
 DIP_SWING_STALLED_POSITION_MIN_AVAILABLE_MARGIN_USDT = Decimal("25")
 DIP_SWING_MIN_LIQ_BUFFER_PCT = Decimal("18")
 DIP_SWING_MAX_LEVERAGE = Decimal("10")
+DIP_SWING_HFT_DEFAULT_WATCHLIST = "BTC,ETH,SOL,DOGE,ARB"
+DIP_SWING_HFT_ALLOWED_BARS = ("1m", "5m")
+DIP_SWING_HFT_DEFAULT_BAR = "1m"
+DIP_SWING_HFT_MIN_FAST_EMA = 4
+DIP_SWING_HFT_MAX_FAST_EMA = 12
+DIP_SWING_HFT_MIN_SLOW_EMA = 12
+DIP_SWING_HFT_MAX_SLOW_EMA = 48
+DIP_SWING_HFT_MIN_LEVERAGE = Decimal("3")
+DIP_SWING_HFT_MAX_LEVERAGE = DIP_SWING_MAX_LEVERAGE
+DIP_SWING_HFT_MIN_STOP_LOSS_PCT = Decimal("0")
+DIP_SWING_HFT_MAX_STOP_LOSS_PCT = Decimal("2.0")
+DIP_SWING_HFT_MIN_TAKE_PROFIT_PCT = Decimal("0")
+DIP_SWING_HFT_MAX_TAKE_PROFIT_PCT = Decimal("8.0")
 OKX_DEFAULT_SWAP_MAKER_FEE_PCT = Decimal("0.02")
 OKX_DEFAULT_SWAP_TAKER_FEE_PCT = Decimal("0.05")
 OKX_DEFAULT_PASSIVE_EXIT_WEIGHT = Decimal("0.70")
@@ -1281,19 +1294,19 @@ def default_automation_config() -> dict[str, Any]:
         "strategyPreset": ONLY_STRATEGY_PRESET,
         "spotInstId": "BTC-USDT",
         "swapInstId": "BTC-USDT-SWAP",
-        "watchlistSymbols": "BTC",
+        "watchlistSymbols": DIP_SWING_HFT_DEFAULT_WATCHLIST,
         "watchlistOverrides": {},
-        "bar": "1m",
+        "bar": DIP_SWING_HFT_DEFAULT_BAR,
         "fastEma": 6,
         "slowEma": 24,
-        "pollSeconds": 5,
+        "pollSeconds": 3,
         "cooldownSeconds": 0,
         "maxOrdersPerDay": 0,
         "spotEnabled": False,
         "spotQuoteBudget": "0",
         "spotMaxExposure": "0",
         "swapEnabled": True,
-        "swapContracts": "0",
+        "swapContracts": "1",
         "swapTdMode": "isolated",
         "swapLeverage": "10",
         "swapStrategyMode": DEFAULT_SWAP_STRATEGY_MODE,
@@ -1313,6 +1326,59 @@ def default_automation_config() -> dict[str, Any]:
     }
 
 
+def enforce_dip_swing_hft_profile(config: dict[str, Any]) -> dict[str, Any]:
+    profiled = copy.deepcopy(config)
+    watchlist_text = str(profiled.get("watchlistSymbols") or "").strip()
+    if not watchlist_text:
+        profiled["watchlistSymbols"] = DIP_SWING_HFT_DEFAULT_WATCHLIST
+
+    current_bar = str(profiled.get("bar") or "").strip()
+    if current_bar not in DIP_SWING_HFT_ALLOWED_BARS:
+        profiled["bar"] = DIP_SWING_HFT_DEFAULT_BAR
+
+    fast = clamp_int(
+        profiled.get("fastEma", 6),
+        DIP_SWING_HFT_MIN_FAST_EMA,
+        DIP_SWING_HFT_MAX_FAST_EMA,
+    )
+    slow_floor = max(fast + 6, DIP_SWING_HFT_MIN_SLOW_EMA)
+    slow = clamp_int(
+        profiled.get("slowEma", 24),
+        slow_floor,
+        DIP_SWING_HFT_MAX_SLOW_EMA,
+    )
+    profiled["fastEma"] = fast
+    profiled["slowEma"] = slow
+    profiled["pollSeconds"] = clamp_int(profiled.get("pollSeconds", 3), 1, 3)
+    profiled["cooldownSeconds"] = clamp_int(profiled.get("cooldownSeconds", 0), 0, 15)
+    profiled["swapContracts"] = decimal_to_str(
+        max(Decimal("1"), safe_decimal(profiled.get("swapContracts"), "1"))
+    )
+    profiled["swapLeverage"] = decimal_to_str(
+        clamp_decimal_value(
+            safe_decimal(profiled.get("swapLeverage"), "10"),
+            DIP_SWING_HFT_MIN_LEVERAGE,
+            DIP_SWING_HFT_MAX_LEVERAGE,
+        )
+    )
+    profiled["swapStrategyMode"] = DEFAULT_SWAP_STRATEGY_MODE
+    profiled["stopLossPct"] = decimal_to_str(
+        clamp_decimal_value(
+            safe_decimal(profiled.get("stopLossPct"), "0"),
+            DIP_SWING_HFT_MIN_STOP_LOSS_PCT,
+            DIP_SWING_HFT_MAX_STOP_LOSS_PCT,
+        )
+    )
+    profiled["takeProfitPct"] = decimal_to_str(
+        clamp_decimal_value(
+            safe_decimal(profiled.get("takeProfitPct"), "0"),
+            DIP_SWING_HFT_MIN_TAKE_PROFIT_PCT,
+            DIP_SWING_HFT_MAX_TAKE_PROFIT_PCT,
+        )
+    )
+    return profiled
+
+
 def enforce_only_dip_swing_strategy(config: dict[str, Any]) -> dict[str, Any]:
     enforced = copy.deepcopy(config)
     enforced["strategyPreset"] = ONLY_STRATEGY_PRESET
@@ -1330,7 +1396,7 @@ def enforce_only_dip_swing_strategy(config: dict[str, Any]) -> dict[str, Any]:
     enforced["maxOrdersPerDay"] = 0
     enforced["cooldownSeconds"] = 0
     enforced["pollSeconds"] = min(max(int(enforced.get("pollSeconds", 5) or 5), 1), 3)
-    return enforced
+    return enforce_dip_swing_hft_profile(enforced)
 
 
 def sanitize_only_dip_swing_override(override: dict[str, Any]) -> dict[str, Any]:
@@ -5970,6 +6036,39 @@ def export_slug(value: str) -> str:
     return slug or "strategy"
 
 
+def resolve_dip_swing_reference_contracts(
+    config: dict[str, Any],
+    meta: dict[str, Any],
+    *,
+    mark_price: Decimal,
+    fallback_equity: Decimal = Decimal("1000"),
+) -> Decimal:
+    lot_size = safe_decimal(meta.get("lotSz"), "1")
+    minimum_contracts = round_down(lot_size, lot_size) if lot_size > 0 else Decimal("0")
+    configured_contracts = round_down(safe_decimal(config.get("swapContracts"), "0"), lot_size)
+    if configured_contracts > 0:
+        return configured_contracts
+    leverage = max(safe_decimal(config.get("swapLeverage"), "1"), Decimal("1"))
+    contract_value = safe_decimal(meta.get("ctVal"), "1")
+    if minimum_contracts <= 0 or leverage <= 0 or mark_price <= 0 or contract_value <= 0:
+        return max(minimum_contracts, Decimal("1"))
+    reference_equity = max(
+        safe_decimal(config.get("_referenceEquity"), "0"),
+        fallback_equity,
+        Decimal("100"),
+    )
+    contract_margin = (mark_price * contract_value) / leverage
+    if contract_margin <= 0:
+        return max(minimum_contracts, Decimal("1"))
+    planned_contracts = round_down(
+        (reference_equity * DIP_SWING_TARGET_MIN_MARGIN_RATIO) / contract_margin,
+        lot_size,
+    )
+    if planned_contracts < minimum_contracts:
+        planned_contracts = minimum_contracts
+    return planned_contracts
+
+
 def compact_metric(value: Any, scale: str = "0.01") -> str:
     return decimal_to_str(safe_decimal(value, "0").quantize(Decimal(scale)))
 
@@ -6503,7 +6602,11 @@ def simulate_swap_market(
         raise OkxApiError("永续样本为空，无法回测")
     fast = int(config["fastEma"])
     slow = int(config["slowEma"])
-    contracts = safe_decimal(config.get("swapContracts"), "0")
+    contracts = resolve_dip_swing_reference_contracts(
+        config,
+        meta,
+        mark_price=candles[0]["close"],
+    )
     leverage = max(safe_decimal(config.get("swapLeverage"), "1"), Decimal("1"))
     stop_loss = safe_decimal(config.get("stopLossPct"), "0") / Decimal("100")
     take_profit = safe_decimal(config.get("takeProfitPct"), "0") / Decimal("100")
@@ -6924,13 +7027,24 @@ def mutate_strategy_config(
     slow_deltas = (-3, 3, -5, 5, -8, 8, -13, 13) if fine_tune else (-5, 5, -8, 8, -13, 13, -21, 21)
     stop_deltas = (Decimal("-0.1"), Decimal("0.1"), Decimal("-0.2"), Decimal("0.2")) if fine_tune else (Decimal("-0.2"), Decimal("0.2"), Decimal("-0.4"), Decimal("0.4"))
     take_deltas = (Decimal("-0.2"), Decimal("0.2"), Decimal("-0.4"), Decimal("0.4")) if fine_tune else (Decimal("-0.4"), Decimal("0.4"), Decimal("-0.8"), Decimal("0.8"))
-    current_bar = str(config.get("bar", bars[0] if bars else "5m"))
+    effective_bars = [bar for bar in bars if bar in DIP_SWING_HFT_ALLOWED_BARS]
+    if not effective_bars:
+        effective_bars = [DIP_SWING_HFT_DEFAULT_BAR]
+    current_bar = str(config.get("bar", effective_bars[0]))
     if current_bar not in bars:
-        bars = [current_bar, *bars]
-    bar_index = bars.index(current_bar) if current_bar in bars else 0
-    next_bar = bars[(bar_index + seed) % len(bars)]
-    fast = clamp_int(int(config["fastEma"]) + fast_deltas[seed % len(fast_deltas)], 2, 48)
-    slow = clamp_int(int(config["slowEma"]) + slow_deltas[(seed // 2) % len(slow_deltas)], fast + 2, 120)
+        effective_bars = [current_bar, *effective_bars]
+    bar_index = effective_bars.index(current_bar) if current_bar in effective_bars else 0
+    next_bar = effective_bars[(bar_index + seed) % len(effective_bars)]
+    fast = clamp_int(
+        int(config["fastEma"]) + fast_deltas[seed % len(fast_deltas)],
+        DIP_SWING_HFT_MIN_FAST_EMA,
+        DIP_SWING_HFT_MAX_FAST_EMA,
+    )
+    slow = clamp_int(
+        int(config["slowEma"]) + slow_deltas[(seed // 2) % len(slow_deltas)],
+        max(fast + 6, DIP_SWING_HFT_MIN_SLOW_EMA),
+        DIP_SWING_HFT_MAX_SLOW_EMA,
+    )
     stop_loss = clamp_decimal_value(
         safe_decimal(config["stopLossPct"], "1.2") + stop_deltas[(seed // 3) % len(stop_deltas)],
         Decimal("0.3"),
@@ -6943,24 +7057,17 @@ def mutate_strategy_config(
     )
     leverage_deltas = (-1, 1, 0, 2) if fine_tune else (-2, -1, 1, 2, 3)
     leverage = clamp_int(
-        int(safe_decimal(config.get("swapLeverage"), "3")) + leverage_deltas[(seed // 2) % len(leverage_deltas)],
-        1,
-        10,
+        int(safe_decimal(config.get("swapLeverage"), "6")) + leverage_deltas[(seed // 2) % len(leverage_deltas)],
+        int(DIP_SWING_HFT_MIN_LEVERAGE),
+        int(DIP_SWING_HFT_MAX_LEVERAGE),
     )
-    mode_cycle = ["trend_reverse", "long_only", "short_only", "trend_follow"]
-    current_mode = normalize_swap_strategy_mode(config.get("swapStrategyMode"))
-    try:
-        mode_index = mode_cycle.index(current_mode)
-    except ValueError:
-        mode_index = 0
-    next_mode = mode_cycle[(mode_index + seed + (0 if fine_tune else 1)) % len(mode_cycle)]
     return deep_merge(
         config,
         {
-            "bar": next_bar if len(bars) > 1 else current_bar,
+            "bar": next_bar if len(effective_bars) > 1 else current_bar,
             "fastEma": fast,
             "slowEma": slow,
-            "swapStrategyMode": next_mode if config.get("swapEnabled") else current_mode,
+            "swapStrategyMode": DEFAULT_SWAP_STRATEGY_MODE,
             "swapLeverage": str(leverage),
             "stopLossPct": decimal_to_str(stop_loss),
             "takeProfitPct": decimal_to_str(take_profit),
@@ -6974,11 +7081,15 @@ def hybridize_strategy_config(
     bars: list[str],
     seed: int,
 ) -> dict[str, Any]:
-    fast = clamp_int(round((int(primary["fastEma"]) + int(secondary["fastEma"])) / 2), 2, 48)
+    fast = clamp_int(
+        round((int(primary["fastEma"]) + int(secondary["fastEma"])) / 2),
+        DIP_SWING_HFT_MIN_FAST_EMA,
+        DIP_SWING_HFT_MAX_FAST_EMA,
+    )
     slow = clamp_int(
         round((int(primary["slowEma"]) + int(secondary["slowEma"])) / 2) + (1 if seed % 2 else 0),
-        fast + 2,
-        120,
+        max(fast + 6, DIP_SWING_HFT_MIN_SLOW_EMA),
+        DIP_SWING_HFT_MAX_SLOW_EMA,
     )
     stop_loss = clamp_decimal_value(
         (safe_decimal(primary["stopLossPct"], "1.2") + safe_decimal(secondary["stopLossPct"], "1.2")) / Decimal("2"),
@@ -6993,19 +7104,21 @@ def hybridize_strategy_config(
     leverage = clamp_int(
         round(
             (
-                int(safe_decimal(primary.get("swapLeverage"), "3"))
-                + int(safe_decimal(secondary.get("swapLeverage"), "3"))
+                int(safe_decimal(primary.get("swapLeverage"), "6"))
+                + int(safe_decimal(secondary.get("swapLeverage"), "6"))
             )
             / 2
         ),
-        1,
-        10,
+        int(DIP_SWING_HFT_MIN_LEVERAGE),
+        int(DIP_SWING_HFT_MAX_LEVERAGE),
     )
-    primary_mode = normalize_swap_strategy_mode(primary.get("swapStrategyMode"))
-    secondary_mode = normalize_swap_strategy_mode(secondary.get("swapStrategyMode"))
-    mode_options = [primary_mode, secondary_mode, "trend_reverse", "short_only", "long_only", "trend_follow"]
-    chosen_mode = mode_options[seed % len(mode_options)]
-    bar_options = [str(primary.get("bar", "5m")), str(secondary.get("bar", "5m"))] + bars
+    bar_options = [
+        bar
+        for bar in [str(primary.get("bar", DIP_SWING_HFT_DEFAULT_BAR)), str(secondary.get("bar", DIP_SWING_HFT_DEFAULT_BAR)), *bars]
+        if bar in DIP_SWING_HFT_ALLOWED_BARS
+    ]
+    if not bar_options:
+        bar_options = [DIP_SWING_HFT_DEFAULT_BAR]
     chosen_bar = bar_options[seed % len(bar_options)]
     return deep_merge(
         primary,
@@ -7013,7 +7126,7 @@ def hybridize_strategy_config(
             "bar": chosen_bar,
             "fastEma": fast,
             "slowEma": slow,
-            "swapStrategyMode": chosen_mode,
+            "swapStrategyMode": DEFAULT_SWAP_STRATEGY_MODE,
             "swapLeverage": str(leverage),
             "stopLossPct": decimal_to_str(stop_loss),
             "takeProfitPct": decimal_to_str(take_profit),
@@ -7101,28 +7214,33 @@ def build_next_generation_pool(
 
 
 def optimization_candidates(config: dict[str, Any], depth: str, include_alt_bars: bool) -> list[dict[str, Any]]:
-    base_bar = str(config.get("bar", "5m") or "5m")
+    base_bar = str(config.get("bar", DIP_SWING_HFT_DEFAULT_BAR) or DIP_SWING_HFT_DEFAULT_BAR)
+    if base_bar not in DIP_SWING_HFT_ALLOWED_BARS:
+        base_bar = DIP_SWING_HFT_DEFAULT_BAR
     bars = [base_bar]
     if include_alt_bars:
-        for candidate in ("5m", "15m", "1H"):
+        for candidate in DIP_SWING_HFT_ALLOWED_BARS:
             if candidate not in bars:
                 bars.append(candidate)
 
-    fast_seed = int(config.get("fastEma", 9) or 9)
-    slow_seed = int(config.get("slowEma", 21) or 21)
+    fast_seed = int(config.get("fastEma", 6) or 6)
+    slow_seed = int(config.get("slowEma", 24) or 24)
     stop_seed = safe_decimal(config.get("stopLossPct"), "1.2")
     take_seed = safe_decimal(config.get("takeProfitPct"), "2.4")
 
     if depth == "standard":
-        fast_values = sorted({max(2, fast_seed - 4), max(2, fast_seed - 2), fast_seed, fast_seed + 2, fast_seed + 4, fast_seed + 6})
-        slow_values = sorted({max(5, slow_seed - 13), max(6, slow_seed - 8), slow_seed, slow_seed + 5, slow_seed + 13, slow_seed + 21})
+        fast_values = sorted({max(DIP_SWING_HFT_MIN_FAST_EMA, fast_seed - 4), max(DIP_SWING_HFT_MIN_FAST_EMA, fast_seed - 2), fast_seed, fast_seed + 2, fast_seed + 4, fast_seed + 6})
+        slow_values = sorted({max(DIP_SWING_HFT_MIN_SLOW_EMA, slow_seed - 13), max(DIP_SWING_HFT_MIN_SLOW_EMA, slow_seed - 8), slow_seed, slow_seed + 5, slow_seed + 13, slow_seed + 21})
         stop_offsets = (Decimal("-0.6"), Decimal("-0.3"), Decimal("0"), Decimal("0.4"))
         take_offsets = (Decimal("-1.0"), Decimal("-0.4"), Decimal("0"), Decimal("0.8"))
     else:
-        fast_values = sorted({max(2, fast_seed - 2), fast_seed, fast_seed + 2, fast_seed + 4})
-        slow_values = sorted({max(5, slow_seed - 8), slow_seed, slow_seed + 5, slow_seed + 13})
+        fast_values = sorted({max(DIP_SWING_HFT_MIN_FAST_EMA, fast_seed - 2), fast_seed, fast_seed + 2, fast_seed + 4})
+        slow_values = sorted({max(DIP_SWING_HFT_MIN_SLOW_EMA, slow_seed - 8), slow_seed, slow_seed + 5, slow_seed + 13})
         stop_offsets = (Decimal("-0.3"), Decimal("0"), Decimal("0.4"))
         take_offsets = (Decimal("-0.6"), Decimal("0"), Decimal("0.8"))
+
+    fast_values = [value for value in fast_values if DIP_SWING_HFT_MIN_FAST_EMA <= value <= DIP_SWING_HFT_MAX_FAST_EMA]
+    slow_values = [value for value in slow_values if DIP_SWING_HFT_MIN_SLOW_EMA <= value <= DIP_SWING_HFT_MAX_SLOW_EMA]
 
     stop_values = sorted(
         {
@@ -7137,21 +7255,18 @@ def optimization_candidates(config: dict[str, Any], depth: str, include_alt_bars
         }
     )
 
-    leverage_seed = int(safe_decimal(config.get("swapLeverage"), "3"))
+    leverage_seed = int(safe_decimal(config.get("swapLeverage"), "6"))
     if depth == "standard":
-        leverage_values = sorted({max(1, leverage_seed - 2), max(1, leverage_seed - 1), leverage_seed, min(10, leverage_seed + 1), min(10, leverage_seed + 3)})
+        leverage_values = sorted({max(int(DIP_SWING_HFT_MIN_LEVERAGE), leverage_seed - 2), max(int(DIP_SWING_HFT_MIN_LEVERAGE), leverage_seed - 1), leverage_seed, min(int(DIP_SWING_HFT_MAX_LEVERAGE), leverage_seed + 1), min(int(DIP_SWING_HFT_MAX_LEVERAGE), leverage_seed + 3)})
     else:
-        leverage_values = sorted({max(1, leverage_seed - 1), leverage_seed, min(10, leverage_seed + 2)})
-    mode_values = [normalize_swap_strategy_mode(config.get("swapStrategyMode"))]
-    for candidate_mode in ("trend_reverse", "trend_follow", "long_only", "short_only"):
-        if candidate_mode not in mode_values:
-            mode_values.append(candidate_mode)
+        leverage_values = sorted({max(int(DIP_SWING_HFT_MIN_LEVERAGE), leverage_seed - 1), leverage_seed, min(int(DIP_SWING_HFT_MAX_LEVERAGE), leverage_seed + 2)})
+    mode_values = [DEFAULT_SWAP_STRATEGY_MODE]
 
     candidates: list[dict[str, Any]] = []
     for bar in bars:
         for fast in fast_values:
             for slow in slow_values:
-                if slow <= fast + 1:
+                if slow <= fast + 5:
                     continue
                 for stop_loss in stop_values:
                     for take_profit in take_values:
@@ -7770,7 +7885,11 @@ def estimate_strategy_capital_requirement(
                 str(config.get("bar", "5m") or "5m"),
                 candle_cache,
             )
-            contracts = safe_decimal(config.get("swapContracts"), "0")
+            contracts = resolve_dip_swing_reference_contracts(
+                config,
+                swap_meta or {},
+                mark_price=mark_price,
+            )
             leverage = max(safe_decimal(config.get("swapLeverage"), "1"), Decimal("1"))
             ct_val = safe_decimal((swap_meta or {}).get("ctVal"), "1")
             notional = contracts * ct_val * mark_price
@@ -16587,8 +16706,23 @@ class AutomationEngine:
         return order
 
 
+def normalize_persisted_automation_config_store() -> None:
+    try:
+        current = AUTOMATION_CONFIG.current()
+        _ok, _message, normalized = validate_automation_config(current)
+        if json.dumps(current, sort_keys=True, ensure_ascii=False) != json.dumps(
+            normalized,
+            sort_keys=True,
+            ensure_ascii=False,
+        ):
+            AUTOMATION_CONFIG.replace(normalized)
+    except Exception:
+        return
+
+
 CONFIG = ConfigStore(CONFIG_PATH)
 AUTOMATION_CONFIG = JsonStore(AUTOMATION_CONFIG_PATH, default_automation_config)
+normalize_persisted_automation_config_store()
 AUTOMATION_STATE = JsonStore(AUTOMATION_STATE_PATH, default_automation_state)
 MIROFISH_AUTOPILOT_CONFIG = JsonStore(MIROFISH_AUTOPILOT_CONFIG_PATH, default_mirofish_autopilot_config)
 LOCAL_ORDER_STORE = JsonStore(LOCAL_ORDER_STATE_PATH, default_local_order_state)

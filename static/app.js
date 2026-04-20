@@ -72,20 +72,20 @@ const ONLY_STRATEGY_PRESET = "dip_swing";
 const STRATEGY_PRESETS = {
   dip_swing: {
     label: "利润循环",
-    description: "市场扫描 + 方向轮动 + 成本过滤。逐仓 10x 反向双向，空仓即开，净赚 1U+ 就平，24 小时持续循环，目标余额 100x。",
+    description: "市场扫描 + 方向轮动 + 成本过滤。小资金高频轮动，逐仓 3x-10x 反向双向，空仓即开，净赚 1U+ 就平，24 小时持续循环，目标余额 100x。",
     config: {
       strategyPreset: "dip_swing",
       bar: "1m",
       fastEma: 6,
       slowEma: 24,
-      pollSeconds: 5,
+      pollSeconds: 3,
       cooldownSeconds: 0,
       maxOrdersPerDay: 0,
       spotEnabled: false,
       spotQuoteBudget: "0",
       spotMaxExposure: "0",
       swapEnabled: true,
-      swapContracts: "0",
+      swapContracts: "1",
       swapTdMode: "isolated",
       swapStrategyMode: "trend_reverse",
       swapLeverage: "10",
@@ -4359,16 +4359,16 @@ function collectAutomationConfig() {
     watchlistSymbols: $("autoWatchlistSymbols").value.trim(),
     watchlistOverrides: $("autoWatchlistOverrides").value.trim(),
     bar: $("autoBar").value,
-    fastEma: Number($("autoFastEma").value || 9),
-    slowEma: Number($("autoSlowEma").value || 21),
-    pollSeconds: Number($("autoPollSeconds").value || 20),
-    cooldownSeconds: Number($("autoCooldownSeconds").value || 180),
-    maxOrdersPerDay: Number($("autoMaxOrdersPerDay").value || 20),
+    fastEma: Number($("autoFastEma").value || 6),
+    slowEma: Number($("autoSlowEma").value || 24),
+    pollSeconds: Number($("autoPollSeconds").value || 3),
+    cooldownSeconds: Number($("autoCooldownSeconds").value || 0),
+    maxOrdersPerDay: Number($("autoMaxOrdersPerDay").value || 0),
     spotEnabled: $("autoSpotEnabled").checked,
     spotQuoteBudget: $("autoSpotQuoteBudget").value.trim(),
     spotMaxExposure: $("autoSpotMaxExposure").value.trim(),
     swapEnabled: $("autoSwapEnabled").checked,
-    swapContracts: "0",
+    swapContracts: "1",
     swapTdMode: $("autoSwapTdMode").value,
     swapStrategyMode: $("autoSwapStrategyMode").value,
     swapLeverage: $("autoSwapLeverage").value.trim(),
@@ -4438,11 +4438,11 @@ function fillAutomationForm(config) {
     parseWatchlistSymbols(config.watchlistSymbols, config.spotInstId || "BTC-USDT", config.swapInstId || "BTC-USDT-SWAP")
   );
   renderWatchlistOverrideEditor($("autoWatchlistOverrides").value);
-  $("autoBar").value = config.bar || "15m";
-  $("autoFastEma").value = config.fastEma ?? 12;
-  $("autoSlowEma").value = config.slowEma ?? 48;
-  $("autoPollSeconds").value = config.pollSeconds ?? 8;
-  $("autoCooldownSeconds").value = config.cooldownSeconds ?? 45;
+  $("autoBar").value = config.bar || "1m";
+  $("autoFastEma").value = config.fastEma ?? 6;
+  $("autoSlowEma").value = config.slowEma ?? 24;
+  $("autoPollSeconds").value = config.pollSeconds ?? 3;
+  $("autoCooldownSeconds").value = config.cooldownSeconds ?? 0;
   $("autoMaxOrdersPerDay").value = config.maxOrdersPerDay ?? 0;
   $("autoSpotEnabled").checked = false;
   $("autoSpotQuoteBudget").value = "0";
@@ -4450,9 +4450,9 @@ function fillAutomationForm(config) {
   $("autoSwapEnabled").checked = true;
   $("autoSwapTdMode").value = "isolated";
   $("autoSwapStrategyMode").value = normalizeSwapStrategyMode(config.swapStrategyMode || "trend_reverse");
-  $("autoSwapLeverage").value = config.swapLeverage ?? "10";
-  $("autoStopLossPct").value = config.stopLossPct ?? "1.2";
-  $("autoTakeProfitPct").value = config.takeProfitPct ?? "8";
+  $("autoSwapLeverage").value = config.swapLeverage ?? "6";
+  $("autoStopLossPct").value = config.stopLossPct ?? "0";
+  $("autoTakeProfitPct").value = config.takeProfitPct ?? "0";
   $("autoMaxDailyLossPct").value = config.maxDailyLossPct ?? "0.8";
   $("autoAutostart").checked = Boolean(config.autostart);
   $("autoAllowLiveTrading").checked = Boolean(config.allowLiveTrading);
