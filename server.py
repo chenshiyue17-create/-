@@ -7127,6 +7127,105 @@ def evaluate_candidate_entry(
     }
 
 
+def build_execution_overlay_snapshot(
+    analysis: dict[str, Any],
+    *,
+    base_score: Decimal,
+) -> dict[str, Any]:
+    predicted_net_pct = safe_decimal(analysis.get("predictedNetPct"), "0")
+    required_predicted_net_pct = safe_decimal(analysis.get("requiredPredictedNetPct"), "0")
+    threshold_delta_pct = predicted_net_pct - required_predicted_net_pct
+    relu_gate_score = safe_decimal(analysis.get("reluGateScore"), "0")
+    relu_gate_label = str(analysis.get("reluGateLabel") or "")
+    decision_label = str(analysis.get("decisionLabel") or "")
+    selected_symbol = str(analysis.get("selectedWatchlistSymbol") or "")
+    hard_blockers = list(analysis.get("hardBlockers") or [])
+    soft_blockers = list(analysis.get("softBlockers") or [])
+    block_state_label = str(analysis.get("blockStateLabel") or "")
+    near_threshold_ready = bool(analysis.get("nearThresholdReady"))
+    allow_new_entries = bool(analysis.get("allowNewEntries"))
+    candidate_count = int(analysis.get("candidateCount") or 0)
+    market_candidate_count = int(analysis.get("marketCandidateCount") or 0)
+    execution_quality_score = safe_decimal(analysis.get("executionQualityScore"), "0")
+
+    execution_bonus = relu_gate_score * Decimal("0.006")
+    execution_bonus += relu_ratio(threshold_delta_pct, Decimal("0.01")) * Decimal("0.60")
+    execution_bonus += relu_ratio(execution_quality_score - Decimal("60"), Decimal("10")) * Decimal("0.40")
+    execution_bonus += Decimal("1.60") if allow_new_entries else Decimal("0")
+    execution_bonus += Decimal("0.70") if near_threshold_ready else Decimal("0")
+    execution_bonus += Decimal("0.30") if candidate_count > 0 else Decimal("0")
+    execution_bonus += Decimal("0.20") if market_candidate_count > 0 else Decimal("0")
+    execution_bonus -= Decimal("1.20") * Decimal(min(len(hard_blockers), 2))
+    execution_bonus -= Decimal("0.35") * Decimal(min(len(soft_blockers), 3))
+    combined_score = base_score + execution_bonus
+
+    return {
+        "evaluated": True,
+        "decisionLabel": decision_label,
+        "selectedSymbol": selected_symbol,
+        "predictedNetPct": decimal_to_str(predicted_net_pct),
+        "requiredPredictedNetPct": decimal_to_str(required_predicted_net_pct),
+        "thresholdDeltaPct": decimal_to_str(threshold_delta_pct),
+        "reluGateScore": decimal_to_str(relu_gate_score),
+        "reluGateLabel": relu_gate_label,
+        "nearThresholdReady": near_threshold_ready,
+        "allowNewEntries": allow_new_entries,
+        "executionQualityScore": decimal_to_str(execution_quality_score),
+        "candidateCount": candidate_count,
+        "marketCandidateCount": market_candidate_count,
+        "blockStateLabel": block_state_label,
+        "hardBlockers": hard_blockers,
+        "softBlockers": soft_blockers,
+        "executionBonus": decimal_to_str(execution_bonus),
+        "combinedScore": decimal_to_str(combined_score),
+    }
+
+
+def review_research_candidates_with_execution_gate(
+    entries: list[dict[str, Any]],
+    client: OkxClient,
+    *,
+    limit: int = 3,
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    if not entries:
+        return entries, None
+    reviewed: list[dict[str, Any]] = []
+    evaluated: list[dict[str, Any]] = []
+    review_limit = max(1, min(limit, len(entries)))
+
+    for index, entry in enumerate(entries):
+        enriched = copy.deepcopy(entry)
+        base_score = safe_decimal(entry.get("score"), "0")
+        if index < review_limit:
+            full_config = deep_merge(default_automation_config(), entry.get("fullConfig") or entry.get("config") or {})
+            full_config = enforce_only_dip_swing_strategy(full_config)
+            try:
+                analysis = build_execution_analysis(full_config, client)
+                overlay = build_execution_overlay_snapshot(analysis, base_score=base_score)
+            except Exception as exc:
+                overlay = {
+                    "evaluated": False,
+                    "error": str(exc),
+                    "combinedScore": decimal_to_str(base_score),
+                }
+            enriched["executionOverlay"] = overlay
+            enriched["combinedScore"] = str(overlay.get("combinedScore") or entry.get("score") or "0")
+            if overlay.get("evaluated"):
+                evaluated.append(enriched)
+        reviewed.append(enriched)
+
+    if not evaluated:
+        return reviewed, None
+    selected = max(
+        evaluated,
+        key=lambda item: safe_decimal(
+            ((item.get("executionOverlay") or {}).get("combinedScore") or item.get("combinedScore") or item.get("score")),
+            "0",
+        ),
+    )
+    return reviewed, selected
+
+
 def pick_seed_candidates(
     config: dict[str, Any],
     options: dict[str, Any],
@@ -7543,20 +7642,38 @@ def research_optimize(config: dict[str, Any], options: dict[str, Any], client: O
     )
     leaderboard = ranked_entries[: int(adjusted_options["raceSize"])]
     population = ranked_entries[: int(adjusted_options.get("populationSize") or adjusted_options["raceSize"])]
+    reviewed_leaderboard, recommended_entry = review_research_candidates_with_execution_gate(leaderboard, client)
+    reviewed_population, _ = review_research_candidates_with_execution_gate(
+        population,
+        client,
+        limit=min(5, int(adjusted_options["raceSize"])),
+    )
     if best_report is None:
         raise OkxApiError("没有可用的优化结果")
+    execution_overlay = copy.deepcopy((recommended_entry or {}).get("executionOverlay") or {})
+    if recommended_entry:
+        best_report["notes"] = best_report.get("notes", []) + [
+            (
+                "已对回测前列候选追加当前市场可执行门控复核，"
+                f"推荐 {recommended_entry.get('name') or recommended_entry.get('label') or '当前冠军'}"
+                f" · ReLU {execution_overlay.get('reluGateLabel') or '观察中'}"
+                f" {compact_metric(execution_overlay.get('reluGateScore'), '0.1')}"
+                f" · 净优势 {compact_metric(execution_overlay.get('predictedNetPct'), '0.01')}%"
+                f" / 门槛 {compact_metric(execution_overlay.get('requiredPredictedNetPct'), '0.01')}%"
+            ),
+        ]
     best_report["notes"] = best_report.get("notes", []) + capital_notes + [
         f"已完成 {adjusted_options['evolutionLoops']} 轮持续赛马进化，榜单展示前 {adjusted_options['raceSize']} 条，后台种群保留 {adjusted_options.get('populationSize') or adjusted_options['raceSize']} 条。",
         f"总共评估 {total_evaluated} 条候选；杂交 {'开启' if adjusted_options['enableHybrid'] else '关闭'}，微调 {'开启' if adjusted_options['enableFineTune'] else '关闭'}。",
         "现在会保留上一轮高分种群做 carry-over，不再每次只拿 10 条从头开始。",
     ]
-    return build_research_state(
+    state = build_research_state(
         "optimize",
         config,
         adjusted_options,
         best_report,
-        leaderboard,
-        population,
+        reviewed_leaderboard,
+        reviewed_population,
         generation_summaries,
         {
             "raceSize": adjusted_options["raceSize"],
@@ -7566,8 +7683,14 @@ def research_optimize(config: dict[str, Any], options: dict[str, Any], client: O
             "enableHybrid": adjusted_options["enableHybrid"],
             "enableFineTune": adjusted_options["enableFineTune"],
             "capital": capital_context,
+            "executionOverlay": execution_overlay,
+            "executionOverlayEvaluated": min(3, len(reviewed_leaderboard)),
+            "executionRecommendedLabel": str((recommended_entry or {}).get("label") or ""),
         },
     )
+    if recommended_entry:
+        state["bestConfig"] = deep_merge({}, recommended_entry.get("fullConfig") or recommended_entry.get("config") or state.get("bestConfig") or {})
+    return state
 
 
 def recommended_import_config(config: dict[str, Any]) -> dict[str, Any]:
@@ -12720,6 +12843,8 @@ class StrategyAutoOptimizationManager:
             "appliedAt": "",
             "bestConfig": {},
             "researchSummary": {},
+            "researchPipeline": {},
+            "executionOverlay": {},
             "notes": [],
             "metrics": {},
         }
@@ -12872,6 +12997,8 @@ class StrategyAutoOptimizationManager:
                 bestConfig=normalized,
                 configDiff=config_diff,
                 researchSummary=copy.deepcopy(research.get("summary") or {}),
+                researchPipeline=copy.deepcopy(research.get("pipeline") or {}),
+                executionOverlay=copy.deepcopy(((research.get("pipeline") or {}).get("executionOverlay") or {})),
                 notes=list(research.get("notes") or []),
                 metrics={
                     "sampleCount": int(research.get("sampleCount") or 0),

@@ -1787,6 +1787,52 @@ function buildQuaternionSummary(source = {}) {
   return parts.join(" · ");
 }
 
+function buildExecutionOverlaySummary(source = {}) {
+  const root = source && typeof source === "object" ? source : {};
+  const overlay = root.executionOverlay && typeof root.executionOverlay === "object"
+    ? root.executionOverlay
+    : ((root.researchPipeline && typeof root.researchPipeline === "object" && root.researchPipeline.executionOverlay && typeof root.researchPipeline.executionOverlay === "object")
+      ? root.researchPipeline.executionOverlay
+      : ((root.pipeline && typeof root.pipeline === "object" && root.pipeline.executionOverlay && typeof root.pipeline.executionOverlay === "object")
+        ? root.pipeline.executionOverlay
+        : {}));
+  const reluGateLabel = String(overlay.reluGateLabel || "").trim();
+  const decisionLabel = String(overlay.decisionLabel || "").trim();
+  const blockStateLabel = String(overlay.blockStateLabel || "").trim();
+  const selectedSymbol = String(overlay.selectedSymbol || "").trim();
+  const reluGateScore = Number(overlay.reluGateScore ?? NaN);
+  const predictedNetPct = Number(overlay.predictedNetPct ?? NaN);
+  const requiredPredictedNetPct = Number(overlay.requiredPredictedNetPct ?? NaN);
+  const thresholdDeltaPct = Number(overlay.thresholdDeltaPct ?? NaN);
+  const hardBlockers = Array.isArray(overlay.hardBlockers) ? overlay.hardBlockers.filter(Boolean) : [];
+  const softBlockers = Array.isArray(overlay.softBlockers) ? overlay.softBlockers.filter(Boolean) : [];
+  const parts = [];
+  if (selectedSymbol) parts.push(selectedSymbol);
+  if (decisionLabel) parts.push(decisionLabel);
+  if (reluGateLabel) {
+    parts.push(
+      Number.isFinite(reluGateScore)
+        ? `ReLU ${reluGateLabel} ${reluGateScore.toFixed(1)}`
+        : `ReLU ${reluGateLabel}`
+    );
+  }
+  if (Number.isFinite(predictedNetPct) || Number.isFinite(requiredPredictedNetPct)) {
+    const predictedText = Number.isFinite(predictedNetPct) ? `${predictedNetPct.toFixed(2)}%` : "--";
+    const requiredText = Number.isFinite(requiredPredictedNetPct) ? `${requiredPredictedNetPct.toFixed(2)}%` : "--";
+    parts.push(`净优势 ${predictedText}/${requiredText}`);
+  }
+  if (Number.isFinite(thresholdDeltaPct)) {
+    const sign = thresholdDeltaPct > 0 ? "+" : "";
+    parts.push(`差值 ${sign}${thresholdDeltaPct.toFixed(3)}%`);
+  }
+  if (blockStateLabel) {
+    parts.push(blockStateLabel);
+  } else if (hardBlockers[0] || softBlockers[0]) {
+    parts.push(hardBlockers[0] || softBlockers[0]);
+  }
+  return parts.join(" · ");
+}
+
 function buildOptimizationPhaseLabel(phase = "") {
   const key = String(phase || "idle");
   const phaseLabelMap = {
@@ -1815,6 +1861,7 @@ function renderMirofishOptimization(optimization = {}, autopilot = {}) {
   const failed = phase === "failed";
   const applied = Boolean(snapshot.applied);
   const quaternionSummary = buildQuaternionSummary(snapshot);
+  const executionOverlaySummary = buildExecutionOverlaySummary(snapshot);
   const bestConfig = snapshot.bestConfig && typeof snapshot.bestConfig === "object" ? snapshot.bestConfig : {};
   const configDiffSummary = buildOptimizationConfigDiffSummary(snapshot);
   const focusSymbol = String(snapshot.focusSymbol || autopilotSnapshot.lastMode || "").trim();
@@ -1841,6 +1888,7 @@ function renderMirofishOptimization(optimization = {}, autopilot = {}) {
   if (Number.isFinite(ordersCount) && ordersCount > 0) optSubParts.push(`订单 ${ordersCount} 笔`);
   if (focusSymbol) optSubParts.push(`焦点 ${focusSymbol}`);
   if (quaternionSummary) optSubParts.push(`四元数 ${quaternionSummary}`);
+  if (executionOverlaySummary) optSubParts.push(`门控 ${executionOverlaySummary}`);
   if (configDiffSummary) optSubParts.push(`改动 ${configDiffSummary}`);
   if (thresholdState.text) optSubParts.push(`门槛 ${thresholdState.text}`);
   if (candidateState.selectedSymbol) optSubParts.push(`候选 ${candidateState.text}`);
@@ -1899,6 +1947,7 @@ function renderDeskMirofishLoop(status = {}) {
   const bestConfig = optimization.bestConfig && typeof optimization.bestConfig === "object" ? optimization.bestConfig : {};
   const configDiffSummary = buildOptimizationConfigDiffSummary(optimization);
   const quaternionSummary = buildQuaternionSummary(optimization);
+  const executionOverlaySummary = buildExecutionOverlaySummary(optimization);
 
   let main = "待同步";
   if (!snapshot.installed) {
@@ -1941,6 +1990,7 @@ function renderDeskMirofishLoop(status = {}) {
   if (autoSimulation.projectName) lastSubParts.push(autoSimulation.projectName);
   if (autoSimulation.startedAt) lastSubParts.push(`开始 ${formatMirofishIso(autoSimulation.startedAt)}`);
   if (quaternionSummary) lastSubParts.push(`四元数 ${quaternionSummary}`);
+  if (executionOverlaySummary) lastSubParts.push(`门控 ${executionOverlaySummary}`);
   if (candidateState.text) lastSubParts.push(`候选 ${candidateState.text}`);
   $("desk-mirofish-last-sub").textContent = lastSubParts.join(" · ")
     || "任务编号、焦点币和订单数会显示在这里。";
@@ -1968,6 +2018,7 @@ function renderDeskMirofishLoop(status = {}) {
     applySubParts.push(`${bestConfig.bar || "--"} · EMA ${bestConfig.fastEma}/${bestConfig.slowEma}`);
   }
   if (configDiffSummary) applySubParts.push(`参数 ${configDiffSummary}`);
+  if (executionOverlaySummary) applySubParts.push(`门控 ${executionOverlaySummary}`);
   if (optimization.appliedAt) applySubParts.push(`回写 ${formatMirofishIso(optimization.appliedAt)}`);
   if (autopilot.nextRunAt) applySubParts.push(`下轮 ${formatMirofishIso(autopilot.nextRunAt)}`);
   if (autopilot.lastCompletedAt) applySubParts.push(`完成 ${formatMirofishIso(autopilot.lastCompletedAt)}`);
@@ -6624,6 +6675,8 @@ function renderResearchState(research) {
     if (capital?.perHorseCapital) bestSubParts.push(`单马约 ${Number(capital.perHorseCapital).toFixed(2)}U`);
     const quaternionSummary = buildQuaternionSummary(summary);
     if (quaternionSummary) bestSubParts.push(`四元数 ${quaternionSummary}`);
+    const executionOverlaySummary = buildExecutionOverlaySummary(research);
+    if (executionOverlaySummary) bestSubParts.push(`门控 ${executionOverlaySummary}`);
     $("research-best-sub").textContent = bestSubParts.join(" · ");
   } else {
     $("research-best-sub").textContent = "自动优化后可直接应用";
