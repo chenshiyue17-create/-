@@ -2530,6 +2530,26 @@ function buildOptimizationConfigDiffSummary(snapshot = {}, limit = 4) {
   }).join(" / ");
 }
 
+function buildAnalysisBlockSummary(analysis = {}) {
+  const snapshot = analysis && typeof analysis === "object" ? analysis : {};
+  const blockStateLabel = String(snapshot.blockStateLabel || "").trim();
+  const hardBlockers = Array.isArray(snapshot.hardBlockers) ? snapshot.hardBlockers.filter(Boolean) : [];
+  const softBlockers = Array.isArray(snapshot.softBlockers) ? snapshot.softBlockers.filter(Boolean) : [];
+  const warnings = Array.isArray(snapshot.warnings) ? snapshot.warnings.filter(Boolean) : [];
+  const primaryReason = hardBlockers[0] || softBlockers[0] || warnings[0] || "";
+  const parts = [];
+  if (blockStateLabel) parts.push(blockStateLabel);
+  if (primaryReason) parts.push(primaryReason);
+  return {
+    blockStateLabel,
+    hardBlockers,
+    softBlockers,
+    warnings,
+    primaryReason,
+    text: parts.join(" · "),
+  };
+}
+
 function buildSmoothPath(points) {
   if (!points.length) return "";
   if (points.length === 1) return `M ${points[0][0]} ${points[0][1]}`;
@@ -2991,6 +3011,8 @@ function renderAnalysisState(analysis, runtimeState = {}) {
   const refreshAt = data.lastAnalyzedAt || runtime.lastCycleAt || "";
   const thresholdState = buildDipSwingThresholdState(data);
   const candidateState = buildDipSwingCandidateState(data);
+  const blockSummary = buildAnalysisBlockSummary(data);
+  const optimizationSummary = buildOptimizationConfigDiffSummary(runtime.strategyOptimization || {});
   const nearThresholdReady = thresholdState.nearThresholdReady;
   $("analysis-decision").textContent =
     data.decisionLabel
@@ -3041,11 +3063,11 @@ function renderAnalysisState(analysis, runtimeState = {}) {
     candidateState.text || "等待候选池快照";
   const reasonBits = [];
   if (data.summary) reasonBits.push(data.summary);
-  if (Array.isArray(data.hardBlockers) && data.hardBlockers.length) {
-    reasonBits.push(`硬拦截: ${data.hardBlockers.join("；")}`);
+  if (blockSummary.hardBlockers.length) {
+    reasonBits.push(`硬拦截: ${blockSummary.hardBlockers.join("；")}`);
   }
-  if (Array.isArray(data.softBlockers) && data.softBlockers.length) {
-    reasonBits.push(`软拦截: ${data.softBlockers.join("；")}`);
+  if (blockSummary.softBlockers.length) {
+    reasonBits.push(`软拦截: ${blockSummary.softBlockers.join("；")}`);
   } else if (data.warnings?.length) {
     reasonBits.push(`提醒: ${data.warnings.join("；")}`);
   }
@@ -3089,8 +3111,8 @@ function renderAnalysisState(analysis, runtimeState = {}) {
     if (data.volatilityPct) dockSummaryBits.push(`波动 ${data.volatilityPct}%`);
     if (data.fundingRatePct) dockSummaryBits.push(`资金费 ${data.fundingRatePct}%`);
     if (data.executionAbilityNetPnl) dockSummaryBits.push(`近场净收益 ${formatSignedMoney(data.executionAbilityNetPnl)}U`);
-    if (data.blockers?.length) dockSummaryBits.push(`阻断 ${data.blockers[0]}`);
-    else if (data.warnings?.length) dockSummaryBits.push(`提醒 ${data.warnings[0]}`);
+    if (blockSummary.text) dockSummaryBits.push(`状态 ${blockSummary.text}`);
+    if (optimizationSummary) dockSummaryBits.push(`回写 ${optimizationSummary}`);
     const journal = getCurrentExecutionJournal();
     const recentOrders = getCurrentRecentOrders();
     const filledCount = Number(journal.filledOrders ?? recentOrders.filter((item) => String(item?.state || "") === "filled").length);
@@ -5890,6 +5912,15 @@ function renderOrderTimelineBoard(groups, meta = {}) {
   const portfolioTone = portfolioTotal > 0 ? "positive" : portfolioTotal < 0 ? "negative" : "muted";
   const ranked = groups.slice().sort((left, right) => Math.abs(Number(right.pnlTotal || 0)) - Math.abs(Number(left.pnlTotal || 0)));
   const maxAbs = Math.max(...ranked.map((group) => Math.abs(Number(group.pnlTotal || 0))), 1);
+  const currentRuntime = getCurrentAutomationState() || {};
+  const currentAnalysis = currentRuntime.analysis || {};
+  const blockSummary = buildAnalysisBlockSummary(currentAnalysis);
+  const thresholdState = buildDipSwingThresholdState(currentAnalysis);
+  const optimizationSummary = buildOptimizationConfigDiffSummary(currentRuntime.strategyOptimization || {});
+  const headSummaryParts = [];
+  if (blockSummary.text) headSummaryParts.push(blockSummary.text);
+  if (thresholdState.text) headSummaryParts.push(thresholdState.text);
+  if (optimizationSummary) headSummaryParts.push(`参数 ${optimizationSummary}`);
 
   target.className = "order-timeline-board";
   target.innerHTML = `
@@ -5897,7 +5928,7 @@ function renderOrderTimelineBoard(groups, meta = {}) {
       <div>
         <span class="order-timeline-eyebrow">组合收益拆分时间线</span>
         <strong>${formatSignedMoney(portfolioTotal)} USDT</strong>
-        <small>每个币独立形成订单收益轨迹，再汇总为组合视角。已实现、持仓浮动、现价估算分开展示。</small>
+        <small>${escapeHtml(headSummaryParts.join(" · ") || "每个币独立形成订单收益轨迹，再汇总为组合视角。已实现、持仓浮动、现价估算分开展示。")}</small>
       </div>
       <span class="order-state-pill tone-${portfolioTone === "muted" ? "cancel" : portfolioTone === "positive" ? "done" : "fail"}">${ranked.length} 个币种</span>
     </div>

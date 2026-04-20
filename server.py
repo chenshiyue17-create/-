@@ -15253,9 +15253,14 @@ class AutomationEngine:
             and recent_net_pnl <= Decimal("0")
             and recent_taker_fill_pct >= DIP_SWING_SYMBOL_MAX_TAKER_FILL_PCT
         )
+        symbol_pressure_blocked = (
+            recent_open_close_gap > DIP_SWING_MAX_OPEN_CLOSE_GAP
+            or recent_consecutive_open_streak > DIP_SWING_MAX_CONSECUTIVE_OPEN_STREAK
+        )
         if aggressive_scalp_mode:
             symbol_cycle_block_reason = ""
             symbol_cycle_blocked = False
+            symbol_pressure_blocked = False
         liquidity_score = min(avg_quote_volume_usd / Decimal("1000000"), Decimal("12"))
         symbol_performance_penalty = Decimal("0")
         if recent_net_pnl < 0:
