@@ -98,13 +98,12 @@ ensure_uv() {
     printf '%s\n' "$uv_bin"
     return 0
   fi
-  echo "未检测到 uv，正在自动安装到 ~/.local/bin ..."
-  "$PYTHON_BIN" -m pip install --user uv
-  uv_bin="$(pick_uv || true)"
-  if [ -z "$uv_bin" ]; then
-    echo "uv 安装后仍不可用，请检查 ~/.local/bin 是否在 PATH 中。" >&2
-    exit 1
+  echo "未检测到 uv，正在尝试自动安装到 ~/.local/bin ..."
+  if ! "$PYTHON_BIN" -m pip install --user uv; then
+    printf '\n'
+    return 0
   fi
+  uv_bin="$(pick_uv || true)"
   printf '%s\n' "$uv_bin"
 }
 
@@ -139,8 +138,6 @@ if [ -z "$NODE_BIN" ] || [ -z "$NPM_CLI" ]; then
   echo "未找到可用的 Node.js / npm-cli.js" >&2
   exit 1
 fi
-
-UV_BIN="$(ensure_uv || true)"
 
 export CODEX_PATH
 export UV_PYTHON="$PYTHON_BIN"
@@ -216,10 +213,16 @@ env_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 PY
 
 BACKEND_REQUIREMENTS="$(determine_backend_requirements)"
+UV_BIN=""
+if [ "$BACKEND_REQUIREMENTS" != "requirements-lite.txt" ]; then
+  UV_BIN="$(ensure_uv || true)"
+fi
 
 echo "开始安装 MiroFish 依赖..."
 echo "使用 Python: $UV_PYTHON"
-if [ -n "$UV_BIN" ]; then
+if [ "$BACKEND_REQUIREMENTS" = "requirements-lite.txt" ]; then
+  echo "使用 uv: 当前链路不需要（lite 后端依赖）"
+elif [ -n "$UV_BIN" ]; then
   echo "使用 uv: $UV_BIN"
 else
   echo "使用 uv: 未找到，改走 venv 回退链路"
