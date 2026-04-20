@@ -2796,7 +2796,6 @@ select:focus {
 body[data-view="focus"] .panel[data-view-group~="focus"],
 body[data-view="research"] .panel[data-view-group~="research"],
 body[data-view="mirofish"] .panel[data-view-group~="mirofish"],
-body[data-view="trade"] .panel[data-view-group~="trade"],
 body[data-view="orders"] .panel[data-view-group~="orders"],
 body[data-view="market"] .panel[data-view-group~="market"],
 body[data-view="miner"] .panel[data-view-group~="miner"] {

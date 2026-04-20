@@ -489,7 +489,6 @@ REMOTE_PROXY_EXACT_PATHS = {
     "/api/account/overview",
     "/api/orders/recent",
     "/api/config/test",
-    "/api/order/place",
 }
 
 REMOTE_PROXY_PREFIXES = (
@@ -1188,7 +1187,6 @@ def default_automation_config() -> dict[str, Any]:
         "arbMaxHoldMinutes": 180,
         "arbRequireFundingAlignment": True,
         "autostart": False,
-        "allowLiveManualOrders": False,
         "allowLiveTrading": False,
         "allowLiveAutostart": False,
         "enforceNetMode": True,
@@ -3310,7 +3308,6 @@ class ConfigStore:
 def reset_automation_live_permissions(*, reason: str = "") -> dict[str, Any]:
     def mutate(config: dict[str, Any]) -> None:
         config["autostart"] = False
-        config["allowLiveManualOrders"] = False
         config["allowLiveTrading"] = False
         config["allowLiveAutostart"] = False
 
@@ -3326,12 +3323,11 @@ def ensure_automation_permissions_match_environment(api_config: dict[str, Any]) 
         return current
     if not any(
         bool(current.get(key))
-        for key in ("allowLiveManualOrders", "allowLiveTrading", "allowLiveAutostart")
+        for key in ("allowLiveTrading", "allowLiveAutostart")
     ):
         return current
 
     def mutate(config: dict[str, Any]) -> None:
-        config["allowLiveManualOrders"] = False
         config["allowLiveTrading"] = False
         config["allowLiveAutostart"] = False
 
@@ -4533,29 +4529,6 @@ def paper_state_has_activity(state: dict[str, Any] | None = None) -> bool:
         if str(market.get("lastOrderId") or "").strip():
             return True
     return False
-
-
-def record_manual_order_activity(order: dict[str, Any]) -> None:
-    order_id = str(order.get("ordId") or order.get("clOrdId") or "")
-    if not order_id:
-        return
-    inst_id = str(order.get("instId") or "")
-    inst_type = str(order.get("instType") or ("SWAP" if inst_id.endswith("-SWAP") else "SPOT")).upper()
-    market = "swap" if inst_type == "SWAP" else "spot"
-    side = "买入" if str(order.get("side") or "").lower() == "buy" else "卖出"
-    stamp = now_local_iso()
-
-    def mutate(state: dict[str, Any]) -> None:
-        state["orderCountToday"] = int(state.get("orderCountToday", 0)) + 1
-        state["lastActionAt"] = stamp
-        target = state["markets"].setdefault(market, default_market_state())
-        target["lastActionAt"] = stamp
-        target["lastTradeAt"] = stamp
-        target["lastOrderId"] = order_id
-        target["lastAction"] = f"手动{side}"
-        target["lastMessage"] = f"手动{side} · {inst_id}"
-
-    AUTOMATION_STATE.update(mutate)
 
 
 def reconcile_automation_state_from_markets() -> None:
@@ -7794,7 +7767,6 @@ STRATEGY_OPTIMIZATION_PRESERVE_KEYS = (
     "cooldownSeconds",
     "maxOrdersPerDay",
     "autostart",
-    "allowLiveManualOrders",
     "allowLiveTrading",
     "allowLiveAutostart",
     "enforceNetMode",
@@ -13232,13 +13204,6 @@ class AutomationEngine:
         if not automation.get("allowLiveTrading"):
             raise OkxApiError("当前是实盘，未开启“允许实盘自动交易”")
 
-    @staticmethod
-    def _guard_live_manual_order(api_config: dict[str, Any], automation: dict[str, Any]) -> None:
-        if api_config.get("simulated"):
-            return
-        if not automation.get("allowLiveManualOrders"):
-            raise OkxApiError("当前是实盘，未开启“允许手动实盘下单”")
-
     def _prepare_swap(self, client: OkxClient, automation: dict[str, Any]) -> None:
         if not automation.get("swapEnabled"):
             return
@@ -16868,7 +16833,6 @@ class AppHandler(BaseHTTPRequestHandler):
                 normalized,
             )
             if bool(CONFIG.current().get("simulated")):
-                normalized["allowLiveManualOrders"] = False
                 normalized["allowLiveTrading"] = False
                 normalized["allowLiveAutostart"] = False
             AUTOMATION_CONFIG.replace(normalized)
@@ -16971,43 +16935,6 @@ class AppHandler(BaseHTTPRequestHandler):
                 json_response(self, {"ok": True, "state": AUTOMATION_ENGINE.snapshot()})
             except Exception as exc:
                 error_response(self, f"执行失败: {exc}", status=400)
-            return
-
-        if path == "/api/order/place":
-            payload = json.loads(raw_body.decode("utf-8")) if raw_body else {}
-            valid, message = validate_config(config)
-            if not valid:
-                error_response(self, message, status=400)
-                return
-
-            required = ["instId", "tdMode", "side", "ordType", "sz"]
-            missing = [key for key in required if not payload.get(key)]
-            if missing:
-                error_response(self, f"订单缺少字段: {', '.join(missing)}", status=400)
-                return
-
-            if payload.get("ordType") == "limit" and not payload.get("px"):
-                error_response(self, "限价单必须填写价格 px", status=400)
-                return
-
-            order = {
-                key: value for key, value in payload.items() if value not in (None, "", False)
-            }
-            try:
-                automation = AUTOMATION_CONFIG.current()
-                self._guard_live_manual_order(config, automation)
-                route = ensure_live_route_ready(config, force=False)
-                client = OkxClient(config)
-                started_at = time.perf_counter()
-                result = client.place_order(order)
-                placed_orders = list(result.get("data") or [])
-                PRIVATE_ORDER_STREAM._ingest_orders(placed_orders)
-                if placed_orders:
-                    record_manual_order_activity(placed_orders[0])
-                elapsed_ms = round((time.perf_counter() - started_at) * 1000, 2)
-                json_response(self, {"ok": True, "result": result, "elapsedMs": elapsed_ms, "route": route})
-            except Exception as exc:
-                error_response(self, f"下单失败: {exc}", status=502)
             return
 
         error_response(self, "未找到接口", status=404)

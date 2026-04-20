@@ -136,15 +136,10 @@ const WORKSPACE_VIEWS = {
     chip: "Simulation",
     description: "在当前 OKX Local App 内直接使用 MiroFish，不再额外新开一个项目。",
   },
-  trade: {
-    label: "交易配置",
-    chip: "Trade",
-    description: "环境配置、账户快照、风控与策略参数。",
-  },
   orders: {
     label: "订单终端",
     chip: "Orders",
-    description: "多币下单、最近订单、收益判断和成交细节。",
+    description: "多币订单流、收益判断和成交细节。",
   },
   market: {
     label: "行情监控",
@@ -1143,7 +1138,6 @@ function normalizeAutomationConfigForCompare(config = {}) {
     arbMaxHoldMinutes: Number(config.arbMaxHoldMinutes ?? 180),
     arbRequireFundingAlignment: config.arbRequireFundingAlignment !== false,
     autostart: Boolean(config.autostart),
-    allowLiveManualOrders: Boolean(config.allowLiveManualOrders),
     allowLiveTrading: Boolean(config.allowLiveTrading),
     allowLiveAutostart: Boolean(config.allowLiveAutostart),
     enforceNetMode: config.enforceNetMode !== false,
@@ -1396,7 +1390,6 @@ function applyRouteHealth(route, { preserveMessage = false } = {}) {
   const simulated = isSimulatedMode();
   const remote = isRemoteExecutionMode() || route?.executionMode === "remote";
   const blocked = !simulated && route && route.healthy === false;
-  const manualLiveLocked = !simulated && !$("autoAllowLiveManualOrders").checked;
   const detail = route?.detail || "";
   const rawSummary = route?.summary || detail || "";
   const summary = remote
@@ -1418,16 +1411,12 @@ function applyRouteHealth(route, { preserveMessage = false } = {}) {
   }
   $("health-text").title = technicalDetail;
 
-  const disabled = blocked || manualLiveLocked;
-  const disabledTitle = blocked
-    ? (summary || "当前实盘链路不可用")
-    : "当前是实盘，未开启“允许手动实盘下单”";
+  const disabled = blocked;
+  const disabledTitle = blocked ? (summary || "当前实盘链路不可用") : "";
   [
     $("start-automation"),
     $("run-automation-once"),
     $("cockpit-run-once"),
-    $("spot-order-form")?.querySelector('button[type="submit"]'),
-    $("swap-order-form")?.querySelector('button[type="submit"]'),
   ].forEach((node) => {
     if (!node) return;
     node.disabled = disabled;
@@ -1727,9 +1716,6 @@ function setWorkspaceView(view, { persist = true, scroll = true } = {}) {
   }
   if (scroll) {
     window.scrollTo({ top: 0, behavior: "smooth" });
-  }
-  if (key === "trade" && !dashboardState.accountDetailsLoadedOnce) {
-    refreshSnapshot().catch(() => {});
   }
   if (key === "orders" && !dashboardState.accountDetailsLoadedOnce) {
     refreshSnapshot().catch(() => {});
@@ -2491,7 +2477,6 @@ function renderEquityCurve(curve) {
 
 function renderDeskGuards() {
   const simulated = $("simulated").value === "true";
-  const allowLiveManualOrders = $("autoAllowLiveManualOrders").checked;
   const allowLiveTrading = $("autoAllowLiveTrading").checked;
   const allowLiveAutostart = $("autoAllowLiveAutostart").checked;
   const autostart = $("autoAutostart").checked;
@@ -2507,7 +2492,6 @@ function renderDeskGuards() {
   $("guard-live").textContent = simulated
     ? "模拟盘下无需额外实盘开关"
     : [
-        allowLiveManualOrders ? "手动下单已解锁" : "手动下单仍锁着",
         allowLiveTrading
           ? `自动交易已解锁${autostart && allowLiveAutostart ? " / 自动启动" : ""}`
           : "自动交易仍锁着",
@@ -2522,12 +2506,8 @@ function renderDeskGuards() {
     riskPill.textContent = "模拟护栏";
     riskPill.style.borderColor = "rgba(69, 214, 196, 0.28)";
     riskPill.style.color = "var(--accent-2)";
-  } else if (!allowLiveManualOrders && !allowLiveTrading) {
+  } else if (!allowLiveTrading) {
     riskPill.textContent = "实盘锁定";
-    riskPill.style.borderColor = "rgba(255, 184, 77, 0.24)";
-    riskPill.style.color = "var(--accent)";
-  } else if (!allowLiveManualOrders) {
-    riskPill.textContent = "手动单受限";
     riskPill.style.borderColor = "rgba(255, 184, 77, 0.24)";
     riskPill.style.color = "var(--accent)";
   } else if (autostart && !allowLiveAutostart) {
@@ -4051,7 +4031,6 @@ function collectAutomationConfig() {
     maxDailyLossPct: $("autoMaxDailyLossPct").value.trim(),
     targetBalanceMultiple: "100",
     autostart: $("autoAutostart").checked,
-    allowLiveManualOrders: $("autoAllowLiveManualOrders").checked,
     allowLiveTrading: $("autoAllowLiveTrading").checked,
     allowLiveAutostart: $("autoAllowLiveAutostart").checked,
     enforceNetMode: $("autoEnforceNetMode").checked,
@@ -4130,7 +4109,6 @@ function fillAutomationForm(config) {
   $("autoTakeProfitPct").value = config.takeProfitPct ?? "8";
   $("autoMaxDailyLossPct").value = config.maxDailyLossPct ?? "0.8";
   $("autoAutostart").checked = Boolean(config.autostart);
-  $("autoAllowLiveManualOrders").checked = Boolean(config.allowLiveManualOrders);
   $("autoAllowLiveTrading").checked = Boolean(config.allowLiveTrading);
   $("autoAllowLiveAutostart").checked = Boolean(config.allowLiveAutostart);
   $("autoEnforceNetMode").checked = config.enforceNetMode !== false;
@@ -6589,7 +6567,6 @@ async function saveConfig() {
         await request("/api/automation/stop", { method: "POST" });
       } catch (_) {}
       $("autoAutostart").checked = false;
-      $("autoAllowLiveManualOrders").checked = false;
       $("autoAllowLiveTrading").checked = false;
       $("autoAllowLiveAutostart").checked = false;
       renderRailStrategyControls();
@@ -7111,53 +7088,6 @@ async function refreshMarket() {
   });
 }
 
-function buildOrderPayload(form) {
-  const formData = new FormData(form);
-  const payload = {};
-  for (const [key, value] of formData.entries()) {
-    if (!value) continue;
-    payload[key] = value;
-  }
-  form.querySelectorAll("[data-source]").forEach((node) => {
-    payload[node.name] = $(node.dataset.source).value.trim();
-  });
-  if (form.id === "swap-order-form") {
-    payload.reduceOnly = form.querySelector('input[name="reduceOnly"]').checked;
-  }
-  return payload;
-}
-
-async function submitOrder(event) {
-  event.preventDefault();
-  if (isLiveRouteBlocked()) {
-    throw new Error(dashboardState.routeHealth?.summary || "当前实盘链路不可用");
-  }
-  if (!isSimulatedMode() && !$("autoAllowLiveManualOrders").checked) {
-    throw new Error("当前是实盘，未开启“允许手动实盘下单”");
-  }
-  const form = event.currentTarget;
-  const payload = buildOrderPayload(form);
-  const result = await request("/api/order/place", {
-    method: "POST",
-    body: JSON.stringify(payload),
-  });
-  const elapsedMs = result.elapsedMs || result.result?._clientElapsedMs;
-  setMessage(
-    `下单请求已发送${elapsedMs ? ` · ${elapsedMs} ms` : ""}: ${JSON.stringify(result.result.data?.[0] || result.result)}`,
-    "ok"
-  );
-  prependRecentOrder(result.result?.data?.[0] || {});
-  window.setTimeout(() => {
-    refreshOrders().catch(() => {});
-  }, 600);
-  window.setTimeout(() => {
-    refreshOrders().catch(() => {});
-  }, 1800);
-  window.setTimeout(() => {
-    refreshOrders().catch(() => {});
-  }, 4500);
-}
-
 function startAutomationPolling() {
   if (automationPollTimer) {
     clearInterval(automationPollTimer);
@@ -7399,7 +7329,6 @@ async function boot() {
     "autoTakeProfitPct",
     "autoMaxDailyLossPct",
     "autoAutostart",
-    "autoAllowLiveManualOrders",
     "autoAllowLiveTrading",
     "autoAllowLiveAutostart",
     "researchHistoryLimit",
@@ -7677,22 +7606,6 @@ async function boot() {
   $("dock-collapse-bar")?.addEventListener("click", () => {
     if (dashboardState.dockCollapsed) {
       setDockCollapsed(false);
-    }
-  });
-
-  $("spot-order-form").addEventListener("submit", async (event) => {
-    try {
-      await submitOrder(event);
-    } catch (err) {
-      setMessage(err.message, "err");
-    }
-  });
-
-  $("swap-order-form").addEventListener("submit", async (event) => {
-    try {
-      await submitOrder(event);
-    } catch (err) {
-      setMessage(err.message, "err");
     }
   });
 

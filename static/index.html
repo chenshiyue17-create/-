@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>10U战神</title>
-    <link rel="stylesheet" href="/styles.css?v=20260420-runtime-opt1" />
+    <link rel="stylesheet" href="/styles.css?v=20260420-autoquant-only1" />
   </head>
   <body data-view="focus">
     <canvas id="tunnel-bg" aria-hidden="true"></canvas>
@@ -26,7 +26,6 @@
           <button class="nav-link active" type="button" data-view="focus">聚焦工作台</button>
           <button class="nav-link" type="button" data-view="research">策略研究</button>
           <button class="nav-link" type="button" data-view="mirofish">仿真推演</button>
-          <button class="nav-link" type="button" data-view="trade">交易配置</button>
           <button class="nav-link" type="button" data-view="orders">订单终端</button>
           <button class="nav-link" type="button" data-view="market">行情监控</button>
         </nav>
@@ -288,12 +287,12 @@
           </div>
         </section>
 
-        <section class="panel panel-hero" id="config" data-view-group="trade">
+        <section class="panel panel-hero" id="config" data-view-group="research">
           <div class="quick-surface">
             <div class="quick-copy">
               <div class="eyebrow">快速切换</div>
-              <h3>一键切到当前交易上下文</h3>
-              <p>先定环境，再切主盯标，底下表单只负责细调和落单。</p>
+              <h3>一键切到当前自动量化上下文</h3>
+              <p>先定环境，再切主盯标，底下只保留自动量化需要的配置和状态。</p>
             </div>
             <div class="quick-groups">
               <div class="quick-group">
@@ -644,10 +643,6 @@
               <input id="autoAutostart" type="checkbox" />
             </label>
             <label class="checkbox-row">
-              <span>允许手动实盘下单</span>
-              <input id="autoAllowLiveManualOrders" type="checkbox" />
-            </label>
-            <label class="checkbox-row">
               <span>允许实盘自动交易</span>
               <input id="autoAllowLiveTrading" type="checkbox" />
             </label>
@@ -828,7 +823,7 @@
           </div>
         </section>
 
-        <section class="panel panel-grid" id="snapshot" data-view-group="trade">
+        <section class="panel panel-grid" id="snapshot" data-view-group="orders">
           <div class="section-title">
             <div class="eyebrow">账户快照</div>
             <h2>余额、持仓、订单一眼扫清</h2>
@@ -954,8 +949,8 @@
           <div class="order-context-surface">
             <div class="order-context-copy">
               <div class="eyebrow">当前下单上下文</div>
-              <h3>先锁环境，再切币，再下单</h3>
-              <p>订单页只保留你真正会频繁操作的内容：当前环境、当前标的、多币快速切换、下单票据和订单详情。</p>
+              <h3>先锁环境，再切币，再看执行结果</h3>
+              <p>订单页只保留自动量化真正会频繁使用的内容：当前环境、当前标的、多币快速切换、订单流和执行详情。</p>
             </div>
             <div class="order-context-grid">
               <div class="order-context-card">
@@ -966,12 +961,12 @@
               <div class="order-context-card">
                 <span>现货下单标的</span>
                 <strong id="order-spot-label">BTC-USDT</strong>
-                <small>对应现货票据</small>
+                <small>自动量化当前现货上下文</small>
               </div>
               <div class="order-context-card">
                 <span>永续下单标的</span>
                 <strong id="order-swap-label">BTC-USDT-SWAP</strong>
-                <small>对应永续票据</small>
+                <small>自动量化当前永续上下文</small>
               </div>
               <div class="order-context-card">
                 <span>并行 watchlist</span>
@@ -999,39 +994,6 @@
                 <input id="orderSwapInstMirror" type="text" placeholder="BTC-USDT-SWAP" />
               </label>
             </div>
-          </div>
-          <div class="ticket-grid">
-            <form class="ticket" id="spot-order-form">
-              <div class="ticket-head">
-                <h3>现货下单</h3>
-                <span class="pill">tdMode=cash</span>
-              </div>
-              <input type="hidden" name="instId" data-source="spotInstId" />
-              <input type="hidden" name="tdMode" value="cash" />
-              <label><span>方向</span><select name="side"><option value="buy">买入</option><option value="sell">卖出</option></select></label>
-              <label><span>类型</span><select name="ordType"><option value="limit">限价</option><option value="market">市价</option></select></label>
-              <label><span>价格</span><input name="px" placeholder="限价单必填" /></label>
-              <label><span>数量</span><input name="sz" placeholder="如 0.001" /></label>
-              <label><span>Client ID</span><input name="clOrdId" placeholder="可选" /></label>
-              <button class="btn btn-primary" type="submit">提交现货订单</button>
-            </form>
-
-            <form class="ticket" id="swap-order-form">
-              <div class="ticket-head">
-                <h3>永续下单</h3>
-                <span class="pill">cross / isolated</span>
-              </div>
-              <input type="hidden" name="instId" data-source="swapInstId" />
-              <label><span>模式</span><select name="tdMode"><option value="cross">全仓</option><option value="isolated">逐仓</option></select></label>
-              <label><span>方向</span><select name="side"><option value="buy">开多 / 平空</option><option value="sell">开空 / 平多</option></select></label>
-              <label><span>持仓方向</span><select name="posSide"><option value="long">long</option><option value="short">short</option></select></label>
-              <label><span>类型</span><select name="ordType"><option value="limit">限价</option><option value="market">市价</option></select></label>
-              <label><span>价格</span><input name="px" placeholder="限价单必填" /></label>
-              <label><span>张数</span><input name="sz" placeholder="如 1" /></label>
-              <label><span>Client ID</span><input name="clOrdId" placeholder="可选" /></label>
-              <label class="checkbox-row"><span>仅减仓</span><input name="reduceOnly" type="checkbox" /></label>
-              <button class="btn btn-primary" type="submit">提交合约订单</button>
-            </form>
           </div>
           <div class="table-block recent-block">
             <div class="block-head">
@@ -1094,6 +1056,6 @@
     </div>
 
     <!-- BOOTSTRAP_DATA -->
-    <script src="/app.js?v=20260420-runtime-opt1"></script>
+    <script src="/app.js?v=20260420-autoquant-only1"></script>
   </body>
 </html>
