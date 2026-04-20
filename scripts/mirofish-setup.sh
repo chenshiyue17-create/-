@@ -108,6 +108,17 @@ ensure_uv() {
   printf '%s\n' "$uv_bin"
 }
 
+setup_backend_with_venv() {
+  echo "未使用 uv，回退到 Python venv 安装后端依赖..."
+  (
+    cd backend
+    "$PYTHON_BIN" -m venv .venv
+    . .venv/bin/activate
+    python -m pip install --upgrade pip setuptools wheel
+    python -m pip install -r requirements.txt
+  )
+}
+
 NODE_BIN="$(pick_node || true)"
 NPM_CLI="$(pick_npm_cli || true)"
 if [ -z "$NODE_BIN" ] || [ -z "$NPM_CLI" ]; then
@@ -115,11 +126,13 @@ if [ -z "$NODE_BIN" ] || [ -z "$NPM_CLI" ]; then
   exit 1
 fi
 
-UV_BIN="$(ensure_uv)"
+UV_BIN="$(ensure_uv || true)"
 
 export CODEX_PATH
 export UV_PYTHON="$PYTHON_BIN"
-export PATH="$(dirname "$UV_BIN"):$PATH"
+if [ -n "$UV_BIN" ]; then
+  export PATH="$(dirname "$UV_BIN"):$PATH"
+fi
 export PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1
 unset PYTHONHOME PYTHONPATH PYTHONEXECUTABLE PYTHONSTARTUP VIRTUAL_ENV __PYVENV_LAUNCHER__
 
@@ -190,14 +203,24 @@ PY
 
 echo "开始安装 MiroFish 依赖..."
 echo "使用 Python: $UV_PYTHON"
-echo "使用 uv: $UV_BIN"
+if [ -n "$UV_BIN" ]; then
+  echo "使用 uv: $UV_BIN"
+else
+  echo "使用 uv: 未找到，改走 venv 回退链路"
+fi
 echo "使用 Node: $NODE_BIN"
 echo "安装根目录依赖..."
 "$NODE_BIN" "$NPM_CLI" install
 echo "安装前端依赖..."
 ( cd frontend && "$NODE_BIN" "$NPM_CLI" install )
 echo "同步后端依赖..."
-( cd backend && "$UV_BIN" sync )
+if [ -n "$UV_BIN" ]; then
+  if ! ( cd backend && "$UV_BIN" sync ); then
+    setup_backend_with_venv
+  fi
+else
+  setup_backend_with_venv
+fi
 
 echo
 echo "MiroFish 依赖安装完成。"

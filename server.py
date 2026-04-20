@@ -10742,8 +10742,6 @@ class MiroFishRuntimeManager:
             missing.append("node")
         if not command_paths.get("npm_cli"):
             missing.append("npm")
-        if not command_paths.get("uv"):
-            missing.append("uv")
         llm_backend, _graph_backend = env_backends
         if llm_backend == "codex":
             configured = str((env_values or {}).get("MIROFISH_CODEX_COMMAND") or "").strip()
@@ -10751,6 +10749,19 @@ class MiroFishRuntimeManager:
             if not codex_available:
                 missing.append("codex")
         return missing
+
+    def _backend_python_bin(self) -> str:
+        candidates = [
+            MIROFISH_BACKEND_DIR / ".venv" / "bin" / "python",
+            MIROFISH_BACKEND_DIR / ".venv" / "Scripts" / "python.exe",
+        ]
+        for candidate in candidates:
+            try:
+                if candidate.exists() and os.access(candidate, os.X_OK):
+                    return str(candidate)
+            except OSError:
+                continue
+        return ""
 
     def _runtime_env_file_values(self, command_paths: dict[str, str] | None = None) -> dict[str, str]:
         values = self._parse_env_file()
@@ -10778,7 +10789,7 @@ class MiroFishRuntimeManager:
         return (MIROFISH_FRONTEND_DIR / "node_modules").exists()
 
     def _backend_deps_ready(self) -> bool:
-        return (MIROFISH_BACKEND_DIR / ".venv").exists()
+        return bool(self._backend_python_bin())
 
     def _frontend_sources_stale(self) -> bool:
         index_path = self._frontend_dist_index()
@@ -10923,8 +10934,10 @@ class MiroFishRuntimeManager:
         env["FLASK_DEBUG"] = "False"
         for key, value in env_values.items():
             env.setdefault(key, value)
+        backend_python = self._backend_python_bin()
+        command = [commands["uv"], "run", "python", "run.py"] if commands.get("uv") else [backend_python, "run.py"]
         process = subprocess.Popen(
-            [commands["uv"], "run", "python", "run.py"],
+            command,
             cwd=str(MIROFISH_BACKEND_DIR),
             env=env,
             stdout=log_handle,
