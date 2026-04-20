@@ -109,14 +109,28 @@ ensure_uv() {
 }
 
 setup_backend_with_venv() {
+  local requirements_file="${1:-requirements.txt}"
   echo "未使用 uv，回退到 Python venv 安装后端依赖..."
   (
     cd backend
     "$PYTHON_BIN" -m venv .venv
     . .venv/bin/activate
     python -m pip install --upgrade pip setuptools wheel
-    python -m pip install -r requirements.txt
+    python -m pip install -r "$requirements_file"
   )
+}
+
+determine_backend_requirements() {
+  local llm_backend graph_backend
+  llm_backend="$(grep '^MIROFISH_LLM_BACKEND=' .env 2>/dev/null | tail -n 1 | cut -d= -f2- | tr -d '\r' || true)"
+  graph_backend="$(grep '^MIROFISH_GRAPH_BACKEND=' .env 2>/dev/null | tail -n 1 | cut -d= -f2- | tr -d '\r' || true)"
+  llm_backend="${llm_backend:-codex}"
+  graph_backend="${graph_backend:-local}"
+  if [ "$llm_backend" = "codex" ] && [ "$graph_backend" = "local" ]; then
+    printf '%s\n' "requirements-lite.txt"
+  else
+    printf '%s\n' "requirements.txt"
+  fi
 }
 
 NODE_BIN="$(pick_node || true)"
@@ -201,6 +215,8 @@ for key, value in values.items():
 env_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 PY
 
+BACKEND_REQUIREMENTS="$(determine_backend_requirements)"
+
 echo "开始安装 MiroFish 依赖..."
 echo "使用 Python: $UV_PYTHON"
 if [ -n "$UV_BIN" ]; then
@@ -209,6 +225,7 @@ else
   echo "使用 uv: 未找到，改走 venv 回退链路"
 fi
 echo "使用 Node: $NODE_BIN"
+echo "后端依赖清单: backend/$BACKEND_REQUIREMENTS"
 if [ -f "frontend/dist/index.html" ]; then
   echo "检测到已打包前端资源，跳过前端依赖安装。"
 else
@@ -216,12 +233,14 @@ else
   ( cd frontend && "$NODE_BIN" "$NPM_CLI" install --no-fund --no-audit )
 fi
 echo "同步后端依赖..."
-if [ -n "$UV_BIN" ]; then
+if [ "$BACKEND_REQUIREMENTS" = "requirements-lite.txt" ]; then
+  setup_backend_with_venv "$BACKEND_REQUIREMENTS"
+elif [ -n "$UV_BIN" ]; then
   if ! ( cd backend && "$UV_BIN" sync ); then
-    setup_backend_with_venv
+    setup_backend_with_venv "$BACKEND_REQUIREMENTS"
   fi
 else
-  setup_backend_with_venv
+  setup_backend_with_venv "$BACKEND_REQUIREMENTS"
 fi
 
 echo
