@@ -2162,32 +2162,36 @@ def sanitize_only_dip_swing_analysis(analysis: dict[str, Any], automation: dict[
         )
     )
     if aggressive_scalp_mode:
+        candidate_count = int(sanitized.get("candidateCount") or 0)
+        market_candidate_count = int(sanitized.get("marketCandidateCount") or 0)
+        blockers = list(sanitized.get("blockers") or [])
+        symbol_blocked = bool(sanitized.get("symbolPerformanceBlocked")) or bool(sanitized.get("symbolTakerBlocked"))
+        allow_new_entries = bool(sanitized.get("allowNewEntries"))
+        had_direct_open_copy = (
+            str(sanitized.get("decision") or "") == "execute"
+            or "直接开单" in str(sanitized.get("decisionLabel") or "")
+            or "空仓直开" in str(sanitized.get("summary") or "")
+        )
+        can_execute_now = (
+            allow_new_entries
+            and not blockers
+            and not symbol_blocked
+            and (candidate_count > 0 or market_candidate_count > 0)
+        )
         sanitized["executionAbilityPhase"] = "attack"
         sanitized["executionAbilityPhaseLabel"] = "直开"
         sanitized["fundingRatePct"] = ""
         sanitized["basisPct"] = ""
         sanitized["liquidationPrice"] = ""
-        sanitized["allowNewEntries"] = True
-        sanitized["decision"] = "execute"
-        sanitized["decisionLabel"] = "直接开单"
-        sanitized["summary"] = "空仓直开，持仓同向继续循环，单笔净赚 1U+ 就平。"
-        sanitized["blockers"] = []
-        sanitized["warnings"] = [
-            item for item in list(sanitized.get("warnings") or [])
-            if not any(
-                marker in str(item or "")
-                for marker in (
-                    "安全缓冲",
-                    "收缩风险",
-                    "跳过新开仓",
-                    "阻断:",
-                    "临时禁开新仓",
-                    "结构裁判快照",
-                    "等待本轮方向确认",
-                    "taker 占比偏高",
-                )
-            )
-        ]
+        sanitized["allowNewEntries"] = can_execute_now
+        if can_execute_now:
+            sanitized["decision"] = "execute"
+            sanitized["decisionLabel"] = "直接开单"
+            sanitized["summary"] = "空仓直开，持仓同向继续循环，单笔净赚 1U+ 就平。"
+        elif stale or had_direct_open_copy:
+            sanitized["decision"] = "observe" if not blockers else "skip"
+            sanitized["decisionLabel"] = "等待候选过门槛" if not blockers else "当前先不开单"
+            sanitized["summary"] = blockers[0] if blockers else "当前为利润循环模式，但本轮候选还没过执行门槛。"
     return sanitized
 
 
@@ -2221,6 +2225,25 @@ def sanitize_only_dip_swing_runtime_state(state: dict[str, Any], automation: dic
             f"{sanitized['analysis'].get('selectedStrategyName', ONLY_STRATEGY_LABEL)} · "
             f"{sanitized['analysis'].get('decisionLabel', '等待本轮方向确认')}"
         )
+    analysis_allow_new_entries = bool((sanitized.get("analysis") or {}).get("allowNewEntries"))
+    analysis_blockers = list((sanitized.get("analysis") or {}).get("blockers") or [])
+    analysis_entry_vetoes = list((sanitized.get("analysis") or {}).get("entryVetoes") or [])
+    if not analysis_allow_new_entries and (
+        analysis_blockers
+        or analysis_entry_vetoes
+        or not str(last_pipeline.get("summary") or "").strip()
+    ):
+        wait_reason = (
+            analysis_blockers[0]
+            if analysis_blockers
+            else analysis_entry_vetoes[0]
+            if analysis_entry_vetoes
+            else "当前为利润循环模式，但本轮候选还没过执行门槛。"
+        )
+        last_pipeline["summary"] = (
+            f"信号 {(sanitized.get('analysis') or {}).get('decisionLabel', '待分析')} · {wait_reason}"
+        )
+    last_pipeline["allowNewEntries"] = analysis_allow_new_entries
     sanitized["lastPipeline"] = last_pipeline
 
     research = copy.deepcopy(sanitized.get("research") or {})
@@ -2898,13 +2921,23 @@ def enrich_remote_dip_swing_runtime_state(
         ((sanitized.get("lastPipeline") or {}).get("executionSummary") or {}).get("activeSymbols") or 0
     )
     selected_from_market = bool(analysis.get("selectedFromMarketScan"))
+    allow_new_entries = bool(analysis.get("allowNewEntries"))
+    blockers = list(analysis.get("blockers") or [])
+    entry_vetoes = list(analysis.get("entryVetoes") or [])
+    wait_reason = (
+        blockers[0]
+        if blockers
+        else entry_vetoes[0]
+        if entry_vetoes
+        else "当前为利润循环模式，但本轮候选还没过执行门槛。"
+    )
 
     if not analysis.get("warnings"):
         analysis["warnings"] = []
     sanitized["analysis"] = analysis
 
     sanitized["statusText"] = (
-        "运行中" if sanitized.get("running") and bool(analysis.get("allowNewEntries")) else
+        "运行中" if sanitized.get("running") and allow_new_entries else
         (analysis.get("decisionLabel") or "观察中") if sanitized.get("running") else
         "自动量化已停止"
     )
@@ -2916,18 +2949,22 @@ def enrich_remote_dip_swing_runtime_state(
     )
 
     last_pipeline = copy.deepcopy(sanitized.get("lastPipeline") or {})
-    last_pipeline["summary"] = (
-        f"信号 {analysis.get('decisionLabel', '待分析')} · "
-        f"watchlist 候选 {candidate_count} · "
-        f"市场候选 {market_candidate_count} / 扫描 {market_scan_count} · "
-        f"{active_symbols} 币持仓"
-    )
+    if allow_new_entries or candidate_count > 0 or market_candidate_count > 0:
+        last_pipeline["summary"] = (
+            f"信号 {analysis.get('decisionLabel', '待分析')} · "
+            f"watchlist 候选 {candidate_count} · "
+            f"市场候选 {market_candidate_count} / 扫描 {market_scan_count} · "
+            f"{active_symbols} 币持仓"
+        )
+    else:
+        last_pipeline["summary"] = f"信号 {analysis.get('decisionLabel', '待分析')} · {wait_reason}"
+    last_pipeline["allowNewEntries"] = allow_new_entries
     sanitized["lastPipeline"] = last_pipeline
 
     last_applied = copy.deepcopy(sanitized.get("lastAppliedStrategy") or {})
     last_applied["title"] = analysis.get("selectedStrategyName") or f"BTC {ONLY_STRATEGY_LABEL}"
     last_applied["detail"] = strategy_detail_line(effective)
-    last_applied["stage"] = "running" if bool(analysis.get("allowNewEntries")) else "synced"
+    last_applied["stage"] = "running" if allow_new_entries else "synced"
     last_applied["appliedAt"] = sanitized.get("lastCycleAt") or last_applied.get("appliedAt") or now_local_iso()
     sanitized["lastAppliedStrategy"] = last_applied
     return sanitized
@@ -9348,10 +9385,31 @@ def build_dip_swing_analysis(
         blockers.append(
             f"{selected_symbol} 近期 taker 占比 {compact_metric(recent_taker_fill_pct, '0.1')}%，先暂停这只币"
         )
+    if position_side == "flat" and candidate_count == 0 and market_candidate_count == 0 and not blockers:
+        if entry_vetoes:
+            blockers.append(f"{selected_symbol} 未过结构裁判：{entry_vetoes[0]}")
+        elif not liquidity_ready:
+            blockers.append(f"{selected_symbol} 流动性不足，先不进场")
+        elif not edge_cost_ready:
+            blockers.append(
+                f"{selected_symbol} 结构优势/成本比只有 {compact_metric(edge_cost_ratio, '0.01')}x，先不进场"
+            )
+        elif not range_cost_ready:
+            blockers.append(
+                f"{selected_symbol} 波动/成本比只有 {compact_metric(range_cost_ratio, '0.01')}x，先不进场"
+            )
+        elif not atr_cost_ready:
+            blockers.append(
+                f"{selected_symbol} ATR/成本比只有 {compact_metric(atr_cost_ratio, '0.01')}x，先不进场"
+            )
+        else:
+            blockers.append(f"{selected_symbol} 本轮候选还没过执行门槛")
 
-    allow_new_entries = True if aggressive_scalp_mode else (not blockers)
+    allow_new_entries = not blockers
     if aggressive_scalp_mode and position_side == "flat":
         allow_new_entries = (
+            not blockers
+            and
             projected_entry_net_pnl >= DIP_SWING_NET_TARGET_USDT
             and predicted_net_pct >= required_predicted_net_pct
             and not symbol_performance_blocked
@@ -9452,6 +9510,7 @@ def build_dip_swing_analysis(
         "openInterest": str(open_interest),
         "warnings": warnings,
         "blockers": blockers,
+        "entryVetoes": entry_vetoes,
         "selectedConfig": deep_merge({}, selected_config),
         "selectedWatchlistSymbol": selected_symbol,
         "executionWatchlistSymbols": execution_symbols,

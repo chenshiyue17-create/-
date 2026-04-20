@@ -2793,32 +2793,38 @@ function sanitizeAnalysisForSwingOnly(analysis = {}) {
   data.selectedStrategyName = `${symbol} 利润循环`;
   data.selectedStrategyDetail = `方向驱动 + 无脑直开 · 逐仓 ${config.swapLeverage || "10"}x · 每单净赚 1U+ 就平`;
   if (stale || scalpMode) {
+    const candidateCount = Number(data.candidateCount || 0);
+    const marketCandidateCount = Number(data.marketCandidateCount || 0);
+    const blockers = Array.isArray(data.blockers) ? data.blockers.filter(Boolean) : [];
+    const symbolBlocked = Boolean(data.symbolPerformanceBlocked) || Boolean(data.symbolTakerBlocked);
     const allowNewEntries = Boolean(data.allowNewEntries);
-    data.decision = allowNewEntries ? "execute" : "observe";
-    data.decisionLabel = allowNewEntries ? "直接开单" : "等待本轮方向确认";
-    data.summary = allowNewEntries
-      ? "空仓直开，持仓同向继续循环，单笔净赚 1U+ 就平。"
-      : "等待本轮方向确认。";
+    const hadDirectOpenCopy = (
+      String(data.decision || "") === "execute"
+      || String(data.decisionLabel || "").includes("直接开单")
+      || String(data.summary || "").includes("空仓直开")
+    );
+    const canExecuteNow = (
+      allowNewEntries
+      && blockers.length === 0
+      && !symbolBlocked
+      && (candidateCount > 0 || marketCandidateCount > 0)
+    );
+    if (canExecuteNow) {
+      data.decision = "execute";
+      data.decisionLabel = "直接开单";
+      data.summary = "空仓直开，持仓同向继续循环，单笔净赚 1U+ 就平。";
+    } else if (stale || hadDirectOpenCopy) {
+      data.decision = blockers.length ? "skip" : "observe";
+      data.decisionLabel = blockers.length ? "当前先不开单" : "等待候选过门槛";
+      data.summary = blockers[0] || "当前为利润循环模式，但本轮候选还没过执行门槛。";
+    }
     data.marketRegime = "24h 利润循环";
     data.executionAbilityPhase = "attack";
     data.executionAbilityPhaseLabel = "直开";
     data.fundingRatePct = "";
     data.basisPct = "";
     data.liquidationPrice = "";
-    data.warnings = (data.warnings || []).filter((item) => {
-      const text = String(item || "");
-      return ![
-        "安全缓冲",
-        "收缩风险",
-        "跳过新开仓",
-        "阻断:",
-        "临时禁开新仓",
-        "结构裁判快照",
-        "等待本轮方向确认",
-        "taker 占比偏高",
-      ].some((marker) => text.includes(marker));
-    });
-    data.blockers = [];
+    data.allowNewEntries = canExecuteNow;
   }
   return data;
 }
