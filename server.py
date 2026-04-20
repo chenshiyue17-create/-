@@ -56,8 +56,8 @@ from strategy_execution_gate import (
     DIP_SWING_RELU_SOFT_MAX_DEFICIT_PCT,
     DIP_SWING_SYMBOL_MAX_TAKER_FILL_PCT,
     build_dip_swing_relu_gate,
-    build_execution_overlay_snapshot,
 )
+from strategy_research_review import review_research_candidates_with_execution_gate
 from trade_quaternion import build_execution_quaternion, build_research_quaternion
 
 
@@ -6966,51 +6966,6 @@ def evaluate_candidate_entry(
     }
 
 
-def review_research_candidates_with_execution_gate(
-    entries: list[dict[str, Any]],
-    client: OkxClient,
-    *,
-    limit: int = 3,
-) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
-    if not entries:
-        return entries, None
-    reviewed: list[dict[str, Any]] = []
-    evaluated: list[dict[str, Any]] = []
-    review_limit = max(1, min(limit, len(entries)))
-
-    for index, entry in enumerate(entries):
-        enriched = copy.deepcopy(entry)
-        base_score = safe_decimal(entry.get("score"), "0")
-        if index < review_limit:
-            full_config = deep_merge(default_automation_config(), entry.get("fullConfig") or entry.get("config") or {})
-            full_config = enforce_only_dip_swing_strategy(full_config)
-            try:
-                analysis = build_execution_analysis(full_config, client)
-                overlay = build_execution_overlay_snapshot(analysis, base_score=base_score)
-            except Exception as exc:
-                overlay = {
-                    "evaluated": False,
-                    "error": str(exc),
-                    "combinedScore": decimal_to_str(base_score),
-                }
-            enriched["executionOverlay"] = overlay
-            enriched["combinedScore"] = str(overlay.get("combinedScore") or entry.get("score") or "0")
-            if overlay.get("evaluated"):
-                evaluated.append(enriched)
-        reviewed.append(enriched)
-
-    if not evaluated:
-        return reviewed, None
-    selected = max(
-        evaluated,
-        key=lambda item: safe_decimal(
-            ((item.get("executionOverlay") or {}).get("combinedScore") or item.get("combinedScore") or item.get("score")),
-            "0",
-        ),
-    )
-    return reviewed, selected
-
-
 def pick_seed_candidates(
     config: dict[str, Any],
     options: dict[str, Any],
@@ -7427,10 +7382,19 @@ def research_optimize(config: dict[str, Any], options: dict[str, Any], client: O
     )
     leaderboard = ranked_entries[: int(adjusted_options["raceSize"])]
     population = ranked_entries[: int(adjusted_options.get("populationSize") or adjusted_options["raceSize"])]
-    reviewed_leaderboard, recommended_entry = review_research_candidates_with_execution_gate(leaderboard, client)
+    reviewed_leaderboard, recommended_entry = review_research_candidates_with_execution_gate(
+        leaderboard,
+        client,
+        default_config_factory=default_automation_config,
+        enforce_strategy=enforce_only_dip_swing_strategy,
+        analysis_builder=build_execution_analysis,
+    )
     reviewed_population, _ = review_research_candidates_with_execution_gate(
         population,
         client,
+        default_config_factory=default_automation_config,
+        enforce_strategy=enforce_only_dip_swing_strategy,
+        analysis_builder=build_execution_analysis,
         limit=min(5, int(adjusted_options["raceSize"])),
     )
     if best_report is None:
