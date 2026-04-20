@@ -8999,11 +8999,28 @@ def build_dip_swing_analysis(
     market_snapshots = target_snapshots + extra_market_snapshots
     watchlist_entry_ready_snapshots = [row for row in target_snapshots if bool(row.get("candidate"))]
     market_entry_ready_snapshots = [row for row in market_snapshots if bool(row.get("candidate"))]
+    watchlist_positive_snapshots = [
+        row
+        for row in target_snapshots
+        if safe_decimal((row.get("profitLoop") or {}).get("predictedNetPct"), "0") > Decimal("0")
+    ]
     market_positive_snapshots = [
         row
         for row in market_snapshots
         if safe_decimal((row.get("profitLoop") or {}).get("predictedNetPct"), "0") > Decimal("0")
     ]
+    snapshot_is_viable = lambda row: (
+        safe_decimal((row.get("profitLoop") or {}).get("predictedNetPct"), "0") > Decimal("0")
+        and bool(row.get("liquidityReady"))
+        and bool(row.get("edgeCostReady"))
+        and bool(row.get("rangeCostReady"))
+        and bool(row.get("atrCostReady"))
+        and not bool(row.get("symbolPerformanceBlocked"))
+        and not bool(row.get("symbolTakerBlocked"))
+        and not bool(row.get("symbolPressureBlocked"))
+    )
+    watchlist_viable_snapshots = [row for row in target_snapshots if snapshot_is_viable(row)]
+    market_viable_snapshots = [row for row in market_snapshots if snapshot_is_viable(row)]
 
     ranking_key = lambda row: (
         safe_decimal((row.get("profitLoop") or {}).get("loopQualityScore"), "-999"),
@@ -9021,8 +9038,16 @@ def build_dip_swing_analysis(
                 safe_decimal((row.get("profitLoop") or {}).get("loopQualityScore"), "-999"),
             ),
         )
+    elif watchlist_entry_ready_snapshots:
+        selected_snapshot = max(watchlist_entry_ready_snapshots, key=ranking_key)
     elif market_entry_ready_snapshots:
         selected_snapshot = max(market_entry_ready_snapshots, key=ranking_key)
+    elif watchlist_viable_snapshots:
+        selected_snapshot = max(watchlist_viable_snapshots, key=ranking_key)
+    elif market_viable_snapshots:
+        selected_snapshot = max(market_viable_snapshots, key=ranking_key)
+    elif watchlist_positive_snapshots:
+        selected_snapshot = max(watchlist_positive_snapshots, key=ranking_key)
     elif market_positive_snapshots:
         selected_snapshot = max(market_positive_snapshots, key=ranking_key)
     elif target_snapshots:
@@ -9169,6 +9194,8 @@ def build_dip_swing_analysis(
     loop_quality_score = safe_decimal(loop_metrics.get("loopQualityScore"), "0")
     candidate_count = len(watchlist_entry_ready_snapshots)
     market_candidate_count = len(market_entry_ready_snapshots)
+    watchlist_viable_count = len(watchlist_viable_snapshots)
+    market_viable_count = len(market_viable_snapshots)
     market_positive_count = len(market_positive_snapshots)
     top_candidates = [
         {
@@ -9179,14 +9206,23 @@ def build_dip_swing_analysis(
             "atrPct": compact_metric(safe_decimal(row.get("atrPct"), "0"), "0.01"),
         }
         for row in sorted(
-            market_entry_ready_snapshots or market_positive_snapshots,
+            market_entry_ready_snapshots
+            or watchlist_viable_snapshots
+            or market_viable_snapshots
+            or watchlist_positive_snapshots
+            or market_positive_snapshots,
             key=ranking_key,
             reverse=True,
         )[:3]
     ]
 
     execution_candidate_rows = sorted(
-        market_positive_snapshots or market_snapshots,
+        market_entry_ready_snapshots
+        or watchlist_viable_snapshots
+        or market_viable_snapshots
+        or watchlist_positive_snapshots
+        or market_positive_snapshots
+        or market_snapshots,
         key=ranking_key,
         reverse=True,
     )
@@ -9375,7 +9411,7 @@ def build_dip_swing_analysis(
         )
     if position_side == "flat" and predicted_net_pct < required_predicted_net_pct:
         blockers.append(
-            f"预期净优势只有 {compact_metric(predicted_net_pct, '0.01')}%，低于开仓门槛 {compact_metric(required_predicted_net_pct, '0.01')}%"
+            f"预期净优势只有 {compact_metric(predicted_net_pct, '0.001')}%，低于开仓门槛 {compact_metric(required_predicted_net_pct, '0.001')}%"
         )
     if position_side == "flat" and symbol_performance_blocked:
         blockers.append(
@@ -9518,8 +9554,10 @@ def build_dip_swing_analysis(
         "selectedFromMarketScan": selected_from_market,
         "watchlistCount": len(watchlist_symbols),
         "candidateCount": candidate_count,
+        "watchlistViableCount": watchlist_viable_count,
         "marketScanCount": len(market_snapshots),
         "marketCandidateCount": market_candidate_count,
+        "marketViableCount": market_viable_count,
         "marketPositiveCount": market_positive_count,
         "marketTopCandidates": top_candidates,
         "plannedSide": planned_side,
