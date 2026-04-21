@@ -76,7 +76,19 @@ MIROFISH_FRONTEND_DIR = MIROFISH_ROOT / "frontend"
 MIROFISH_FRONTEND_DIST_DIR = MIROFISH_FRONTEND_DIR / "dist"
 MIROFISH_BACKEND_DIR = MIROFISH_ROOT / "backend"
 MIROFISH_ENV_PATH = MIROFISH_ROOT / ".env"
-DATA_DIR = Path(os.environ.get("OKX_LOCAL_APP_DATA_DIR", APP_DIR / "data"))
+
+
+def default_data_dir() -> Path:
+    """Keep runtime-app code updates from silently switching to a fresh data dir."""
+    configured = str(os.environ.get("OKX_LOCAL_APP_DATA_DIR") or "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    if APP_DIR.name == "runtime-app" and APP_DIR.parent.name == "OKXLocalApp":
+        return APP_DIR.parent / "data"
+    return APP_DIR / "data"
+
+
+DATA_DIR = default_data_dir()
 CONFIG_PATH = DATA_DIR / "local-config.json"
 AUTOMATION_CONFIG_PATH = DATA_DIR / "automation-config.json"
 AUTOMATION_STATE_PATH = DATA_DIR / "automation-state.json"
