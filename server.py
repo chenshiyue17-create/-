@@ -61,6 +61,10 @@ from strategy_auto_optimization import (
     StrategyAutoOptimizationDependencies,
     StrategyAutoOptimizationManager,
 )
+from mirofish_auto_simulation import (
+    MiroFishAutoSimulationDependencies,
+    MiroFishAutoSimulationManager as ExtractedMiroFishAutoSimulationManager,
+)
 from strategy_research_review import review_research_candidates_with_execution_gate
 from trade_quaternion import build_execution_quaternion, build_research_quaternion
 
@@ -11563,7 +11567,7 @@ class MiroFishRuntimeManager:
 MIROFISH_RUNTIME = MiroFishRuntimeManager()
 
 
-class MiroFishAutoSimulationManager:
+class _LegacyMiroFishAutoSimulationManager:
     def __init__(self) -> None:
         self.lock = threading.RLock()
         self.state: dict[str, Any] = self._blank_state()
@@ -16531,7 +16535,6 @@ MINER_STATE = JsonStore(MINER_STATE_PATH, default_miner_state)
 MAC_LOTTO = MacLottoManager()
 AUTOMATION_ENGINE = AutomationEngine(CONFIG, AUTOMATION_CONFIG, AUTOMATION_STATE)
 PRIVATE_ORDER_STREAM = OkxPrivateOrderStream()
-MIROFISH_AUTO_SIMULATION = MiroFishAutoSimulationManager()
 STRATEGY_AUTO_OPTIMIZATION = StrategyAutoOptimizationManager(
     StrategyAutoOptimizationDependencies(
         automation_state=AUTOMATION_STATE,
@@ -16550,6 +16553,20 @@ STRATEGY_AUTO_OPTIMIZATION = StrategyAutoOptimizationManager(
         validate_automation_config=validate_automation_config,
         build_automation_config_diff=build_automation_config_diff,
         normalize_remote_automation_config_payload=normalize_remote_automation_config_payload,
+    )
+)
+MIROFISH_AUTO_SIMULATION = ExtractedMiroFishAutoSimulationManager(
+    MiroFishAutoSimulationDependencies(
+        config=CONFIG,
+        mirofish_runtime=MIROFISH_RUNTIME,
+        strategy_auto_optimization=STRATEGY_AUTO_OPTIMIZATION,
+        now_local_iso=now_local_iso,
+        build_runtime_snapshot=build_runtime_snapshot,
+        runtime_snapshot_type=RuntimeSnapshot,
+        mirofish_backend_port=MIROFISH_BACKEND_PORT,
+        mirofish_backend_dir=MIROFISH_BACKEND_DIR,
+        mirofish_runtime_dir=MIROFISH_RUNTIME_DIR,
+        mirofish_app_base=MIROFISH_APP_BASE,
     )
 )
 MIROFISH_AUTOPILOT = MiroFishAutopilotManager(MIROFISH_AUTOPILOT_CONFIG)
