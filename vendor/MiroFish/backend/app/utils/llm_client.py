@@ -157,12 +157,28 @@ class LLMClient:
             )
             if result.returncode != 0:
                 stderr = (result.stderr or result.stdout or "").strip()
-                raise RuntimeError(stderr or "Codex CLI 执行失败")
+                raise RuntimeError(self._format_codex_error(stderr or "Codex CLI 执行失败"))
             content = output_path.read_text(encoding="utf-8", errors="ignore").strip()
             content = re.sub(r'<think>[\s\S]*?</think>', '', content).strip()
+            if not content:
+                raise RuntimeError("Codex CLI 未返回有效内容，请检查额度、登录状态或改用 LLM_API_KEY。")
             return content
         finally:
             try:
                 output_path.unlink(missing_ok=True)
             except Exception:
                 pass
+
+    def _format_codex_error(self, raw_text: str) -> str:
+        text = str(raw_text or "").strip()
+        lowered = text.lower()
+        if "usage limit" in lowered or "upgrade to pro" in lowered or "purchase more credits" in lowered:
+            return "本地 Codex CLI 当前额度不足，无法继续生成智能推演结果。请在 Codex 中补充额度，或在 MiroFish/.env 配置可用的 LLM_API_KEY。"
+        if "failed to open state db" in lowered or "failed to initialize state runtime" in lowered:
+            return "本地 Codex CLI 状态库异常，请重启 Codex 或清理 ~/.codex 状态缓存后重试。"
+        if not text:
+            return "Codex CLI 执行失败"
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if len(lines) > 8:
+            lines = lines[-8:]
+        return "\n".join(lines)

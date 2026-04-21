@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>10U战神</title>
-    <link rel="stylesheet" href="/styles.css?v=20260421-quaternion-ui10" />
+    <link rel="stylesheet" href="/styles.css?v=20260421-quaternion-ui11" />
   </head>
   <body data-view="focus">
     <canvas id="tunnel-bg" aria-hidden="true"></canvas>
@@ -781,7 +781,7 @@
             <div class="block-head">
               <div>
                 <h3>自动驾驶</h3>
-                <small class="subtle">按固定周期自动推演、自动回写策略，并尝试恢复量化运行。</small>
+                <small class="subtle">按分钟级周期与订单变化实时触发推演、自动回写策略，并尝试恢复量化运行。</small>
               </div>
               <span class="pill" id="mirofish-autopilot-pill">待同步</span>
             </div>
@@ -809,8 +809,8 @@
               </label>
               <label>
                 <span>每轮间隔（分钟）</span>
-                <input id="mirofish-autopilot-interval" type="number" min="15" max="1440" step="5" value="60" />
-                <small class="field-hint">监督线程每 15 秒评估一次，到点后自动触发推演。</small>
+                <input id="mirofish-autopilot-interval" type="number" min="1" max="1440" step="1" value="3" />
+                <small class="field-hint">监督线程每 5 秒评估一次，到点或检测到新订单后自动触发推演。</small>
               </label>
               <label>
                 <span>触发模式</span>
@@ -1091,6 +1091,6 @@
     </div>
 
     <!-- BOOTSTRAP_DATA -->
-    <script src="/app.js?v=20260421-quaternion-ui10"></script>
+    <script src="/app.js?v=20260421-quaternion-ui11"></script>
   </body>
 </html>

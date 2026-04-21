@@ -212,29 +212,20 @@ class OntologyGenerator:
             {"role": "user", "content": user_message}
         ]
         
-        if getattr(self.llm_client, "use_codex", False):
-            logger.info("当前运行在本地自主模式，直接使用确定性本体生成。")
+        try:
+            result = self.llm_client.chat_json(
+                messages=messages,
+                temperature=0.3,
+                max_tokens=4096
+            )
+        except Exception as exc:
+            logger.warning("LLM 本体生成失败，回退到本地确定性生成: %s", exc)
             result = self._build_local_fallback_ontology(
                 document_texts=document_texts,
                 simulation_requirement=simulation_requirement,
                 additional_context=additional_context,
-                error_message="当前推演改走本地确定性生成链路，不依赖外部 LLM 配额。",
+                error_message=str(exc),
             )
-        else:
-            try:
-                result = self.llm_client.chat_json(
-                    messages=messages,
-                    temperature=0.3,
-                    max_tokens=4096
-                )
-            except Exception as exc:
-                logger.warning("LLM 本体生成失败，回退到本地确定性生成: %s", exc)
-                result = self._build_local_fallback_ontology(
-                    document_texts=document_texts,
-                    simulation_requirement=simulation_requirement,
-                    additional_context=additional_context,
-                    error_message=str(exc),
-                )
         
         # 验证和后处理
         result = self._validate_and_process(result)

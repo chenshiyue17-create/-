@@ -1607,6 +1607,8 @@ def default_automation_state() -> dict[str, Any]:
             "nextRunAt": "",
             "lastMode": "",
             "lastOrdersCount": 0,
+            "lastTriggerSource": "",
+            "lastOrderAt": "",
             "lastError": "",
             "taskId": "",
             "config": default_mirofish_autopilot_config(),
@@ -1617,9 +1619,9 @@ def default_automation_state() -> dict[str, Any]:
 def default_mirofish_autopilot_config() -> dict[str, Any]:
     return {
         "enabled": True,
-        "intervalMinutes": 60,
+        "intervalMinutes": 3,
         "mode": "orders_first",
-        "minOrdersCount": 12,
+        "minOrdersCount": 3,
         "autoStartRuntime": True,
         "autoResumeAutomation": True,
     }
@@ -1630,11 +1632,19 @@ def normalize_mirofish_autopilot_config(payload: dict[str, Any] | None = None) -
     mode = str(raw.get("mode") or "orders_first").strip().lower()
     if mode not in {"orders_first", "orders_only", "strategy_only"}:
         mode = "orders_first"
+    interval_minutes = clamp_int(raw.get("intervalMinutes", 3), 1, 24 * 60)
+    min_orders_count = clamp_int(raw.get("minOrdersCount", 3), 1, 200)
+    # 旧版本默认按 60 分钟 / 12 笔订单触发，这会把闭环拖成“小时级批处理”。
+    # 当前项目明确切到分钟级监督与订单驱动，因此将旧默认值迁回实时档位。
+    if interval_minutes == 60:
+        interval_minutes = 3
+    if min_orders_count == 12:
+        min_orders_count = 3
     return {
         "enabled": flag_true(raw.get("enabled", True)),
-        "intervalMinutes": clamp_int(raw.get("intervalMinutes", 60), 15, 24 * 60),
+        "intervalMinutes": interval_minutes,
         "mode": mode,
-        "minOrdersCount": clamp_int(raw.get("minOrdersCount", 12), 1, 200),
+        "minOrdersCount": min_orders_count,
         "autoStartRuntime": flag_true(raw.get("autoStartRuntime", True)),
         "autoResumeAutomation": flag_true(raw.get("autoResumeAutomation", True)),
     }
@@ -12606,6 +12616,9 @@ class MiroFishAutopilotManager:
             "nextRunAt": "",
             "lastMode": "",
             "lastOrdersCount": 0,
+            "lastTriggerSource": "",
+            "lastOrderSignal": "",
+            "lastOrderAt": "",
             "lastError": "",
             "taskId": "",
             "config": normalize_mirofish_autopilot_config(self.config_store.current()),
@@ -12666,8 +12679,8 @@ class MiroFishAutopilotManager:
     def _compute_due_at(self, last_triggered_at: str, interval_minutes: int) -> datetime:
         last_triggered = parse_iso(str(last_triggered_at or ""))
         if last_triggered is None:
-            return datetime.now() - timedelta(minutes=max(15, interval_minutes))
-        return last_triggered + timedelta(minutes=max(15, interval_minutes))
+            return datetime.now() - timedelta(minutes=max(1, interval_minutes))
+        return last_triggered + timedelta(minutes=max(1, interval_minutes))
 
     def _recent_orders_count(self) -> int:
         try:
@@ -12675,6 +12688,51 @@ class MiroFishAutopilotManager:
             return len(((snapshot.execution_journal or {}).get("orders") or []))
         except Exception:
             return 0
+
+    def _recent_orders_signal(self) -> tuple[int, str, str]:
+        try:
+            snapshot = build_runtime_snapshot(include_account=False, remote_timeout=2.5)
+            orders_payload = snapshot.orders_payload(limit=40)
+            journal = orders_payload.get("journal") or {}
+            orders = list((snapshot.execution_journal or {}).get("orders") or [])
+            orders_count = len(orders)
+            latest_order_at = str(journal.get("latestOrderAt") or "")
+            today_count = int(journal.get("todayOrderCount") or 0)
+            recent_symbols: list[str] = []
+            for order in orders[:6]:
+                inst_id = str(order.get("instId") or "").strip()
+                if inst_id and inst_id not in recent_symbols:
+                    recent_symbols.append(inst_id)
+            signal_key = "|".join(
+                part for part in [
+                    latest_order_at,
+                    str(today_count),
+                    str(orders_count),
+                    ",".join(recent_symbols[:3]),
+                ] if part
+            )
+            return orders_count, signal_key, latest_order_at
+        except Exception:
+            return 0, "", ""
+
+    def _order_flow_trigger(
+        self,
+        *,
+        snapshot_state: dict[str, Any],
+        chosen_mode: str | None,
+        orders_count: int,
+        signal_key: str,
+    ) -> tuple[bool, str]:
+        if chosen_mode != "orders" or orders_count <= 0 or not signal_key:
+            return False, ""
+        last_signal = str(snapshot_state.get("lastOrderSignal") or "")
+        if signal_key == last_signal:
+            return False, ""
+        last_triggered = parse_iso(str(snapshot_state.get("lastTriggeredAt") or ""))
+        if last_triggered is not None:
+            if (datetime.now() - last_triggered).total_seconds() < 45:
+                return False, ""
+        return True, "检测到新订单流，立即按订单推演。"
 
     def _select_mode(self, config: dict[str, Any], orders_count: int) -> tuple[str | None, str]:
         mode = str(config.get("mode") or "orders_first")
@@ -12692,7 +12750,7 @@ class MiroFishAutopilotManager:
     def _supervisor_loop(self) -> None:
         self._update(
             status="waiting",
-            message="自动驾驶监督线程已启动，等待下一轮评估。",
+            message="自动驾驶监督线程已启动，正在实时监听订单与策略变化。",
             startedAt=now_local_iso(),
         )
         while True:
@@ -12700,11 +12758,12 @@ class MiroFishAutopilotManager:
                 config = self._config()
                 sim_state = MIROFISH_AUTO_SIMULATION.snapshot()
                 opt_state = STRATEGY_AUTO_OPTIMIZATION.snapshot()
+                state_snapshot = self.snapshot()
                 now_dt = datetime.now()
                 last_completed_at = str(
                     sim_state.get("completedAt")
                     or opt_state.get("completedAt")
-                    or self.snapshot().get("lastCompletedAt")
+                    or state_snapshot.get("lastCompletedAt")
                     or ""
                 )
                 if not bool(config.get("enabled")):
@@ -12716,7 +12775,7 @@ class MiroFishAutopilotManager:
                         nextRunAt="",
                         lastCompletedAt=last_completed_at,
                     )
-                    time.sleep(15.0)
+                    time.sleep(5.0)
                     continue
 
                 if sim_state.get("running") or opt_state.get("running"):
@@ -12731,30 +12790,37 @@ class MiroFishAutopilotManager:
                         message=busy_message,
                         lastEvaluatedAt=now_local_iso(),
                         lastCompletedAt=last_completed_at,
-                        taskId=str(sim_state.get("taskId") or self.snapshot().get("taskId") or ""),
-                        nextRunAt=self.snapshot().get("nextRunAt") or "",
+                        taskId=str(sim_state.get("taskId") or state_snapshot.get("taskId") or ""),
+                        nextRunAt=state_snapshot.get("nextRunAt") or "",
                     )
-                    time.sleep(15.0)
+                    time.sleep(5.0)
                     continue
 
-                orders_count = self._recent_orders_count()
+                orders_count, order_signal, latest_order_at = self._recent_orders_signal()
                 due_at = self._compute_due_at(
-                    str(self.snapshot().get("lastTriggeredAt") or ""),
-                    int(config.get("intervalMinutes") or 60),
+                    str(state_snapshot.get("lastTriggeredAt") or ""),
+                    int(config.get("intervalMinutes") or 3),
                 )
                 next_run_at = due_at.isoformat(timespec="seconds")
                 chosen_mode, reason = self._select_mode(config, orders_count)
-                if due_at > now_dt:
+                event_ready, event_reason = self._order_flow_trigger(
+                    snapshot_state=state_snapshot,
+                    chosen_mode=chosen_mode,
+                    orders_count=orders_count,
+                    signal_key=order_signal,
+                )
+                if due_at > now_dt and not event_ready:
                     self._update(
                         enabled=True,
                         status="waiting",
                         message=reason,
                         lastEvaluatedAt=now_local_iso(),
                         lastOrdersCount=orders_count,
+                        lastOrderAt=latest_order_at,
                         lastCompletedAt=last_completed_at,
                         nextRunAt=next_run_at,
                     )
-                    time.sleep(15.0)
+                    time.sleep(5.0)
                     continue
 
                 if not chosen_mode:
@@ -12764,10 +12830,11 @@ class MiroFishAutopilotManager:
                         message=reason,
                         lastEvaluatedAt=now_local_iso(),
                         lastOrdersCount=orders_count,
+                        lastOrderAt=latest_order_at,
                         lastCompletedAt=last_completed_at,
                         nextRunAt=(now_dt + timedelta(minutes=5)).isoformat(timespec="seconds"),
                     )
-                    time.sleep(15.0)
+                    time.sleep(5.0)
                     continue
 
                 if config.get("autoStartRuntime", True):
@@ -12781,23 +12848,29 @@ class MiroFishAutopilotManager:
                             message="自动驾驶等待 MiroFish 运行时手动启动。",
                             lastEvaluatedAt=now_local_iso(),
                             lastOrdersCount=orders_count,
+                            lastOrderAt=latest_order_at,
                             nextRunAt=(now_dt + timedelta(minutes=5)).isoformat(timespec="seconds"),
                         )
-                        time.sleep(15.0)
+                        time.sleep(5.0)
                         continue
 
                 task = MIROFISH_AUTO_SIMULATION.start(chosen_mode)
+                trigger_source = "event" if event_ready else "schedule"
+                trigger_message = event_reason if event_ready else f"已触发{reason}"
                 self._update(
                     enabled=True,
                     status="triggered",
-                    message=f"已触发{reason}",
+                    message=trigger_message,
                     lastEvaluatedAt=now_local_iso(),
                     lastTriggeredAt=now_local_iso(),
                     lastMode=chosen_mode,
                     lastOrdersCount=orders_count,
+                    lastTriggerSource=trigger_source,
+                    lastOrderSignal=order_signal,
+                    lastOrderAt=latest_order_at,
                     taskId=str(task.get("taskId") or ""),
                     lastError="",
-                    nextRunAt=(now_dt + timedelta(minutes=int(config.get('intervalMinutes') or 60))).isoformat(timespec="seconds"),
+                    nextRunAt=(now_dt + timedelta(minutes=int(config.get('intervalMinutes') or 3))).isoformat(timespec="seconds"),
                 )
             except Exception as exc:
                 self._update(
@@ -12807,7 +12880,7 @@ class MiroFishAutopilotManager:
                     lastEvaluatedAt=now_local_iso(),
                     lastError=str(exc),
                 )
-            time.sleep(15.0)
+            time.sleep(5.0)
 
 
 class MacLottoManager:

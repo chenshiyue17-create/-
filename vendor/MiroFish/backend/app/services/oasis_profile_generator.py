@@ -208,6 +208,20 @@ class OasisProfileGenerator:
                 self.zep_client = Zep(api_key=self.zep_api_key)
             except Exception as e:
                 logger.warning(f"Zep客户端初始化失败: {e}")
+
+    @staticmethod
+    def _is_non_retryable_llm_error(exc: Exception) -> bool:
+        lowered = str(exc or "").lower()
+        return any(
+            marker in lowered
+            for marker in (
+                "usage limit",
+                "upgrade to pro",
+                "purchase more credits",
+                "codex cli 当前额度不足",
+                "状态库异常",
+            )
+        )
     
     def generate_profile_from_entity(
         self, 
@@ -512,12 +526,6 @@ class OasisProfileGenerator:
         
         is_individual = self._is_individual_entity(entity_type)
 
-        if getattr(self.llm_client, "use_codex", False):
-            logger.info(f"Codex/local 模式启用，直接使用规则生成 {entity_name} 的画像")
-            return self._generate_profile_rule_based(
-                entity_name, entity_type, entity_summary, entity_attributes
-            )
-        
         if is_individual:
             prompt = self._build_individual_persona_prompt(
                 entity_name, entity_type, entity_summary, entity_attributes, context
@@ -530,8 +538,10 @@ class OasisProfileGenerator:
         # 尝试多次生成，直到成功或达到最大重试次数
         max_attempts = 3
         last_error = None
+        attempts_used = 0
         
         for attempt in range(max_attempts):
+            attempts_used = attempt + 1
             try:
                 result = self.llm_client.chat_json(
                     messages=[
@@ -550,10 +560,12 @@ class OasisProfileGenerator:
             except Exception as e:
                 logger.warning(f"LLM调用失败 (attempt {attempt+1}): {str(e)[:80]}")
                 last_error = e
+                if self._is_non_retryable_llm_error(e):
+                    break
                 import time
                 time.sleep(1 * (attempt + 1))  # 指数退避
         
-        logger.warning(f"LLM生成人设失败（{max_attempts}次尝试）: {last_error}, 使用规则生成")
+        logger.warning(f"LLM生成人设失败（{attempts_used}次尝试）: {last_error}, 使用规则生成")
         return self._generate_profile_rule_based(
             entity_name, entity_type, entity_summary, entity_attributes
         )

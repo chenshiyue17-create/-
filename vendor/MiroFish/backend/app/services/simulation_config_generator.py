@@ -237,8 +237,24 @@ class SimulationConfigGenerator:
             model=self.model_name,
         )
 
+    @staticmethod
+    def _is_non_retryable_llm_error(exc: Exception) -> bool:
+        lowered = str(exc or "").lower()
+        return any(
+            marker in lowered
+            for marker in (
+                "usage limit",
+                "upgrade to pro",
+                "purchase more credits",
+                "codex cli 当前额度不足",
+                "状态库异常",
+            )
+        )
+
     def _prefer_local_generation(self) -> bool:
-        return bool(getattr(self.llm_client, "use_codex", False))
+        # codex/local 表示通过本地 Codex CLI 调用模型，不等于放弃 LLM。
+        # 只有真正调用失败时才回退到规则生成。
+        return False
 
     def _extract_hot_topics_local(
         self,
@@ -555,6 +571,8 @@ class SimulationConfigGenerator:
             except Exception as e:
                 logger.warning(f"LLM调用失败 (attempt {attempt+1}): {str(e)[:80]}")
                 last_error = e
+                if self._is_non_retryable_llm_error(e):
+                    break
                 import time
                 time.sleep(2 * (attempt + 1))
         

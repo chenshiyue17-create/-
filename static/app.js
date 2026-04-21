@@ -2129,9 +2129,9 @@ function syncMirofishAutopilotInputs(config = {}) {
   if (enabled) enabled.checked = Boolean(config.enabled);
   if (autoStartRuntime) autoStartRuntime.checked = Boolean(config.autoStartRuntime);
   if (autoResume) autoResume.checked = Boolean(config.autoResumeAutomation);
-  if (interval && document.activeElement !== interval) interval.value = String(config.intervalMinutes || 60);
+  if (interval && document.activeElement !== interval) interval.value = String(config.intervalMinutes || 3);
   if (mode && document.activeElement !== mode) mode.value = String(config.mode || "orders_first");
-  if (minOrders && document.activeElement !== minOrders) minOrders.value = String(config.minOrdersCount || 12);
+  if (minOrders && document.activeElement !== minOrders) minOrders.value = String(config.minOrdersCount || 3);
 }
 
 function renderMirofishAutopilot(status = {}, optimization = {}) {
@@ -2144,7 +2144,7 @@ function renderMirofishAutopilot(status = {}, optimization = {}) {
   const quaternionSummary = buildQuaternionSummary(optimizationSnapshot);
   const statusLabelMap = {
     idle: "待启动",
-    waiting: "待命中",
+    waiting: "实时待命",
     busy: "运行中",
     triggered: "已触发",
     disabled: "已关闭",
@@ -2159,11 +2159,13 @@ function renderMirofishAutopilot(status = {}, optimization = {}) {
   const metaParts = [];
   if (snapshot.lastEvaluatedAt) metaParts.push(`最近评估 ${formatMirofishIso(snapshot.lastEvaluatedAt)}`);
   if (snapshot.lastOrdersCount) metaParts.push(`订单 ${snapshot.lastOrdersCount} 笔`);
+  if (snapshot.lastOrderAt) metaParts.push(`最新订单 ${formatMirofishIso(snapshot.lastOrderAt)}`);
   if (snapshot.lastError) metaParts.push(`错误待处理`);
   $("mirofish-autopilot-meta").textContent = metaParts.join(" · ") || "尚未计算下一次推演时间。";
 
   const lastParts = [];
   if (snapshot.lastMode) lastParts.push(`模式 ${snapshot.lastMode === "orders" ? "订单" : "策略"}`);
+  if (snapshot.lastTriggerSource) lastParts.push(snapshot.lastTriggerSource === "event" ? "订单触发" : "周期触发");
   if (snapshot.lastTriggeredAt) lastParts.push(`触发 ${formatMirofishIso(snapshot.lastTriggeredAt)}`);
   if (snapshot.taskId) lastParts.push(`任务 ${snapshot.taskId}`);
   $("mirofish-autopilot-last").textContent = lastParts.join(" · ") || "-";
@@ -2279,9 +2281,9 @@ async function refreshMirofishStatus(options = {}) {
 function collectMirofishAutopilotConfig() {
   return {
     enabled: Boolean($("mirofish-autopilot-enabled")?.checked),
-    intervalMinutes: Number($("mirofish-autopilot-interval")?.value || 60),
+    intervalMinutes: Number($("mirofish-autopilot-interval")?.value || 3),
     mode: String($("mirofish-autopilot-mode")?.value || "orders_first"),
-    minOrdersCount: Number($("mirofish-autopilot-min-orders")?.value || 12),
+    minOrdersCount: Number($("mirofish-autopilot-min-orders")?.value || 3),
     autoStartRuntime: Boolean($("mirofish-autopilot-auto-start-runtime")?.checked),
     autoResumeAutomation: Boolean($("mirofish-autopilot-auto-resume")?.checked),
   };

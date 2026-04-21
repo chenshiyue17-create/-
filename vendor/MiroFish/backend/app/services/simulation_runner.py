@@ -22,7 +22,8 @@ from queue import Queue
 
 from ..config import Config
 from ..utils.logger import get_logger
-from ..utils.locale import get_locale, set_locale
+from ..utils.llm_client import LLMClient
+from ..utils.locale import get_locale, get_language_instruction, set_locale
 from .zep_graph_memory_updater import ZepGraphMemoryManager
 from .simulation_ipc import SimulationIPCClient, CommandType, IPCResponse
 
@@ -491,7 +492,7 @@ class SimulationRunner:
 
     @classmethod
     def _should_use_local_runner(cls) -> bool:
-        """在 codex/local 模式下使用本地规则模拟，避免 OASIS 对外部 LLM API 的硬依赖。"""
+        """在 codex/local 模式下使用本地智能推演链，避免 OASIS 对外部 LLM API 的硬依赖。"""
         return Config.use_codex_llm() and not Config.LLM_API_KEY
 
     @classmethod
@@ -541,6 +542,218 @@ class SimulationRunner:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with open(log_path, "a", encoding="utf-8") as handle:
             handle.write(f"{timestamp} - INFO - {message}\n")
+
+    @classmethod
+    def _platform_action_types(cls, platform: str) -> List[str]:
+        if platform == "twitter":
+            return ["CREATE_POST", "LIKE_POST", "QUOTE_POST", "FOLLOW", "REPOST"]
+        return ["CREATE_POST", "CREATE_COMMENT", "TREND", "SEARCH_POSTS", "FOLLOW"]
+
+    @classmethod
+    def _local_agent_roster(cls, config: Dict[str, Any]) -> List[Dict[str, Any]]:
+        roster: List[Dict[str, Any]] = []
+        for index, agent in enumerate(list(config.get("agent_configs") or []), start=1):
+            try:
+                agent_id = int(agent.get("agent_id") or index)
+            except Exception:
+                agent_id = index
+            roster.append(
+                {
+                    "agent_id": agent_id,
+                    "entity_name": str(agent.get("entity_name") or f"Agent-{agent_id}"),
+                    "entity_type": str(agent.get("entity_type") or "Unknown"),
+                    "stance": str(agent.get("stance") or "neutral"),
+                    "activity_level": float(agent.get("activity_level") or 0.5),
+                    "influence_weight": float(agent.get("influence_weight") or 1.0),
+                }
+            )
+        return roster
+
+    @classmethod
+    def _normalize_local_llm_plan(
+        cls,
+        *,
+        config: Dict[str, Any],
+        enabled_platforms: List[str],
+        total_rounds: int,
+        focus_symbols: List[str],
+        raw_plan: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        roster = cls._local_agent_roster(config)
+        if not roster:
+            return {"rounds": {}, "summaries": {}, "summary": ""}
+        agent_by_id = {int(item["agent_id"]): item for item in roster}
+        normalized: Dict[str, Any] = {
+            "summary": str(raw_plan.get("summary") or "").strip(),
+            "summaries": {},
+            "rounds": {},
+        }
+        for round_item in list(raw_plan.get("rounds") or []):
+            if not isinstance(round_item, dict):
+                continue
+            try:
+                round_num = int(round_item.get("round") or 0)
+            except Exception:
+                continue
+            if round_num < 1 or round_num > total_rounds:
+                continue
+            round_summary = str(round_item.get("summary") or "").strip()
+            if round_summary:
+                normalized["summaries"][round_num] = round_summary
+            platforms = round_item.get("platforms") or {}
+            if not isinstance(platforms, dict):
+                continue
+            per_platform: Dict[str, List[Dict[str, Any]]] = {}
+            for platform in enabled_platforms:
+                planned_actions = platforms.get(platform) or []
+                if not isinstance(planned_actions, list):
+                    continue
+                allowed_actions = cls._platform_action_types(platform)
+                symbol = focus_symbols[(round_num - 1) % len(focus_symbols)]
+                normalized_actions: List[Dict[str, Any]] = []
+                for index, item in enumerate(planned_actions[:12], start=1):
+                    if not isinstance(item, dict):
+                        continue
+                    try:
+                        raw_agent_id = int(item.get("agent_id") or 0)
+                    except Exception:
+                        raw_agent_id = 0
+                    agent = agent_by_id.get(raw_agent_id)
+                    if agent is None:
+                        agent = roster[(round_num + index - 2) % len(roster)]
+                    agent_id = int(agent["agent_id"])
+                    agent_name = str(agent.get("entity_name") or item.get("agent_name") or f"Agent-{agent_id}")
+                    action_type = str(item.get("action_type") or "").strip().upper()
+                    if action_type not in allowed_actions:
+                        action_type = allowed_actions[(round_num + index - 1) % len(allowed_actions)]
+                    focus = str(item.get("focus") or item.get("topic") or f"{symbol} 执行质量").strip()
+                    mood = str(item.get("mood") or "").strip() or ("改善" if round_num % 2 == 0 else "恶化")
+                    result_text = str(item.get("result") or item.get("content") or "").strip()
+                    if not result_text:
+                        result_text = (
+                            f"{agent_name} 在第 {round_num} 轮围绕 {symbol} 讨论执行质量，"
+                            f"当前观点偏向{mood}，建议继续观察滑点、手续费与方向切换。"
+                        )
+                    action_args = item.get("action_args") if isinstance(item.get("action_args"), dict) else {}
+                    action_args = {
+                        "symbol": str(action_args.get("symbol") or symbol),
+                        "focus": focus,
+                        "mood": mood,
+                    }
+                    normalized_actions.append(
+                        {
+                            "round": round_num,
+                            "timestamp": datetime.now().isoformat(),
+                            "platform": platform,
+                            "agent_id": agent_id,
+                            "agent_name": agent_name,
+                            "action_type": action_type,
+                            "action_args": action_args,
+                            "result": result_text,
+                            "success": True,
+                        }
+                    )
+                if normalized_actions:
+                    per_platform[platform] = normalized_actions
+            if per_platform:
+                normalized["rounds"][round_num] = per_platform
+        return normalized
+
+    @classmethod
+    def _generate_local_llm_plan(
+        cls,
+        *,
+        config: Dict[str, Any],
+        enabled_platforms: List[str],
+        total_rounds: int,
+        focus_symbols: List[str],
+    ) -> Dict[str, Any]:
+        roster = cls._local_agent_roster(config)
+        if not roster:
+            return {"rounds": {}, "summaries": {}, "summary": ""}
+        llm_client = LLMClient(
+            api_key=Config.LLM_API_KEY,
+            base_url=Config.LLM_BASE_URL,
+            model=Config.LLM_MODEL_NAME,
+        )
+        roster_payload = roster[: min(len(roster), 18)]
+        action_catalog = {
+            platform: cls._platform_action_types(platform)
+            for platform in enabled_platforms
+        }
+        prompt = f"""请为一个加密交易推演任务生成多轮社交平台动作计划。
+
+模拟需求：
+{str(config.get("simulation_requirement") or "").strip()}
+
+焦点标的：
+{", ".join(focus_symbols)}
+
+平台：
+{", ".join(enabled_platforms)}
+
+总轮数：
+{total_rounds}
+
+可用 Agent：
+```json
+{json.dumps(roster_payload, ensure_ascii=False, indent=2)}
+```
+
+每个平台允许的动作：
+```json
+{json.dumps(action_catalog, ensure_ascii=False, indent=2)}
+```
+
+请输出 JSON（不要 markdown）：
+{{
+  "summary": "整体推演摘要",
+  "rounds": [
+    {{
+      "round": 1,
+      "summary": "这一轮的市场情绪与交易含义",
+      "platforms": {{
+        "twitter": [
+          {{
+            "agent_id": 1,
+            "action_type": "CREATE_POST",
+            "focus": "讨论的交易焦点",
+            "mood": "改善/恶化/分歧/谨慎",
+            "result": "该动作想表达的市场观点，必须直接服务于交易闭环"
+          }}
+        ],
+        "reddit": []
+      }}
+    }}
+  ]
+}}
+
+约束：
+1. 每轮每个平台生成 2-6 条动作。
+2. agent_id 必须来自给定 Agent 列表。
+3. result 必须明确说明这条互动如何影响开仓、减仓、方向切换、滑点、手续费或风险控制。
+4. 不要写空泛的舆论描述，要围绕真实交易闭环。
+5. 所有自然语言内容使用中文。"""
+        system_prompt = (
+            "你是交易推演导演兼执行分析师。"
+            "你需要让每一轮互动都服务于真实交易闭环，而不是泛泛的社交媒体剧情。"
+            f"\n\n{get_language_instruction()}"
+        )
+        raw_plan = llm_client.chat_json(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.4,
+            max_tokens=12000,
+        )
+        return cls._normalize_local_llm_plan(
+            config=config,
+            enabled_platforms=enabled_platforms,
+            total_rounds=total_rounds,
+            focus_symbols=focus_symbols,
+            raw_plan=raw_plan,
+        )
 
     @classmethod
     def _build_local_round_actions(
@@ -601,9 +814,6 @@ class SimulationRunner:
         try:
             focus_symbols = cls._extract_focus_symbols(config)
             requirement = str(config.get("simulation_requirement") or "").strip()
-            cls._append_simulation_log(sim_dir, f"Codex/local 规则推演启动: focus={','.join(focus_symbols)}")
-            cls._append_simulation_log(sim_dir, f"需求摘要: {requirement[:180]}")
-
             platform_logs = {
                 "twitter": os.path.join(sim_dir, "twitter", "actions.jsonl"),
                 "reddit": os.path.join(sim_dir, "reddit", "actions.jsonl"),
@@ -614,6 +824,24 @@ class SimulationRunner:
                     "reddit": state.reddit_running,
                 }.items() if enabled
             ] or ["twitter", "reddit"]
+            llm_plan: Dict[str, Any] = {"rounds": {}, "summaries": {}, "summary": ""}
+            using_llm_plan = False
+            try:
+                llm_plan = cls._generate_local_llm_plan(
+                    config=config,
+                    enabled_platforms=enabled_platforms,
+                    total_rounds=max(state.total_rounds, 1),
+                    focus_symbols=focus_symbols,
+                )
+                using_llm_plan = bool((llm_plan.get("rounds") or {}))
+            except Exception as exc:
+                cls._append_simulation_log(sim_dir, f"Codex/local 智能推演计划生成失败，回退规则链: {exc}")
+
+            mode_label = "智能推演" if using_llm_plan else "规则推演"
+            cls._append_simulation_log(sim_dir, f"Codex/local {mode_label}启动: focus={','.join(focus_symbols)}")
+            cls._append_simulation_log(sim_dir, f"需求摘要: {requirement[:180]}")
+            if llm_plan.get("summary"):
+                cls._append_simulation_log(sim_dir, f"整体推演摘要: {str(llm_plan.get('summary') or '')[:220]}")
 
             for platform in enabled_platforms:
                 cls._append_action_record(
@@ -637,11 +865,14 @@ class SimulationRunner:
                     return
 
                 for platform in enabled_platforms:
-                    actions = cls._build_local_round_actions(
-                        config=config,
-                        platform=platform,
-                        round_num=round_num,
-                        focus_symbols=focus_symbols,
+                    actions = (
+                        ((llm_plan.get("rounds") or {}).get(round_num) or {}).get(platform)
+                        or cls._build_local_round_actions(
+                            config=config,
+                            platform=platform,
+                            round_num=round_num,
+                            focus_symbols=focus_symbols,
+                        )
                     )
                     for item in actions:
                         cls._append_action_record(platform_logs[platform], item)
@@ -677,7 +908,14 @@ class SimulationRunner:
 
                 state.current_round = round_num
                 state.simulated_hours = round_num
-                cls._append_simulation_log(sim_dir, f"规则推演完成第 {round_num}/{state.total_rounds} 轮")
+                round_summary = str(((llm_plan.get("summaries") or {}).get(round_num) or "")).strip()
+                if round_summary:
+                    cls._append_simulation_log(
+                        sim_dir,
+                        f"{mode_label}第 {round_num}/{state.total_rounds} 轮: {round_summary}",
+                    )
+                else:
+                    cls._append_simulation_log(sim_dir, f"{mode_label}完成第 {round_num}/{state.total_rounds} 轮")
                 cls._save_run_state(state)
                 time.sleep(0.15)
 
@@ -701,16 +939,16 @@ class SimulationRunner:
 
             state.runner_status = RunnerStatus.COMPLETED
             state.completed_at = datetime.now().isoformat()
-            cls._append_simulation_log(sim_dir, "Codex/local 规则推演完成")
+            cls._append_simulation_log(sim_dir, f"Codex/local {mode_label}完成")
             cls._save_run_state(state)
         except Exception as exc:
-            logger.error(f"本地规则推演失败: {simulation_id}, error={exc}")
+            logger.error(f"本地推演失败: {simulation_id}, error={exc}")
             state.runner_status = RunnerStatus.FAILED
             state.error = str(exc)
             state.completed_at = datetime.now().isoformat()
             state.twitter_running = False
             state.reddit_running = False
-            cls._append_simulation_log(sim_dir, f"Codex/local 规则推演失败: {exc}")
+            cls._append_simulation_log(sim_dir, f"Codex/local 推演失败: {exc}")
             cls._save_run_state(state)
         finally:
             cls._local_stop_events.pop(simulation_id, None)
@@ -756,7 +994,7 @@ class SimulationRunner:
         )
         worker.start()
         cls._monitor_threads[simulation_id] = worker
-        logger.info(f"已启动 Codex/local 规则推演: {simulation_id}, platform={platform}")
+        logger.info(f"已启动 Codex/local 本地推演: {simulation_id}, platform={platform}")
         return state
     
     @classmethod
