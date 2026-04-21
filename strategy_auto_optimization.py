@@ -168,6 +168,14 @@ class StrategyAutoOptimizationManager:
             except Exception as exc:
                 result["detail"] = f"自动恢复远端量化运行失败: {exc}"
                 return result
+        local_runtime_config = self.deps.config.current()
+        has_local_credentials = all(
+            bool(str(local_runtime_config.get(key) or "").strip())
+            for key in ("apiKey", "secretKey", "passphrase")
+        )
+        if not has_local_credentials:
+            result["detail"] = "本地未保存 API 凭据，已跳过自动恢复量化运行。"
+            return result
         result["attempted"] = True
         if self.deps.automation_engine.snapshot().get("running"):
             result["started"] = True
