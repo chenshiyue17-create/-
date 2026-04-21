@@ -28,6 +28,30 @@ class StrategyAutoOptimizationDependencies:
     normalize_remote_automation_config_payload: Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]]
 
 
+def normalize_focus_symbol_token(raw: Any) -> str:
+    value = str(raw or "").strip().upper()
+    if not value:
+        return ""
+    if "-" in value:
+        value = value.split("-", 1)[0]
+    return "".join(ch for ch in value if ch.isalnum())
+
+
+def build_focus_seed_automation_config(config: dict[str, Any], focus_symbol: str) -> dict[str, Any]:
+    focused = copy.deepcopy(config)
+    normalized_symbol = normalize_focus_symbol_token(focus_symbol)
+    if not normalized_symbol:
+        return focused
+    overrides = copy.deepcopy(focused.get("watchlistOverrides") or {})
+    symbol_override = copy.deepcopy(overrides.get(normalized_symbol) or {})
+    focused["watchlistSymbols"] = normalized_symbol
+    focused["watchlistOverrides"] = {normalized_symbol: symbol_override} if symbol_override else {}
+    focused["spotInstId"] = f"{normalized_symbol}-USDT"
+    focused["swapInstId"] = f"{normalized_symbol}-USDT-SWAP"
+    focused["focusSymbol"] = normalized_symbol
+    return focused
+
+
 class StrategyAutoOptimizationManager:
     def __init__(self, deps: StrategyAutoOptimizationDependencies) -> None:
         self.deps = deps
@@ -207,16 +231,17 @@ class StrategyAutoOptimizationManager:
         )
         try:
             current_config = self.deps.automation_config.current()
+            optimization_seed_config = build_focus_seed_automation_config(current_config, focus_symbol)
             runtime_config = self.deps.config.current()
             self._update(phase="optimizing", message="正在回测并搜索更优参数。")
             research = self.deps.research_optimize(
-                current_config,
-                self.deps.runtime_research_options(current_config),
+                optimization_seed_config,
+                self.deps.runtime_research_options(optimization_seed_config),
                 self.deps.build_public_client(runtime_config),
             )
             best_config = self.deps.merge_optimized_automation_config(
-                current_config,
-                copy.deepcopy(research.get("bestConfig") or current_config),
+                optimization_seed_config,
+                copy.deepcopy(research.get("bestConfig") or optimization_seed_config),
             )
             ok, message, normalized = self.deps.validate_automation_config(best_config)
             if not ok:
