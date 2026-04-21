@@ -10938,6 +10938,20 @@ def tail_lines(path: Path, count: int = 20) -> list[str]:
     return lines[-count:]
 
 
+def tail_lines_since_offset(path: Path, start_offset: int = 0, count: int = 20) -> list[str]:
+    if not path.exists():
+        return []
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as handle:
+            if start_offset > 0:
+                handle.seek(max(0, int(start_offset)))
+            text = handle.read()
+    except OSError:
+        return []
+    lines = [line for line in text.splitlines() if line.strip()]
+    return lines[-count:]
+
+
 def normalize_mirofish_base(base: str) -> str:
     text = str(base or "").strip() or "/mirofish/"
     if not text.startswith("/"):
@@ -10968,6 +10982,7 @@ class MiroFishRuntimeManager:
         self.lock = threading.RLock()
         self.backend_process: subprocess.Popen[str] | None = None
         self.backend_log_handle: Any = None
+        self.backend_log_offset = 0
         self.started_at = ""
 
     def _current_backend_stamp(self) -> str:
@@ -10988,10 +11003,11 @@ class MiroFishRuntimeManager:
             pass
         return {}
 
-    def _save_backend_stamp(self, stamp: str, pid: int) -> None:
+    def _save_backend_stamp(self, stamp: str, pid: int, *, log_offset: int | None = None) -> None:
         payload = {
             "stamp": stamp,
             "pid": int(pid or 0),
+            "logOffset": max(0, int(log_offset or 0)),
             "runtimeSource": RUNTIME_SOURCE_LABEL,
             "updatedAt": now_local_iso(),
         }
@@ -11023,6 +11039,19 @@ class MiroFishRuntimeManager:
     def _stamped_backend_updated_at(self) -> str:
         payload = self._load_backend_stamp() or {}
         return str(payload.get("updatedAt") or "").strip()
+
+    def _stamped_backend_log_offset(self) -> int:
+        payload = self._load_backend_stamp() or {}
+        try:
+            return max(0, int(payload.get("logOffset") or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def _backend_log_size(self) -> int:
+        try:
+            return max(0, int(MIROFISH_LOG_PATH.stat().st_size))
+        except OSError:
+            return 0
 
     def _backend_stamp_mismatch(self, current_stamp: str | None = None) -> bool:
         desired = str(current_stamp or self._current_backend_stamp()).strip()
@@ -11366,6 +11395,7 @@ class MiroFishRuntimeManager:
                 pass
         self.backend_process = None
         self.backend_log_handle = None
+        self.backend_log_offset = 0
         self.started_at = ""
 
     def _stop_backend_locked(self) -> None:
@@ -11453,7 +11483,14 @@ class MiroFishRuntimeManager:
             raise RuntimeError(f"MiroFish 缺少必要环境变量: {', '.join(missing_env)}")
         self._ensure_runtime_dir()
         self._stop_port_backend_locked()
+        log_offset = self._backend_log_size()
+        self._save_backend_stamp(current_stamp, 0, log_offset=log_offset)
         log_handle = open(MIROFISH_LOG_PATH, "a", encoding="utf-8")
+        session_time = datetime.now().strftime("%H:%M:%S")
+        log_handle.write(
+            f"\n[{session_time}] INFO: 当前运行会话已切换，状态页只显示本次启动后的日志\n"
+        )
+        log_handle.flush()
         env = self._runtime_env(commands)
         env["FLASK_HOST"] = "127.0.0.1"
         env["FLASK_PORT"] = str(MIROFISH_BACKEND_PORT)
@@ -11473,11 +11510,12 @@ class MiroFishRuntimeManager:
         )
         self.backend_process = process
         self.backend_log_handle = log_handle
+        self.backend_log_offset = log_offset
         self.started_at = now_local_iso()
         deadline = time.time() + 20.0
         while time.time() < deadline:
             if self._backend_healthy(timeout=1.2):
-                self._save_backend_stamp(current_stamp, process.pid)
+                self._save_backend_stamp(current_stamp, process.pid, log_offset=log_offset)
                 return
             if process.poll() is not None:
                 break
@@ -11515,9 +11553,27 @@ class MiroFishRuntimeManager:
                         break
             backend_pid = managed_pid or stamped_pid or listener_pid
             if backend_healthy and listener_pid and not stamped_pid:
-                self._save_backend_stamp(current_stamp, listener_pid)
+                existing_offset = self._stamped_backend_log_offset() or self._backend_log_size()
+                self._save_backend_stamp(current_stamp, listener_pid, log_offset=existing_offset)
             backend_running = bool(backend_pid and backend_healthy)
             started_at = self.started_at or self._stamped_backend_updated_at()
+            log_offset = self.backend_log_offset or self._stamped_backend_log_offset()
+            if backend_running and log_offset <= 0:
+                # Older runtime stamps predate log offsets. Start reading from the current
+                # file edge so stale historical simulation logs do not leak into the current
+                # runtime snapshot.
+                log_offset = self._backend_log_size()
+                self._save_backend_stamp(current_stamp, backend_pid, log_offset=log_offset)
+                if managed_pid:
+                    self.backend_log_offset = log_offset
+            log_tail = tail_lines_since_offset(MIROFISH_LOG_PATH, log_offset, 40)
+            if backend_running and not log_tail:
+                session_time = ""
+                if "T" in started_at:
+                    session_time = started_at.split("T", 1)[1][:8]
+                log_tail = [
+                    f"[{session_time or datetime.now().strftime('%H:%M:%S')}] INFO: 当前运行会话已就绪，旧日志已从状态页隐藏"
+                ]
             status = {
                 "installed": MIROFISH_ROOT.exists(),
                 "frontendBuilt": frontend_built,
@@ -11537,7 +11593,7 @@ class MiroFishRuntimeManager:
                 "missingCommands": missing_commands,
                 "commands": commands,
                 "startedAt": started_at,
-                "logTail": tail_lines(MIROFISH_LOG_PATH, 40),
+                "logTail": log_tail,
             }
             frontend_runtime_ready = bool(frontend_built or status["frontendDepsReady"])
             status["setupRequired"] = not (
